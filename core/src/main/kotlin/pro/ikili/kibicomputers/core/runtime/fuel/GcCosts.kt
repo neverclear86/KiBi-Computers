@@ -16,7 +16,8 @@ import run.endive.wasm.WasmModule as EndiveModule
  * WASM の大きさ（i8 で 1 バイト）ではなく、この JVM の大きさで数える（圧縮しない参照の前提。テーブルの `tableElementBytes` と同じ考え方）:
  * - オブジェクト 1 つの固定費 [OBJECT_BYTES]（包みのオブジェクトと、配列 2 本のヘッダー）。フィールドのない struct・長さ 0 の配列も 0 にしない
  * - 関数の本体で作る配列の要素: 参照（Endive が `Object[]` に置く型）なら [REF_ELEMENT_BYTES]、ほかは [VALUE_ELEMENT_BYTES]
- * - struct のフィールドと、定数式（グローバル・要素の初期値）で作る配列の要素: [REF_ELEMENT_BYTES]（Endive が `long[]` と `Object[]` の両方を作る）
+ * - struct のフィールド、定数式（グローバル・要素の初期値）で作る配列の要素、`array.new_elem` で作る配列の要素: [REF_ELEMENT_BYTES]
+ *   （Endive が `long[]` と `Object[]` の両方を作る。`array.new_elem` は要素の型に関係なく両方を作る）
  *
  * 見積もりは仮の値（確定は #251）。
  */
@@ -24,7 +25,7 @@ internal object GcCosts {
     /** オブジェクト 1 つの固定費（バイト） */
     const val OBJECT_BYTES: Long = 64
 
-    /** 参照の要素・struct のフィールド・定数式の配列の要素 1 つ（`long` と参照） */
+    /** 参照の要素・struct のフィールド・定数式と `array.new_elem` の配列の要素 1 つ（`long` と参照） */
     const val REF_ELEMENT_BYTES: Long = 16
 
     /** 参照でない要素 1 つ（`long`） */
@@ -36,7 +37,10 @@ internal object GcCosts {
         return OBJECT_BYTES + REF_ELEMENT_BYTES * st.fieldTypes().size
     }
 
-    /** 関数の本体で作る、array の型 [typeIdx] の要素 1 つのバイト数。array の型でなければ [WasmLoadException] */
+    /**
+     * 関数の本体で作る、array の型 [typeIdx] の要素 1 つのバイト数。array の型でなければ [WasmLoadException]。
+     * `array.new_elem` には使わない（要素の型に関係なく [REF_ELEMENT_BYTES]。[GcPlan.dynamicBytes]）
+     */
     fun arrayElementBytes(types: TypeSection, typeIdx: Long): Long {
         val at = subType(types, typeIdx)?.compType()?.arrayType() ?: throw WasmLoadException("型 $typeIdx が array でない")
         return if (at.fieldType().storageType().isObjectRef()) REF_ELEMENT_BYTES else VALUE_ELEMENT_BYTES
@@ -60,8 +64,10 @@ internal object GcCosts {
      * @property instantiateBytes インスタンスを作るときに 1 回評価する式（グローバルの初期値と、アクティブの要素の式）が作るオブジェクトの合計
      * @property elementItemBytes 要素セグメントごとの、項目 1 つの式が作るオブジェクトの最大（パッシブの要素は `table.init`・`array.new_elem`・
      *   `array.init_elem` で使うたびに評価し直すので、そこで項目の数 × これを数える）
+     * @property elementItemLength 要素セグメントごとの、項目 1 つの式の命令数（`end` を除く）の最大。Endive は要素 1 つごとに式を先頭から全部評価し直すので、
+     *   `table.init`・`array.new_elem`・`array.init_elem` の燃料は、この長さに比例して増やす（[GcPlan.elementFuel]）
      */
-    class ModuleEstimate(val instantiateBytes: Long, val elementItemBytes: LongArray)
+    class ModuleEstimate(val instantiateBytes: Long, val elementItemBytes: LongArray, val elementItemLength: LongArray)
 
     /**
      * [module] の定数式が作る GC のオブジェクトを見積もる。配列の長さが読み込みのときに決まらない（import したグローバルから読むなど）
@@ -81,19 +87,23 @@ internal object GcCosts {
         }
         val elements = module.elementSection()
         val items = LongArray(elements.elementCount())
+        val lengths = LongArray(elements.elementCount())
         for (i in 0 until elements.elementCount()) {
             val el = elements.getElement(i)
             var max = 0L
             var sum = 0L
+            var longest = 0L
             for (init in el.initializers()) {
+                longest = maxOf(longest, init.count { it.opcode() != OpCode.END }.toLong())
                 val r = evaluate(init, types, known) ?: throw WasmLoadException("要素セグメント $i の式が作る GC のオブジェクトの大きさを、読み込みのときに決められない")
                 max = maxOf(max, r.bytes)
                 sum = saturatedAdd(sum, r.bytes)
             }
             items[i] = max
+            lengths[i] = longest
             if (el is ActiveElement) total = saturatedAdd(total, sum)
         }
-        return ModuleEstimate(total, items)
+        return ModuleEstimate(total, items, lengths)
     }
 
     private class Evaluated(val bytes: Long, val value: Long?)
@@ -210,7 +220,11 @@ internal class GcPlan(module: EndiveModule) {
     private val types: TypeSection = module.typeSection()
 
     /** 要素セグメントごとの、項目 1 つの式が作るオブジェクトの最大（[GcCosts.ModuleEstimate.elementItemBytes]） */
-    private val itemBytes: LongArray = GcCosts.estimate(module).elementItemBytes
+    private val estimate = GcCosts.estimate(module)
+    private val itemBytes: LongArray = estimate.elementItemBytes
+
+    /** 要素セグメントごとの、項目 1 つの式の命令数（`end` を除く）の最大 */
+    private val itemLength: LongArray = estimate.elementItemLength
 
     /** GC のオブジェクトを数える命令があるか */
     val needed: Boolean = module.codeSection().functionBodies().any { body ->
@@ -237,15 +251,32 @@ internal class GcPlan(module: EndiveModule) {
         val (perElement, fixed) = when (ins.opcode()) {
             OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_DEFAULT, OpCode.ARRAY_NEW_DATA ->
                 GcCosts.arrayElementBytes(types, ins.operand(0)) to GcCosts.OBJECT_BYTES
-            // 配列の要素に加えて、要素ごとに評価し直す式が作るオブジェクト
-            OpCode.ARRAY_NEW_ELEM ->
-                GcCosts.saturatedAdd(GcCosts.arrayElementBytes(types, ins.operand(0)), item(ins.operand(1))) to GcCosts.OBJECT_BYTES
+            // 配列の要素（Endive は要素の型に関係なく `long[]` と `Object[]` の両方を作るので、いつも 16）に加えて、要素ごとに評価し直す式が作るオブジェクト
+            OpCode.ARRAY_NEW_ELEM -> {
+                GcCosts.arrayElementBytes(types, ins.operand(0)) // array の型でなければ断る
+                GcCosts.saturatedAdd(GcCosts.REF_ELEMENT_BYTES, item(ins.operand(1))) to GcCosts.OBJECT_BYTES
+            }
             OpCode.ARRAY_INIT_ELEM -> item(ins.operand(1)) to 0L
             OpCode.TABLE_INIT -> item(ins.operand(0)) to 0L
             else -> return null
         }
         if (perElement == 0L && fixed == 0L) return null
         return minOf(perElement, MAX_PER_ELEMENT) to fixed
+    }
+
+    /**
+     * `table.init`・`array.new_elem`・`array.init_elem` の、要素 1 つごとの燃料（項目の式が長いときに、長さ 1 を超える分を足したもの）。
+     * 当たらない命令、または式が長さ 1 以下で基本の重み（[FuelCosts.TABLE_ELEMENTS_SHIFT]・[FuelCosts.ARRAY_ELEM_ITEMS_SHIFT] の分）で足りるなら `null`。
+     * Endive は要素 1 つごとに項目の式を先頭から全部評価し直すので、仕事の量は「要素の数 × 式の命令数」になる（長い式は燃料も増やす）
+     */
+    fun elementFuel(ins: Instruction): Long? {
+        val (base, segment) = when (ins.opcode()) {
+            OpCode.TABLE_INIT -> (1L shl FuelCosts.TABLE_ELEMENTS_SHIFT) to ins.operand(0)
+            OpCode.ARRAY_NEW_ELEM, OpCode.ARRAY_INIT_ELEM -> (1L shl -FuelCosts.ARRAY_ELEM_ITEMS_SHIFT) to ins.operand(1)
+            else -> return null
+        }
+        val extra = if (segment in itemLength.indices) minOf(itemLength[segment.toInt()] - 1, MAX_ITEM_EXTRA) else 0L
+        return if (extra <= 0) null else base + extra
     }
 
     private fun item(segment: Long): Long = if (segment in itemBytes.indices) itemBytes[segment.toInt()] else 0L
@@ -256,5 +287,8 @@ internal class GcPlan(module: EndiveModule) {
          * 長さ（2^32 未満）を掛けても i64 で桁あふれしない
          */
         const val MAX_PER_ELEMENT: Long = 1L shl 30
+
+        /** 項目の式が長いときの、要素 1 つごとの燃料に足す分の上限。長さ（2^32 未満）を掛けても i64 で桁あふれしない */
+        const val MAX_ITEM_EXTRA: Long = 1L shl 24
     }
 }

@@ -527,7 +527,9 @@ internal object FuelInjector {
                 // 長さを控えてから、GC のオブジェクトの RAM（#939）→ 燃料 → 元の命令の順。RAM で断ったら燃料は引かない
                 out.saveLength(ctx)
                 ctx.gc.dynamicBytes(ins)?.let { (perElement, fixed) -> out.gcAllocDynamic(ctx, perElement, fixed) }
-                out.chargeSaved(ctx, shift)
+                // 要素セグメントの式が長いときは、要素 1 つの重みを掛ける（Endive は要素ごとに式を全部評価し直す）
+                val perElement = ctx.gc.elementFuel(ins)
+                if (perElement != null) out.chargeSavedTimes(ctx, perElement) else out.chargeSaved(ctx, shift)
             }
             ctx.gc.staticBytes(ins)?.let { bytes -> out.gcAllocStatic(ctx, bytes) }
             if (op in GROW) out.saveSize(ctx, op, ins.operand(0))
@@ -862,6 +864,19 @@ internal object FuelInjector {
             sleb(if (shift > 0) shift.toLong() else (-shift).toLong())
             u8(if (shift > 0) 0x88 else 0x86) // i64.shr_u / i64.shl
         }
+        u8(0x7D) // i64.sub
+        set(ctx)
+    }
+
+    /** 控えた長さ `len`（i32、符号なし）に [weight] を掛けて燃料にして引く: `fuel -= u64(len) * weight`（[weight] は 2^25 まで。i64 で桁あふれしない） */
+    private fun Sink.chargeSavedTimes(ctx: BodyContext, weight: Long) {
+        get(ctx)
+        u8(0x20) // local.get
+        leb(ctx.lengthLocal.toLong())
+        u8(0xAD) // i64.extend_i32_u
+        u8(0x42)
+        sleb(weight)
+        u8(0x7E) // i64.mul
         u8(0x7D) // i64.sub
         set(ctx)
     }

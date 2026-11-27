@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
@@ -308,5 +309,384 @@ class GcAllocationTest {
             }
             assertEquals(0L, memory.usedBytes, name)
         }
+    }
+
+    // ---- ここから: 命令ごとの課金の道（#1004 のレビュー） ----
+
+    /** `%` を `$` に直す（WAT の名前の `$` を Kotlin の文字列で書きやすくする） */
+    private fun w(text: String): String = text.replace('%', '$')
+
+    /** マシンの RAM が [machineBytes] しかない勘定（前借りの 64 KiB は断られ、要る分だけが数えられる） */
+    private fun tight(machineBytes: Long = 5000): ProcessMemory {
+        val server = MemoryAccount(Long.MAX_VALUE / 4)
+        val machine = MemoryAccount(machineBytes, server)
+        return machine.process(16)
+    }
+
+    /** 新しいインスタンスで [export] を呼び、勘定に数えたバイト数と、引いた燃料を返す */
+    private fun measure(module: WasmModule, memory: ProcessMemory, export: String, vararg args: Long): Pair<Long, Long> {
+        module.instantiate(config(memory)).use { inst ->
+            val before = inst.fuel
+            inst.call(export, *args)
+            return memory.usedBytes to before - inst.fuel
+        }
+    }
+
+    @Test
+    fun `struct_new_defaultとarray_new_fixedは、命令だけで決まるバイト数と、フィールド・要素の数の燃料を数える`() {
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %s2 (struct (field i32) (field i32)))
+                  (type %s5 (struct (field i32) (field i32) (field i32) (field i32) (field i32)))
+                  (type %a (array i32))
+                  (func (export "s2") (drop (struct.new_default %s2)))
+                  (func (export "s5") (drop (struct.new_default %s5)))
+                  (func (export "f3") (result i32)
+                    (array.len (array.new_fixed %a 3 (i32.const 1) (i32.const 2) (i32.const 3))))
+                  (func (export "f5") (result i32)
+                    (array.len (array.new_fixed %a 5 (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            val s2 = measure(module, tight(), "s2")
+            val s5 = measure(module, tight(), "s5")
+            val f3 = measure(module, tight(), "f3")
+            val f5 = measure(module, tight(), "f5")
+            // 64 + 16 × フィールド、64 + 8 × 要素（i32 の配列）
+            assertEquals(64L + 16 * 2, s2.first, "$name s2")
+            assertEquals(64L + 16 * 5, s5.first, "$name s5")
+            assertEquals(64L + 8 * 3, f3.first, "$name f3")
+            assertEquals(64L + 8 * 5, f5.first, "$name f5")
+            // フィールドが 3 つ増えると 3
+            assertEquals(3L, s5.second - s2.second, name)
+            // 要素が 2 つ増えると、i32.const が 2、array.new_fixed の要素の数の分が 2
+            assertEquals(4L, f5.second - f3.second, name)
+        }
+    }
+
+    @Test
+    fun `array_new_dataは、長さに比例したバイト数を数えて、上限を超えるなら作る前に止まる`() {
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %b (array (mut i8)))
+                  (data %d "0123456789")
+                  (func (export "d") (param i32) (result i32)
+                    (array.len (array.new_data %b %d (i32.const 0) (local.get 0)))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            val ten = measure(module, tight(), "d", 10)
+            val five = measure(module, tight(), "d", 5)
+            assertEquals(64L + 8 * 10, ten.first, name)
+            assertEquals(5L, ten.second - five.second, name)
+            // データの範囲を超える長さでも、RAM を先に断る（Endive に大きな配列を作らせない）
+            val memory = budget()
+            module.instantiate(config(memory)).use { inst ->
+                val e = assertThrows<WasmTrapException>(name) { inst.call("d", 1_000_000) }
+                assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name: ${e.message}")
+                assertEquals(0L, memory.usedBytes, name)
+            }
+        }
+    }
+
+    @Test
+    fun `array_copyとarray_init_dataは、長さに比例した燃料を引く`() {
+        val data = "a".repeat(1000)
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %b (array (mut i8)))
+                  (data %d "$data")
+                  (func (export "copy") (param i32)
+                    (local %a (ref null %b))
+                    (local.set %a (array.new_default %b (i32.const 2000)))
+                    (array.copy %b %b (local.get %a) (i32.const 0) (local.get %a) (i32.const 1000) (local.get 0)))
+                  (func (export "initd") (param i32)
+                    (local %a (ref null %b))
+                    (local.set %a (array.new_default %b (i32.const 2000)))
+                    (array.init_data %b %d (local.get %a) (i32.const 0) (i32.const 0) (local.get 0))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            for (export in listOf("copy", "initd")) {
+                val small = measure(module, budget(256), export, 10)
+                val large = measure(module, budget(256), export, 900)
+                assertEquals(890L, large.second - small.second, "$name $export")
+            }
+        }
+    }
+
+    /** `(elem)` の中身: 長さ 1 の式 [count] 個 */
+    private fun funcItems(count: Int) = (1..count).joinToString(" ") { "%f" }
+
+    /** 命令数が 2k + 2 の `i31ref` の定数式（拡張定数式の足し算を入れ子にしたもの） */
+    private fun longItem(k: Int) = "(item (ref.i31 ${"(i32.add (i32.const 1) ".repeat(k)}(i32.const 1)${")".repeat(k)}))"
+
+    @Test
+    fun `array_new_elemは、要素の型に関係なく1要素16バイトで数え、array_new_elemとarray_init_elemは1要素4の燃料を引く`() {
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %fa (array (mut funcref)))
+                  (func %f)
+                  (elem %e func ${funcItems(1100)})
+                  (func (export "new") (param i32) (result i32)
+                    (array.len (array.new_elem %fa %e (i32.const 0) (local.get 0))))
+                  (func (export "init") (param i32) (result i32)
+                    (local %a (ref null %fa))
+                    (local.set %a (array.new_default %fa (i32.const 1100)))
+                    (array.init_elem %fa %e (local.get %a) (i32.const 0) (i32.const 0) (local.get 0))
+                    (i32.const 0)))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            // funcref の配列でも、Endive は long[] と Object[] の両方を作る
+            assertEquals(64L + 16 * 100, measure(module, tight(), "new", 100).first, name)
+            for (export in listOf("new", "init")) {
+                val small = measure(module, budget(256), export, 10)
+                val large = measure(module, budget(256), export, 1000)
+                assertEquals(4L * 990, large.second - small.second, "$name $export")
+            }
+        }
+    }
+
+    @Test
+    fun `項目の式が長い要素セグメントは、array_new_elem・array_init_elem・table_initの燃料を式の長さに比例して増やす`() {
+        // 式は 102 命令: 要素 1 つの燃料は、array.new_elem・array.init_elem が 4 + 101、table.init が 1 + 101
+        val items = (1..12).joinToString(" ") { longItem(50) }
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %ia (array (mut i31ref)))
+                  (table %t 16 i31ref)
+                  (elem %e i31ref $items)
+                  (func (export "new") (param i32) (result i32)
+                    (array.len (array.new_elem %ia %e (i32.const 0) (local.get 0))))
+                  (func (export "init") (param i32) (result i32)
+                    (local %a (ref null %ia))
+                    (local.set %a (array.new_default %ia (i32.const 16)))
+                    (array.init_elem %ia %e (local.get %a) (i32.const 0) (i32.const 0) (local.get 0))
+                    (i32.const 0))
+                  (func (export "tinit") (param i32)
+                    (table.init %t %e (i32.const 0) (i32.const 0) (local.get 0))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            for ((export, weight) in listOf("new" to 105L, "init" to 105L, "tinit" to 102L)) {
+                val one = measure(module, budget(256), export, 1)
+                val ten = measure(module, budget(256), export, 10)
+                assertEquals(weight * 9, ten.second - one.second, "$name $export")
+            }
+        }
+    }
+
+    @Test
+    fun `GCのオブジェクトを作る項目の要素セグメントを使うarray_init_elemとtable_initは、使う数だけRAMに数える`() {
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %big (array i8))
+                  (type %arr (array (mut (ref null %big))))
+                  (table %t 4 (ref null %big))
+                  (elem %e (ref null %big)
+                    (item (array.new_default %big (i32.const 1000)))
+                    (item (array.new_default %big (i32.const 1000))))
+                  (func (export "init") (param i32) (result i32)
+                    (local %a (ref null %arr))
+                    (local.set %a (array.new_default %arr (i32.const 2)))
+                    (array.init_elem %arr %e (local.get %a) (i32.const 0) (i32.const 0) (local.get 0))
+                    (i32.const 0))
+                  (func (export "tinit") (param i32)
+                    (table.init %t %e (i32.const 0) (i32.const 0) (local.get 0))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            // 項目 1 つは 64 + 16 × 1,000 = 16,064 バイト。マシンの RAM が 20,000 バイトなら 1 つまで
+            val init = measure(module, tight(20_000), "init", 1)
+            // テーブルの要素（4 つ。数十バイト）が加わる
+            assertTrue(init.first in (96L + 16_064)..(96L + 16_064 + 100), "$name init ${init.first}")
+            val tinit = measure(module, tight(20_000), "tinit", 1)
+            assertTrue(tinit.first >= 16_064, "$name tinit ${tinit.first}")
+            for (export in listOf("init", "tinit")) {
+                val memory = tight(20_000)
+                module.instantiate(config(memory)).use { inst ->
+                    val e = assertThrows<WasmTrapException>("$name $export") { inst.call(export, 2) }
+                    assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name $export: ${e.message}")
+                    assertTrue(memory.usedBytes < 16_064, "$name $export ${memory.usedBytes}")
+                }
+                assertEquals(0L, memory.usedBytes, "$name $export")
+            }
+        }
+    }
+
+    @Test
+    fun `アクティブの要素の式が作るオブジェクトは、インスタンスを作る前に合計を数える`() {
+        val small = metered(
+            w(
+                """
+                (module
+                  (type %big (array i8))
+                  (table %t 2 (ref null %big))
+                  (elem (table %t) (i32.const 0) (ref null %big)
+                    (item (array.new_default %big (i32.const 100)))
+                    (item (array.new_default %big (i32.const 100)))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(small) { name, module ->
+            val memory = tight()
+            module.instantiate(config(memory)).use {
+                // 2 つで 2 × (64 + 16 × 100)。テーブルの要素の分（2 つ。数十バイト）が加わる
+                assertTrue(memory.usedBytes in 3328L..3428L, "$name ${memory.usedBytes}")
+            }
+            assertEquals(0L, memory.usedBytes, name)
+        }
+        val huge = metered(
+            w(
+                """
+                (module
+                  (type %big (array i8))
+                  (table %t 1 (ref null %big))
+                  (elem (table %t) (i32.const 0) (ref null %big) (item (array.new_default %big (i32.const 1000000)))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(huge) { name, module ->
+            val memory = budget()
+            val e = assertThrows<WasmLinkException>(name) { module.instantiate(config(memory)) }
+            assertTrue(e.message!!.contains("初期値の GC のオブジェクト"), e.message)
+            assertEquals(0L, memory.usedBytes, name)
+            val large = budget(1024)
+            module.instantiate(config(large)).use { assertTrue(large.usedBytes >= 16_000_064L, "$name ${large.usedBytes}") }
+            assertEquals(0L, large.usedBytes, name)
+        }
+    }
+
+    @Test
+    fun `前借りを断られても、要る分だけなら数えて断った記録を残さず、要る分も数えられなければ記録する`() {
+        val bytes = metered(arrays)
+        forEachRuntime(bytes) { name, module ->
+            val memory = tight()
+            module.instantiate(config(memory)).use { inst ->
+                // 64 KiB の前借りはマシンの RAM（5,000 バイト）を超えるので断られるが、64 + 8 × 100 は数えられる
+                assertEquals(100L, inst.call("bytes", 100).single(), name)
+                assertEquals(64L + 8 * 100, memory.usedBytes, name)
+                assertNull(memory.lastRefusal, name)
+                assertEquals(0, memory.refusalCount, name)
+                // 残りで足りないものは、前借りでなく本当の確保が断られたので記録する
+                val e = assertThrows<WasmTrapException>(name) { inst.call("bytes", 1000) }
+                assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name: ${e.message}")
+                assertEquals(MemoryRefusal.MACHINE, memory.lastRefusal, name)
+                assertEquals(1, memory.refusalCount, name)
+                assertEquals(64L + 8 * 100, memory.usedBytes, name)
+            }
+            assertEquals(0L, memory.usedBytes, name)
+        }
+    }
+
+    @Test
+    fun `インスタンスを閉じた後の確保は断る`() {
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %a (array i32))
+                  (import "w" "close" (func %close))
+                  (func (export "run") (result i32)
+                    (call %close)
+                    (array.len (array.new_default %a (i32.const 3)))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            val memory = budget()
+            val cfg = WasmInstanceConfig.builder()
+                .hostFunction("w", "close", WasmFunctionType.of(emptyList(), emptyList())) { instance: WasmInstance, _ ->
+                    instance.close()
+                    longArrayOf()
+                }
+                .fuel(1L shl 40, null)
+                .tableLimit(Int.MAX_VALUE, memory)
+                .build()
+            module.instantiate(cfg).use { inst ->
+                val e = assertThrows<WasmTrapException>(name) { inst.call("run") }
+                assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name: ${e.message}")
+            }
+            // 閉じた後に数えると二度と返らない
+            assertEquals(0L, memory.usedBytes, name)
+        }
+    }
+
+    @Test
+    fun `燃料を共有する形の挿入でも、GCの確保のimportを足し、関数とグローバルの番号を合わせて数える`() {
+        val wat = w(
+            """
+            (module
+              (type %a (array i32))
+              (global %g (mut i32) (i32.const 3))
+              (func %len (result i32) (global.get %g))
+              (func (export "big") (global.set %g (i32.const 1000000)))
+              (func (export "run") (result i32) (array.len (array.new_default %a (call %len)))))
+            """.trimIndent(),
+        )
+        val injected = FuelInjector.inject(WitTool.wat(wat), sharedGlobal = true)
+        assertEquals(0, injected.fuelFunc)
+        assertEquals(1, injected.gcFunc)
+        assertEquals(-1, injected.originalFunc(0))
+        assertEquals(-1, injected.originalFunc(1))
+        assertEquals(0, injected.originalFunc(2))
+        assertNull(WitTool.validate(injected.bytes), "挿入した後のバイト列が正しくない")
+        for ((name, rt) in runtimes) {
+            val module = rt.load(injected.bytes)
+            val memory = budget()
+            val cfg = WasmInstanceConfig.builder().sharedFuel(WasmSharedFuel(1L shl 40)).tableLimit(Int.MAX_VALUE, memory).build()
+            module.instantiate(cfg).use { inst ->
+                assertEquals(3L, inst.call("run").single(), name)
+                assertTrue(memory.usedBytes > 0, name)
+                inst.call("big")
+                val e = assertThrows<WasmTrapException>(name) { inst.call("run") }
+                assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name: ${e.message}")
+            }
+            assertEquals(0L, memory.usedBytes, name)
+        }
+    }
+
+    @Test
+    fun `配列の長さを読み込みのときに決められない定数式は、読み込みで断る`() {
+        // import したグローバル（燃料を共有する形だけが許す）の値は、読み込みのときには分からない
+        val global = w(
+            """
+            (module
+              (type %a (array i32))
+              (import "env" "n" (global %n i32))
+              (global %g (ref %a) (array.new_default %a (global.get %n))))
+            """.trimIndent(),
+        )
+        val e1 = assertThrows<WasmLoadException> { FuelInjector.inject(WitTool.wat(global), sharedGlobal = true) }
+        assertTrue(e1.message!!.contains("グローバル"), e1.message)
+        val element = w(
+            """
+            (module
+              (type %big (array i8))
+              (import "env" "n" (global %n i32))
+              (elem %e (ref null %big) (item (array.new_default %big (global.get %n)))))
+            """.trimIndent(),
+        )
+        val e2 = assertThrows<WasmLoadException> { FuelInjector.inject(WitTool.wat(element), sharedGlobal = true) }
+        assertTrue(e2.message!!.contains("要素セグメント"), e2.message)
     }
 }
