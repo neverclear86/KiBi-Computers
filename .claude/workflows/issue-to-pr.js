@@ -109,8 +109,8 @@ function gradlePending(r, text, textEligible) {
 
 // コマンドラインに worktree のパスを含む java のプロセスを探す PowerShell のコマンド（#855）。
 // 番号が前方一致する別の worktree（issue-<n>0 など）のものを数えないよう、番号の後ろに数字が続かないものだけを数える
-function worktreeJavaQuery(number) {
-  return `Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match '[\\\\/]\\.worktrees[\\\\/]issue-${number}(?![0-9])' }`
+function worktreeJavaQuery(number, dirName = `issue-${number}`) {
+  return `Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match '[\\\\/]\\.worktrees[\\\\/]${dirName}(?![0-9])' }`
 }
 
 // Gradle を待たずに返した段階を、もう 1 回だけ呼ぶときに付ける指示（#904）。
@@ -488,9 +488,10 @@ const STACK_SCHEMA = {
           state: { type: 'string', enum: ['OPEN', 'MERGED', 'CLOSED'] },
           draft: { type: 'boolean' },
           needsHuman: { type: 'boolean', description: 'PR に needs-human ラベルが付いている' },
+          reviewed: { type: 'boolean', description: 'この自動の流れ（issue-to-pr）のレビューを通っているか。「## 自動レビューの結果」の最後のコメントの結論が「マージ可能」で、それより後にコードを変えたコミットがない' },
           headSha: { type: ['string', 'null'] },
         },
-        required: ['pr', 'branch', 'baseRef', 'position', 'state', 'draft', 'needsHuman', 'headSha'],
+        required: ['pr', 'branch', 'baseRef', 'position', 'state', 'draft', 'needsHuman', 'reviewed', 'headSha'],
       },
     },
   },
@@ -1204,7 +1205,7 @@ function pendingMergeResult(r, prefix) {
 // 下の段から順に取り込み（一番下は main、上の段は一つ下の段のブランチ。通常の push だけ）→ 一番上の段の木で build と両 GameTest を 1 回 →
 // 全段の先頭のコミットの CI → `gh stack merge <一番上> --yes --squash`。ツールの権限の判定で拒否されたら、確かめを済ませたうえで
 // 「スタックごとマージしてよいか」を 1 回だけ聞く（回避の手段は使わない）。人への新しい質問は、スタックにつき 1 つまで。
-// 下の段の論点（needs-human）がもう別の PR で聞かれているなら、新しく聞かず、その PR を指す短い報告と needs-human だけを付ける。
+// 下の段の論点（needs-human）がもう別の PR で聞かれているなら、新しく聞かず、その PR を指す短い報告だけを付ける（needs-human は付けない。付けると、人が論点の PR のラベルだけを外して resume したとき、案内のラベルで止まって互いを指し合う）。
 // 段の担当: 一番上の段の Issue の流れがまとめてマージする。下の段の Issue の流れは、上の段がこの実行の中にあれば、その結果（done）を待つ。
 // 待つ前に slots と area のロックを放す（上の段がそれを取れずに詰まらないように）。上の段は下の段の「マージしてよい」（readySignals）を、
 // mergeLock の外で待つ（下の段は、マージの段階に入る前に、それを出す）
@@ -1215,10 +1216,36 @@ const readySignals = new Map()
 const prImpl = new Map()
 // Issue の番号 → info（この実行で流している Issue）
 const infoByNumber = new Map()
+// Issue の番号 → その流れが登録した PR の番号（prIssue の逆引き。流れが slots と area のロックを取って PR を登録するまでは載らない）
+const issuePr = new Map()
+// resume で渡された PR の番号 ⇄ Issue の番号（流れが PR を登録する前から、この実行の PR と分かるように。起動のときに入れる）
+const resumePrs = new Map()
+const resumePrOf = new Map()
 
 function issueOfBranch(branch) {
   const m = /^issue-(\d+)-/.exec(branch ?? '')
   return m ? Number(m[1]) : null
+}
+
+// スタックの段 PR を担当している、この実行の Issue の流れ（なければ null。#936）。
+// 流れが PR を登録する（prIssue・prImpl に入れる）のは、slots と area のロックを取ったあとなので、登録だけを頼りにすると、
+// ロック待ち・依存待ち・実装中の流れを「この実行にない」と取り違える（同じ area の 2 段や、window が埋まっているとき）。
+// 登録済み → resume で渡された PR → まだ PR を登録していない流れのブランチ名（issue-<番号>-）の順に見る。
+// 同じ Issue がもう別の PR を登録している（1 つの Issue を複数の PR に分けた形）なら、その段はこの実行の流れの PR ではない
+function flowOfPr(pr, branch) {
+  if (prIssue.has(pr)) return prIssue.get(pr)
+  if (resumePrs.has(pr)) return resumePrs.get(pr)
+  const n = issueOfBranch(branch)
+  if (n == null || !infoByNumber.has(n) || issuePr.has(n) || resumePrOf.has(n)) return null
+  return n
+}
+
+// Issue a が Issue b に（推移的に）依存しているか。依存先の流れが終わるまで a は始まらない（runIssue の依存の待ち）
+function dependsOn(a, b, seen = new Set()) {
+  if (seen.has(a)) return false
+  seen.add(a)
+  const deps = infoByNumber.get(a)?.openDeps ?? []
+  return deps.includes(b) || deps.some(d => dependsOn(d, b, seen))
 }
 
 // 読むだけの段階で、PR がスタックに属するかと、全段の状態を取る。gh stack view はローカルで追跡しているスタックしか見えないので使わない
@@ -1227,7 +1254,8 @@ function detectStack(pr, label) {
     `${REPO} の PR #${pr} が Stacked PRs（GitHub のスタック）に属するかを調べる（#936）。コードとリポジトリは変更せず、Issue・PR にも書き込まない。
 1. \`gh api repos/${REPO}/pulls/${pr} --jq '{base: .base.ref, stack: .stack}'\` を読む。baseRef に base を入れる。stack が null なら、stackNumber=null・members=[] で返す（base が main でなくても、スタックでなければ members は空）。
 2. stack があれば stackNumber に \`.stack.number\` を入れ、\`gh api repos/${REPO}/stacks/<stack の number>\` の \`pull_requests[]\` を読む（下の段から順）。\`gh stack view\` は使わない（ローカルで追跡しているスタックしか見えない）。
-3. 各段について \`gh pr view <n> --json number,state,isDraft,labels,headRefName,baseRefName,headRefOid\` を読み、members に下から順に入れる（position は 1 から。needsHuman は needs-human ラベルが付いているか）。`,
+3. 各段について \`gh pr view <n> --json number,state,isDraft,labels,headRefName,baseRefName,headRefOid,comments,commits\` を読み、members に下から順に入れる（position は 1 から。needsHuman は needs-human ラベルが付いているか）。
+4. 各段の reviewed を決める: \`comments\` のうち、投稿者の \`authorAssociation\` が OWNER・MEMBER・COLLABORATOR で、本文が「## 自動レビューの結果」で始まる最後のコメントを探す。その本文に「結論: マージ可能」があり、かつそのコメントの \`createdAt\` より後の \`committedDate\` のコミットが、headline が \`Merge \` で始まる取り込みのコミットだけ（コードを変えた直しがない）なら true。コメントがない・結論が「人の確認が必要」・コメントより後にコードの直しがある、のどれかなら false。`,
     { label, phase: 'Merge', schema: STACK_SCHEMA, ...M.select },
   ).then(x => x.result)
 }
@@ -1236,7 +1264,11 @@ function detectStack(pr, label) {
 function stackPlan(st, selfPr) {
   const members = [...(st.members ?? [])]
     .sort((a, b) => a.position - b.position)
-    .map(m => ({ ...m, issue: prIssue.get(m.pr) ?? issueOfBranch(m.branch), inRun: prImpl.has(m.pr) }))
+    .map(m => {
+      const flow = flowOfPr(m.pr, m.branch)
+      // flow: この段を担当する、この実行の Issue の流れ（なければ null）。issue: ブランチ名などから分かる Issue（この実行にないものも）
+      return { ...m, flow, issue: flow ?? issueOfBranch(m.branch), inRun: flow != null }
+    })
   if (st.stackNumber == null || !members.length) {
     return { ok: false, members, reason: `PR #${selfPr} の base が main でない（${st.baseRef}）のに、GitHub のスタックに属していない。base を別の PR のブランチに向けただけの PR は、スタックとして扱えない（AGENTS.md。\`gh pr merge\` すると、main ではなく base のブランチに squash され、Issue も閉じない）。\`gh stack link <下の PR の番号> ${selfPr}\` でスタックにするか、base を main に向け直してから続ける` }
   }
@@ -1249,12 +1281,14 @@ function stackLabel(plan) {
   return `スタック #${plan.number}（下から ${plan.members.map(m => `PR #${m.pr}`).join(' → ')}）`
 }
 
-// PR に短い報告を付ける（論点の置き場所の案内や、まとめてマージした報告）。label なら needs-human も付ける。重ねても害の小さい段階なので、呼び直す
-async function stackNote(pr, body, label) {
+// PR に短い報告を付ける（論点の置き場所の案内や、まとめてマージした報告）。needs-human は付けない:
+// 案内のためだけに付けると、人が論点の PR のラベルだけを外して resume したとき、案内のラベルを「人の回答待ち」と取り違えて止まる
+// （互いを指し合って進まない）。ラベルは、本当に人へ質問した PR（論点の PR）にだけ付く。重ねても害の小さい段階なので、呼び直す
+async function stackNote(pr, body) {
   const { result } = await stepRetrying(
-    `${REPO} の PR #${pr} に、次の内容を日本語のコメントで投稿する（\`gh pr comment ${pr} --body-file <ファイル>\`）。見出しは「## スタックの状態」。内容は書き換えずにそのまま載せる。${label ? `投稿したら \`gh pr edit ${pr} --add-label needs-human\` を実行する。` : ''}\n\n${body}`,
+    `${REPO} の PR #${pr} に、次の内容を日本語のコメントで投稿する（\`gh pr comment ${pr} --body-file <ファイル>\`）。見出しは「## スタックの状態」。内容は書き換えずにそのまま載せる。ラベルは付けない（\`needs-human\` を付けたり外したりしない）。\n\n${body}`,
     { label: `stack-note:${pr}`, phase: 'Report', ...M.report },
-    `投稿の前に \`gh pr view ${pr} --json comments,labels\` で確かめ、見出しが「## スタックの状態」で同じ内容のコメントがもう付いていれば、投稿しない${label ? '（needs-human ラベルが無ければ付ける）' : ''}。`,
+    `投稿の前に \`gh pr view ${pr} --json comments\` で確かめ、見出しが「## スタックの状態」で同じ内容のコメントがもう付いていれば、投稿しない。`,
   )
   return result
 }
@@ -1264,10 +1298,15 @@ function stackSyncPrompt(plan, i) {
   const m = plan.members[i]
   const src = i === 0 ? 'main' : plan.members[i - 1].branch
   const known = prImpl.get(m.pr)?.impl.worktree
-  const dir = m.issue != null ? `.worktrees/issue-${m.issue}` : `.worktrees/stack-pr-${m.pr}`
+  // この実行にない段の作業場所。ブランチ名の Issue がこの実行の Issue と同じ（1 つの Issue を複数の PR に分けた形。上の段の worktree が
+  // `.worktrees/issue-<番号>` にある）か、この実行で流している Issue なら、`.worktrees/issue-<番号>` は別のブランチ（この実行の流れ）のものなので使わず、
+  // PR の番号の場所にする（別のブランチを開いた worktree でブランチを切り替えると、その流れの前提が崩れる）
+  const shared = m.issue != null && (infoByNumber.has(m.issue) || [...prImpl.values()].some(x => x.info.number === m.issue))
+  const dir = m.issue != null && !shared ? `.worktrees/issue-${m.issue}` : `.worktrees/stack-pr-${m.pr}`
+  const prDir = `.worktrees/stack-pr-${m.pr}`
   const where = known
     ? `worktree ${known} で作業する。`
-    : `作業場所: このブランチをもうチェックアウトしている worktree があれば（\`git worktree list --porcelain\` の \`branch refs/heads/${m.branch}\`）、そこで作業する（同じブランチは 2 つの worktree で開けない）。なければリポジトリのルートで \`git worktree add ${dir} ${m.branch}\`（ローカルにブランチがなければ \`git worktree add -b ${m.branch} ${dir} origin/${m.branch}\`）で作る。${m.issue != null ? worktreeCheck(m.issue) : ''}`
+    : `作業場所: このブランチをもうチェックアウトしている worktree があれば（\`git worktree list --porcelain\` の \`branch refs/heads/${m.branch}\`）、そこで作業する（同じブランチは 2 つの worktree で開けない）。なければリポジトリのルートで \`git worktree add ${dir} ${m.branch}\`（ローカルにブランチがなければ \`git worktree add -b ${m.branch} ${dir} origin/${m.branch}\`）で作る。${dir !== prDir ? `\`${dir}\` がもうあって、ほかのブランチを開いた worktree なら、それは別の流れのものなので触らず、ブランチも切り替えず、\`${prDir}\` に同じ手順で作る。` : ''}${m.issue != null && !shared ? worktreeCheck(m.issue) : ''}`
   return `${REPO} の${stackLabel(plan)}の ${i + 1}/${plan.members.length} 段目、PR #${m.pr}（ブランチ ${m.branch}）に、\`origin/${src}\` を取り込んで push する（#936。取り込みは下の段から順に行い、この段階はスクリプトが段ごとに呼ぶ）。**Gradle は動かさない**（build と GameTest は、全段の取り込みのあとで一番上の段の木で 1 回だけ回す）。${where}
 1. \`git status --porcelain\` で作業ツリーが汚れていたら（コミットしていない変更がある）、何もせず outcome=failed・pushed=false で、summary に残っているファイルを書く。reset・stash・checkout で消さない。
 2. \`git fetch origin\` する。ローカルのブランチが \`origin/${m.branch}\` より遅れていれば \`git merge --ff-only origin/${m.branch}\`、分かれていれば \`git merge origin/${m.branch}\` で合わせる（push していないローカルのコミットは捨てない。reset しない）。
@@ -1305,14 +1344,16 @@ ${mergeNumbersText(info.number)}
 // スタックの上の段がまとめてマージするのを待つ（下の段の Issue の流れ）。上の段がこの実行にないなら、下の段だけではマージしない
 async function waitStackTop(info, plan) {
   const label = stackLabel(plan)
-  const topIssue = prIssue.get(plan.top.pr)
+  // 上の段を担当する流れ。上の段の流れがまだ PR を登録していなくても（ロック待ち・依存待ち）、この実行の流れとして見つかる（flowOfPr）
+  const topIssue = plan.top.flow
   const command = `\`gh stack merge ${plan.top.pr} --yes --squash\``
   if (topIssue == null || !done.has(topIssue)) {
     log(`PR #${plan.self.pr}: ${label}の下の段。上の段 PR #${plan.top.pr} はこの実行にないので、この PR だけではマージしない`)
     return { status: 'stack_lower', noQuestion: true, pointerPr: null, reason: `${label}の下の段（${plan.self.position}/${plan.members.length}）。上の段 PR #${plan.top.pr} と一緒に、上の段の流れ（issue-to-pr の resume など）で ${command} によりまとめてマージする。この PR だけではマージしない（部分マージのあとは、上の段に rebase が要る）` }
   }
   // 上の段の Issue がこの Issue に依存していると、上の段はこの Issue の終わりを待つので、ここで上の段を待つと互いに待って詰まる
-  if (infoByNumber.get(topIssue)?.openDeps?.includes(info.number)) {
+  // （依存を書いた Issue の流れは、依存先の done を待ってから始まるので、上の段の PR がまだ登録されていない間にここへ来る）
+  if (dependsOn(topIssue, info.number)) {
     log(`PR #${plan.self.pr}: 上の段の Issue #${topIssue} がこの Issue に依存しているので、上の段を待たない`)
     return { status: 'stack_lower', noQuestion: true, pointerPr: null, reason: `${label}の下の段。上の段の Issue #${topIssue} が「依存: #${info.number}」でこの Issue の終わりを待つため、この実行ではスタックをマージしない。上の段を resume で流すと、まとめてマージする` }
   }
@@ -1329,8 +1370,15 @@ async function waitStackTop(info, plan) {
 async function mergeStackTop(info, impl, plan) {
   const label = stackLabel(plan)
   // a. この実行で流している下の段が、マージしてよいところまで進むのを待つ（mergeLock の外で待つ。下の段は mergeLock を取らずに知らせる）
+  // 下の段の流れが PR をまだ登録していなくても（ロック待ち・実装中）、この実行の流れとして待つ（flowOfPr）。待たずに進むと、
+  // その段のレビューと直しを待たずに、確かめている最中の worktree へ取り込みを入れ、一緒にマージしてしまう
   for (const m of plan.lowers.filter(m => m.inRun)) {
-    const sig = readySignals.get(prIssue.get(m.pr))
+    // 下の段の Issue が一番上の段の Issue に依存していると、下の段の流れは上の段の終わりを待って始まらず、互いに待って詰まる
+    if (dependsOn(m.flow, info.number)) {
+      log(`PR #${impl.pr}: ${label}の下の段 PR #${m.pr}（Issue #${m.flow}）が、この Issue に依存している。互いに待つので、スタックはマージしない`)
+      return { status: 'needs_human', failedStep: 'merge', reason: `${label}の下の段 PR #${m.pr} の Issue #${m.flow} が「依存: #${info.number}」でこの Issue の終わりを待つため、下の段の流れが始まらず、互いに待つ。依存の向きとスタックの積み方が合っていない。スタックは確かめもマージもしていない` }
+    }
+    const sig = readySignals.get(m.flow)
     const r = sig ? await sig.promise : { ready: false, reason: '知らせの置き場所がない' }
     if (!r.ready) {
       log(`PR #${impl.pr}: ${label}の下の段 PR #${m.pr} がマージしてよいところまで進まなかった。スタックはマージしない`)
@@ -1357,8 +1405,17 @@ async function mergeStackTop(info, impl, plan) {
       log(`PR #${impl.pr}: ${label}の下の段に needs-human が付いている。取り込みも確かめもせずに止まる`)
       return { status: 'needs_human', failedStep: 'merge', noQuestion: true, pointerPr: waiting[0].pr, reason: `${label}の下の段 ${waiting.map(m => `PR #${m.pr}`).join('・')} に needs-human が付いている（人の回答待ち）。上の段をマージすると下の段も一緒に入るので、スタックの論点として PR #${waiting[0].pr} の回答を待つ。取り込み・確かめ・マージはしていない` }
     }
+    // この実行にない下の段は、このフローのレビュー（AGENTS.md の開発フローの 5）を通ったものだけ、一緒にマージする。
+    // 一番上の段のレビューは base が下の段のブランチの差分なので、下の段のコードは見ない。通っていない段は、別の流れ
+    // （その PR の issue-to-pr の resume）でレビューしてから、まとめてマージする。新しい論点なので、一番上の段で 1 回だけ聞く
+    const unreviewed = now.lowers.filter(m => !m.inRun && !m.reviewed)
+    if (unreviewed.length) {
+      log(`PR #${impl.pr}: ${label}の下の段 ${unreviewed.map(m => `PR #${m.pr}`).join('・')} は、この実行にないうえに、自動レビューを通った記録がない。取り込みも確かめもせずに止まる`)
+      return { status: 'needs_human', failedStep: 'merge', reason: `${label}の下の段 ${unreviewed.map(m => `PR #${m.pr}`).join('・')} は、この実行の流れではなく、自動レビュー（issue-to-pr のレビュー。コメント「## 自動レビューの結果」の結論が「マージ可能」で、その後にコードの直しがないもの）を通った記録もない。一番上の段のレビューは下の段の差分を見ないので、このままスタックごとマージすると、下の段がレビューなしで main に入る。下の段を issue-to-pr の resume で流してレビューしてから続けるか、レビューなしでマージしてよいか判断してほしい。取り込み・確かめ・マージはしていない` }
+    }
     // c. 下の段から順に取り込んで push する（段ごとに 1 回ずつ。順はこのループで決める）
     const synced = []
+    const syncedWorktrees = {}
     for (let i = 0; i < now.members.length; i++) {
       const m = now.members[i]
       const s = await step(stackSyncPrompt(now, i), { label: `stack-sync:${m.pr}`, phase: 'Merge', schema: STACK_SYNC_SCHEMA, ...M.merge })
@@ -1368,13 +1425,15 @@ async function mergeStackTop(info, impl, plan) {
         return { status: 'needs_human', failedStep: 'conflict', reason: `${label}: ${i + 1} 段目 PR #${m.pr} に ${i === 0 ? 'main' : now.members[i - 1].branch} を取り込めなかった（${why}）${done_}。確かめもマージもしていない` }
       }
       synced.push(`PR #${m.pr}（${s.outcome === 'merged' ? '取り込んで push' : '取り込むものなし'}）`)
+      // 実際に作業した場所。この実行にない下の段の片付けは、決め打ちの名前でなく、これを使う（runStack）
+      if (s.worktree) syncedWorktrees[m.pr] = s.worktree
     }
     log(`PR #${impl.pr}: ${label}の取り込みが済んだ（${synced.join('、')}）。一番上の段の木で確かめてマージする`)
     // d. 一番上の段の木で確かめ、全段の CI を待ち、gh stack merge する（回し直し・やり直しはふつうのマージと同じ）。
     // 不安定なテストの CI の回し直し（#961）は、1 つの PR を見る作りなので、スタックには使わない（落ちたら止まって人に上がる）
     const res = await mergeWithRetries(info, impl, now)
     const prefix = `${label}: 下の段から順に取り込んだ（${synced.join('、')}）。`
-    if (res.status === 'merged') return { ...res, retried: true, reason: `${prefix}一番上の段の木で確かめ、\`gh stack merge ${impl.pr} --yes --squash\` でまとめてマージした${res.retried && res.reason ? `（${res.reason}）` : ''}` }
+    if (res.status === 'merged') return { ...res, syncedWorktrees, retried: true, reason: `${prefix}一番上の段の木で確かめ、\`gh stack merge ${impl.pr} --yes --squash\` でまとめてマージした${res.retried && res.reason ? `（${res.reason}）` : ''}` }
     if (res.stackMergeOutcome === 'permission_denied') {
       return {
         ...res,
@@ -1404,10 +1463,11 @@ async function runStack(info, d) {
     // この実行で流していない下の段は、上の段の流れが報告と片付けをする（この実行で流している段は、それぞれの流れが行う）
     for (const m of plan.lowers.filter(m => !m.inRun)) {
       if (merged) {
-        if (m.issue != null) await cleanupWorktree({ number: m.issue }, { pr: m.pr, worktree: `.worktrees/issue-${m.issue}` })
-        await stackNote(m.pr, `${stackLabel(plan)}を、上の段 PR #${impl.pr} の流れで \`gh stack merge ${impl.pr} --yes --squash\` によりまとめてマージした。`, false)
+        // 片付けるのは、取り込みの段階が実際に作業した場所（stack-sync の worktree）。決め打ちの名前にしない（#936）
+        const kept = await cleanupStackLower(m, merge.syncedWorktrees?.[m.pr])
+        await stackNote(m.pr, `${stackLabel(plan)}を、上の段 PR #${impl.pr} の流れで \`gh stack merge ${impl.pr} --yes --squash\` によりまとめてマージした。${kept ? `\n\nworktree: ${kept}` : ''}`)
       } else if (pointer != null && pointer !== m.pr) {
-        await stackNote(m.pr, `${stackLabel(plan)}はマージしていない。論点は PR #${pointer} で扱う（上の段をマージすると下の段も一緒に入るので、スタック全体で 1 つの論点にまとめている）。理由: ${merge.reason ?? '-'}`, true)
+        await stackNote(m.pr, `${stackLabel(plan)}はマージしていない。論点は PR #${pointer} で扱う（上の段をマージすると下の段も一緒に入るので、スタック全体で 1 つの論点にまとめている）。この PR には needs-human を付けていない。回答と \`needs-human\` を外す操作は PR #${pointer} だけでよい。理由: ${merge.reason ?? '-'}`)
       }
     }
   }
@@ -1428,6 +1488,25 @@ async function runStack(info, d) {
   }
 }
 
+// この実行にない下の段の worktree を、stack-sync が返した実際の場所で片付ける（#936）。片付けたら null、残したら理由の文を返す。
+// 片付けるのは `.worktrees/issue-<番号>`・`.worktrees/stack-pr-<PR>` の形のものだけ（それ以外は人の作業場所かもしれない）で、
+// この実行の流れの worktree（ブランチ名の Issue が同じ段が、その流れの場所を使った場合など）は、その流れが片付けるので触らない
+const STACK_WORKTREE_RE = /[\\/]\.worktrees[\\/](issue-\d+|stack-pr-\d+)[\\/]?$/
+const normPath = p => String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+async function cleanupStackLower(m, worktree) {
+  if (!worktree) return '片付けなかった（取り込みの段階が worktree の場所を返さなかった）'
+  const dirName = STACK_WORKTREE_RE.exec(worktree)?.[1]
+  if (!dirName) return `片付けなかった（${worktree} は \`.worktrees/issue-<番号>\`・\`.worktrees/stack-pr-<PR>\` の形ではない）`
+  if ([...prImpl.values()].some(x => normPath(x.impl.worktree) === normPath(worktree))) return null
+  const own = dirName.startsWith('stack-pr-')
+  const cleanup = await cleanupWorktree(
+    { number: own ? m.pr : Number(dirName.slice('issue-'.length)) },
+    { pr: m.pr, worktree, dirName, ...(own ? { logsDir: `.worktrees/.logs/${dirName}` } : {}) },
+  )
+  log(`PR #${m.pr}: この実行にない下の段の worktree の片付け（${worktree}）: ${cleanup ? (cleanup.removed ? '消した' : `残した（${cleanup.note}）`) : '片付けの段階が失敗した'}`)
+  return cleanup?.removed ? null : `片付けなかった（${worktree}。${cleanup ? cleanup.note : '片付けの段階が失敗した'}）`
+}
+
 // 最後のラウンドの指摘を、直せなかったもの（remaining）と、直して push したがレビューし直していないもの（fixedUnreviewed）に分ける。
 // 最後のラウンドの後にはレビューを回さないので、直したかどうかは修正のエージェントの申告（pushed）で分ける
 function lastFindings(rounds) {
@@ -1440,13 +1519,15 @@ function lastFindings(rounds) {
 
 // マージ済みの PR の worktree を片付ける（#855）。そこで動いている Gradle・GameTest のサーバーが終わってから消す。
 // 終わる前に git worktree remove --force を実行すると、.gradle のロックで途中で止まり、.git だけ消えた壊れたディレクトリが残る
+// impl.dirName・impl.logsDir は、Issue の番号の名前でない worktree（この実行にないスタックの下の段の `stack-pr-<PR>`。#936）のときだけ付く
 function cleanupWorktree(info, impl) {
-  const logs = `.worktrees/.logs/issue-${info.number}`
+  const dirName = impl.dirName ?? `issue-${info.number}`
+  const logs = impl.logsDir ?? `.worktrees/.logs/issue-${info.number}`
   return step(
     `${REPO} の PR #${impl.pr} はマージ済み。worktree ${impl.worktree} を片付ける。リポジトリのルートで作業する。
 1. その worktree の Gradle と GameTest のサーバーが終わっているのを確かめる。最大 15 分、Monitor などで待つ（前景の \`sleep\` は使えない）:
    - \`${logs}/\` の \`.log\` のうち、\`-latest.log\` で終わらないものすべてに、同じ名前の \`.exit\` がある（Gradle が終わった）。
-   - コマンドラインに worktree のパス（\`.worktrees/issue-${info.number}\`）を含む java のプロセスがない。番号が前方一致する別の worktree（例: issue-${info.number}0 や issue-${info.number}4）のものを数えないよう、番号の後ろに数字が続かないものだけを数える（PowerShell の \`${worktreeJavaQuery(info.number)}\`。\`/\`・\`\\\` のどちらの書き方でも当たる）。
+   - コマンドラインに worktree のパス（\`.worktrees/${dirName}\`）を含む java のプロセスがない。番号が前方一致する別の worktree（例: ${dirName}0 や ${dirName}4）のものを数えないよう、番号の後ろに数字が続かないものだけを数える（PowerShell の \`${worktreeJavaQuery(info.number, dirName)}\`。\`/\`・\`\\\` のどちらの書き方でも当たる）。
    - ただし \`.exit\` のない \`.log\` でも、上の java のプロセスがなく、そのログの最終更新から ${STALE_LOG_MINUTES} 分以上たっていれば、終わった（ジョブが殺されて \`.exit\` を書けなかった）とみなす。最終更新との差は \`date +%s\` と \`stat -c %Y <ログ>\` で測る。そうみなしたログの名前は note に書く。
    15 分たっても終わらなければ、消さずに removed=false で、残っているもの（ログの名前・プロセスの ID とコマンドラインの先頭）を note に書いて返す。プロセスは殺さない。\`./gradlew --stop\` は使わない（ほかの worktree のビルドまで止まる）。
 2. 終わっていたら \`git worktree remove --force ${impl.worktree}\` を実行する。
@@ -1495,7 +1576,7 @@ worktree は消さない（片付けはこのスクリプトが別に行う）�
   // スタック（#936）で、論点がもう別の PR にある（か、上の段の流れがまとめてマージする）ときは、新しく聞かない（スタックにつき質問は 1 つ）
   if (r.merge?.noQuestion) {
     if (r.merge.pointerPr != null && r.merge.pointerPr !== r.impl.pr) {
-      await stackNote(r.impl.pr, `この PR はマージしていない。論点は PR #${r.merge.pointerPr} で扱う（スタック全体で 1 つの論点にまとめている）。理由: ${r.merge.reason ?? '-'}`, true)
+      await stackNote(r.impl.pr, `この PR はマージしていない。論点は PR #${r.merge.pointerPr} で扱う（スタック全体で 1 つの論点にまとめている）。この PR には needs-human を付けていない。回答と \`needs-human\` を外す操作は PR #${r.merge.pointerPr} だけでよい。理由: ${r.merge.reason ?? '-'}`)
     }
     return null
   }
@@ -1569,6 +1650,7 @@ async function runIssueLocked(info) {
       return { issue: info.number, status: 'failed', reason: impl?.summary ?? '実装の段階が失敗した', question: null }
     }
     prIssue.set(impl.pr, info.number)
+    issuePr.set(info.number, impl.pr)
     prImpl.set(impl.pr, { info, impl })
 
     // 実装のエージェントが PR に残した確認事項は、マージの前に確かめる。人の判断が要るならマージせずに止まる
@@ -1736,6 +1818,11 @@ for (const i of infos) {
   done.set(i.number, deferred())
   readySignals.set(i.number, deferred())
   infoByNumber.set(i.number, i)
+  // resume の PR は、流れが登録する前から、この実行の PR と分かるようにする（スタックの段の判定。flowOfPr）
+  if (i.resumeImpl?.pr != null) {
+    resumePrs.set(i.resumeImpl.pr, i.number)
+    resumePrOf.set(i.number, i.resumeImpl.pr)
+  }
 }
 
 const results = await parallel(infos.map(info => async () => {

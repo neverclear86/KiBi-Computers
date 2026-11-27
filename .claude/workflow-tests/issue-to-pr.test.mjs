@@ -828,8 +828,8 @@ test('runId・attempt を文字列で返した CI 待ちの結果も、失敗の
 
 // ---- Stacked PRs（#936） ----
 // 下の段 PR #900（Issue #338。この実行にない）、上の段 PR #906（この実行の Issue #904）の 2 段のスタック
-const LOWER = { pr: 900, branch: 'issue-338-lower', baseRef: 'main', position: 1, state: 'OPEN', draft: false, needsHuman: false, headSha: 'l1' }
-const TOP = { pr: PR, branch: IMPL.branch, baseRef: LOWER.branch, position: 2, state: 'OPEN', draft: false, needsHuman: false, headSha: 't1' }
+const LOWER = { pr: 900, branch: 'issue-338-lower', baseRef: 'main', position: 1, state: 'OPEN', draft: false, needsHuman: false, reviewed: true, headSha: 'l1' }
+const TOP = { pr: PR, branch: IMPL.branch, baseRef: LOWER.branch, position: 2, state: 'OPEN', draft: false, needsHuman: false, reviewed: true, headSha: 't1' }
 const stackOf = (...members) => ({ baseRef: members.find(m => m.pr === PR)?.baseRef ?? 'main', stackNumber: 925, members })
 const STACK2 = stackOf(LOWER, TOP)
 const STACK_CMD = `gh stack merge ${PR} --yes --squash`
@@ -840,7 +840,11 @@ const TWO_ISSUES = [
 const UPPER_IMPL = { ...IMPL, pr: 907, branch: 'issue-905-y', worktree: 'D:/w/issue-905', baseRef: 'issue-904-x' }
 
 test('スタック: 上の段は、下の段から順に取り込み、一番上の木で 1 回だけ確かめて gh stack merge でマージする', async () => {
-  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2] })
+  const r = await run({
+    'stack-detect': [STACK2],
+    'stack-check': [STACK2],
+    'stack-sync': prompt => ({ outcome: 'merged', pushed: true, headSha: 'abc', worktree: prompt.includes('PR #900') ? 'D:/KiBi/.worktrees/issue-338' : 'D:/w/issue-904', summary: 'ok' }),
+  })
   assert.equal(r.issue.status, 'merged')
   assert.equal(r.count('merge'), 0)
   assert.equal(r.count('stack-merge'), 1)
@@ -888,7 +892,10 @@ test('スタック: gh stack merge が権限の判定で拒否されたら、確
   const note = r.promptsOf('stack-note').find(p => p.opts.label === 'stack-note:900')
   assert.ok(note)
   assert.match(note.prompt, /論点は PR #906 で扱う/)
-  assert.match(note.prompt, /needs-human/)
+  // 案内のためだけに needs-human を付けない（人が論点の PR のラベルだけを外して resume したとき、互いを指し合って止まるため）
+  assert.doesNotMatch(note.prompt, /--add-label/)
+  assert.match(note.prompt, /ラベルは付けない/)
+  assert.match(note.prompt, /needs-human を付けていない/)
   assert.equal(r.issue.stackPointer, PR)
 })
 
@@ -1087,6 +1094,205 @@ test('スタック: 同じ実行で上の段の Issue が下の段に依存し�
   const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
   assert.equal(byIssue[904].status, 'ready')
   assert.equal(byIssue[905].status, 'blocked')
+  // 「この実行にない」の分岐ではなく、依存の分岐で待たずに終わる（上の段の流れは、依存先の終わりを待っていて、PR をまだ登録していない）
+  assert.match(byIssue[904].mergeReason, /「依存: #904」/)
+  assert.doesNotMatch(byIssue[904].mergeReason, /この実行にない|と一緒に/)
+  assert.ok(r.logs.some(l => l.includes('上の段の Issue #905 がこの Issue に依存している')))
+})
+
+test('スタック: 推移的な依存（上の段 → 別の Issue → 下の段）でも、下の段は上の段を待たない', async () => {
+  const low = { ...LOWER, pr: PR, branch: IMPL.branch }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: IMPL.branch }
+  const mid = { number: 903, title: 'm', areas: ['c'], openDeps: [904], blockedReason: null, needsPlan: false }
+  const r = await run({
+    select: [{ issues: [TWO_ISSUES[0], mid, { ...TWO_ISSUES[1], openDeps: [903] }] }],
+    implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+    'stack-detect': () => ({ stackNumber: 925, baseRef: 'main', members: [low, up] }),
+  }, { issues: [904, 903, 905] })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[904].status, 'ready')
+  assert.match(byIssue[904].mergeReason, /「依存: #904」/)
+})
+
+test('スタック: 下の段の Issue が一番上の段の Issue に依存していたら、上の段は待たずに止まる（互いに待たない）', async () => {
+  const low = { ...LOWER, pr: PR, branch: IMPL.branch }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: IMPL.branch }
+  const r = await run({
+    select: [{ issues: [{ ...TWO_ISSUES[0], openDeps: [905] }, TWO_ISSUES[1]] }],
+    implement: prompt => prompt.includes('Issue #905') ? UPPER_IMPL : IMPL,
+    'stack-detect': () => ({ stackNumber: 925, baseRef: 'main', members: [low, up] }),
+    'stack-check': () => ({ stackNumber: 925, baseRef: 'main', members: [low, up] }),
+  }, { issues: [904, 905] })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[905].status, 'needs_human')
+  assert.match(byIssue[905].mergeReason, /「依存: #905」/)
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(byIssue[904].status, 'blocked')
+})
+
+// ---- 同じ実行の 2 段が、同じ area・window が埋まっているなどで、片方の流れが PR を登録する前に、もう片方がマージの段階に来る形 ----
+const SAME_AREA = [
+  { number: 904, title: 'a', areas: ['tooling'], openDeps: [], blockedReason: null, needsPlan: false },
+  { number: 905, title: 'b', areas: ['tooling'], openDeps: [], blockedReason: null, needsPlan: false },
+]
+const lowStep = { ...LOWER, pr: 906, branch: 'issue-904-x' }
+const upStep = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: 'issue-904-x' }
+const SAME_AREA_BASE = {
+  implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+  'stack-detect': () => ({ stackNumber: 925, baseRef: 'issue-904-x', members: [lowStep, upStep] }),
+  'stack-check': () => ({ stackNumber: 925, baseRef: 'issue-904-x', members: [lowStep, upStep] }),
+}
+const LOWER_CI_FAILS = {
+  ci: prompt => prompt.includes('PR #906') ? { passed: false, mergeable: 'MERGEABLE', failingChecks: ['build'], failureLog: 'boom' } : OK_CI,
+  'ci-fix': () => ({ pushed: false, rerun: false, summary: '直せない', gradleStillRunning: false, runningLogs: [] }),
+}
+
+test('スタック: 上の段が先にロックを取り（同じ area・window: 1）、下の段が未登録でも、上の段は下の段の知らせを待ってから取り込む', async () => {
+  const r = await run({ ...SAME_AREA_BASE, select: [{ issues: [SAME_AREA[1], SAME_AREA[0]] }] }, { issues: [905, 904], window: 1 })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[904].status, 'merged')
+  assert.equal(byIssue[905].status, 'merged')
+  assert.equal(r.count('stack-merge'), 1)
+  // 下の段（PR #906）の CI が済んでから、取り込みが始まる
+  const lastLowerCi = Math.max(...r.prompts.map((p, i) => p.kind === 'ci' && p.prompt.includes('PR #906') ? i : -1))
+  const firstSync = r.prompts.findIndex(p => p.kind === 'stack-sync')
+  assert.ok(lastLowerCi >= 0 && firstSync > lastLowerCi, `下の段の CI(${lastLowerCi}) の後に取り込み(${firstSync})`)
+  assert.equal(r.count('cleanup'), 2)
+  assert.equal(r.count('cross-check'), 0)
+})
+
+test('スタック: 上の段が先にロックを取り、下の段の CI が落ち続けるなら、上の段は取り込みも確かめもマージもしない', async () => {
+  const r = await run({ ...SAME_AREA_BASE, ...LOWER_CI_FAILS, select: [{ issues: [SAME_AREA[1], SAME_AREA[0]] }] }, { issues: [905, 904], window: 1 })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[905].status, 'needs_human')
+  assert.equal(byIssue[905].stackPointer, 906)
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.equal(r.count('cross-check'), 1)
+})
+
+test('スタック: 下の段が先にロックを取り、上の段が未登録でも、下の段は上の段の結果を待ち、上の段がスタックごとマージして両方 merged になる', async () => {
+  const r = await run({ ...SAME_AREA_BASE, select: [{ issues: SAME_AREA }] }, { issues: [904, 905], window: 1 })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[904].status, 'merged')
+  assert.equal(byIssue[905].status, 'merged')
+  assert.equal(r.count('stack-merge'), 1)
+  assert.equal(r.promptsOf('stack-merge')[0].opts.label, 'stack-merge:907')
+  assert.equal(r.count('merge'), 0)
+  // どちらも自分の worktree を片付ける（下の段が「マージせず」で返して片付けない形にならない）
+  assert.equal(r.count('cleanup'), 2)
+  assert.doesNotMatch(byIssue[904].mergeReason, /この実行にない/)
+})
+
+test('スタック: resume の 2 段（同じ area・window: 1）も、PR を登録する前から、この実行の段として扱う', async () => {
+  const resume = prompt => {
+    const isLow = prompt.includes('PR #906')
+    return { ok: true, title: 't', areas: ['tooling'], branch: isLow ? 'issue-904-x' : 'issue-905-y', worktree: isLow ? 'D:/w/issue-904' : 'D:/w/issue-905', publicApiChanged: false, touchesConcurrency: false, summary: 's', baseRef: isLow ? 'main' : 'issue-904-x' }
+  }
+  const r = await run({ ...SAME_AREA_BASE, ...LOWER_CI_FAILS, resume }, { resume: [{ issue: 905, pr: 907 }, { issue: 904, pr: 906 }], window: 1 })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[905].status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+})
+
+// ---- 下の段の論点の案内（needs-human を付けない） ----
+test('スタック: 上の段が止まって質問したら、下の段には案内だけでラベルを付けず、人が上の段のラベルだけを外せば続けられる', async () => {
+  const denied = fail('merge', '拒否', { stackMergeOutcome: 'permission_denied' })
+  const first = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2], 'stack-merge': [denied] })
+  assert.equal(first.issue.status, 'needs_human')
+  const notes = first.promptsOf('stack-note')
+  assert.ok(notes.length >= 1)
+  for (const n of notes) assert.doesNotMatch(n.prompt, /add-label/, n.opts.label)
+  // 続き: 上の段の needs-human だけが外れた状態（下の段には付いていない）。取り込み・確かめ・マージまで進む
+  const second = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2] })
+  assert.equal(second.issue.status, 'merged')
+  assert.equal(second.count('stack-sync'), 2)
+})
+
+// ---- この実行にない下の段のレビュー（#936） ----
+test('スタック: この実行にない下の段が、自動レビューを通った記録がなければ、取り込みも確かめもせず、一番上の段で 1 回だけ聞く', async () => {
+  const unreviewed = stackOf({ ...LOWER, reviewed: false }, TOP)
+  const r = await run({ 'stack-detect': [unreviewed], 'stack-check': [unreviewed] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.count('ask'), 1)
+  assert.match(r.issue.mergeReason, /レビューなしで main に入る/)
+  assert.match(r.promptOf('stack-detect'), /reviewed/)
+  assert.match(r.promptOf('stack-detect'), /## 自動レビューの結果/)
+})
+
+test('スタック: レビューの記録（reviewed）はスキーマの必須で、この実行の流れがレビューする下の段には求めない', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2] })
+  assert.ok(r.schemaOf('stack-detect').properties.members.items.required.includes('reviewed'))
+  const low = { ...LOWER, pr: 906, branch: 'issue-904-x', reviewed: false }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: 'issue-904-x', reviewed: false }
+  const same = await run({
+    select: [{ issues: TWO_ISSUES }],
+    implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+    'stack-detect': () => ({ stackNumber: 925, baseRef: 'issue-904-x', members: [low, up] }),
+    'stack-check': () => ({ stackNumber: 925, baseRef: 'issue-904-x', members: [low, up] }),
+  }, { issues: [904, 905] })
+  assert.equal(same.result.results.find(x => x.issue === 905).status, 'merged')
+})
+
+// ---- 作業場所と片付け（#936） ----
+const SAME_ISSUE_UPPER = { ...IMPL, pr: 907, branch: 'issue-904-up', worktree: 'D:/KiBi/.worktrees/issue-904', baseRef: 'issue-904-low' }
+const SAME_ISSUE_STACK = stackOf({ ...LOWER, pr: 900, branch: 'issue-904-low' }, { ...TOP, pr: 907, branch: 'issue-904-up', baseRef: 'issue-904-low' })
+const syncAt = (lowerWorktree, upperWorktree = 'D:/w/issue-904') => prompt => ({
+  outcome: 'merged', pushed: true, headSha: 'abc', worktree: prompt.includes('PR #900') ? lowerWorktree : upperWorktree, summary: 'ok',
+})
+
+test('スタック: 1 つの Issue を 2 つの PR に分けた形では、下の段の作業場所を上の段の worktree と同じにせず、PR の番号の場所にする', async () => {
+  const r = await run({
+    implement: [SAME_ISSUE_UPPER],
+    'stack-detect': [SAME_ISSUE_STACK],
+    'stack-check': [SAME_ISSUE_STACK],
+    'stack-sync': syncAt('D:/KiBi/.worktrees/stack-pr-900', 'D:/KiBi/.worktrees/issue-904'),
+  })
+  assert.equal(r.issue.status, 'merged')
+  const lower = r.promptsOf('stack-sync')[0].prompt
+  assert.match(lower, /git worktree add \.worktrees\/stack-pr-900 issue-904-low/)
+  assert.doesNotMatch(lower, /git worktree add \.worktrees\/issue-904 /)
+  // 片付けは、取り込みが返した場所（stack-pr-900）。上の段の worktree（issue-904）は上の段の流れが 1 回だけ片付ける
+  const cleanups = r.promptsOf('cleanup').map(p => p.prompt)
+  assert.equal(cleanups.length, 2)
+  assert.ok(cleanups.some(p => p.includes('worktree D:/KiBi/.worktrees/stack-pr-900 を片付ける') && p.includes('stack-pr-900(?![0-9])') && p.includes('.worktrees/.logs/stack-pr-900')))
+  assert.equal(cleanups.filter(p => p.includes('worktree D:/KiBi/.worktrees/issue-904 を片付ける')).length, 1)
+})
+
+test('スタック: この実行にない下の段の取り込みが、この実行の流れの worktree を返したら、片付けない（その流れが片付ける）', async () => {
+  const r = await run({
+    implement: [SAME_ISSUE_UPPER],
+    'stack-detect': [SAME_ISSUE_STACK],
+    'stack-check': [SAME_ISSUE_STACK],
+    'stack-sync': syncAt('D:\\KiBi\\.worktrees\\issue-904', 'D:/KiBi/.worktrees/issue-904'),
+  })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('cleanup'), 1)
+})
+
+test('スタック: この実行にない下の段の worktree が .worktrees/ の標準の形でなければ、片付けずに報告に残す', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2], 'stack-sync': syncAt('D:/Users/me/work/KiBi') })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('cleanup'), 1)
+  const note = r.promptsOf('stack-note').find(p => p.opts.label === 'stack-note:900')
+  assert.match(note.prompt, /片付けなかった（D:\/Users\/me\/work\/KiBi/)
+})
+
+test('スタック: ブランチ名が issue-<番号>- でない下の段は、stack-pr-<PR> の場所で作業し、同じ場所を片付ける', async () => {
+  const odd = stackOf({ ...LOWER, branch: 'feature-lower' }, { ...TOP, baseRef: 'feature-lower' })
+  const r = await run({ 'stack-detect': [odd], 'stack-check': [odd], 'stack-sync': syncAt('D:/KiBi/.worktrees/stack-pr-900') })
+  assert.equal(r.issue.status, 'merged')
+  assert.match(r.promptsOf('stack-sync')[0].prompt, /git worktree add \.worktrees\/stack-pr-900 feature-lower/)
+  assert.ok(r.promptsOf('cleanup').some(p => p.prompt.includes('worktree D:/KiBi/.worktrees/stack-pr-900 を片付ける')))
+})
+
+test('スタック: 下の段がこの実行にない別の Issue なら、その Issue の場所を使う', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2] })
+  assert.match(r.promptsOf('stack-sync')[0].prompt, /git worktree add \.worktrees\/issue-338 issue-338-lower/)
 })
 
 test('スタック: どのプロンプトも、force を使う gh stack のコマンドや merge-async を実行させない', async () => {
