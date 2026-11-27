@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.ModuleStore
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
 import pro.ikili.kibicomputers.core.persist.SnapshotInspection
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
@@ -116,6 +117,9 @@ object MachineSnapshotContentGameTests {
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
         val modules: Path = helper.level.server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize()
             .resolve(KiBiComputers.MOD_ID).resolve("modules")
+        // READY で書いたときの書き込みの回数と、そのときのプロセスの上限（書くまでは null）
+        var writes: Int? = null
+        var maxProcesses: Int? = null
 
         helper.startSequence().thenWaitUntil {
             val screen = be.wiring.connectedScreen
@@ -123,12 +127,24 @@ object MachineSnapshotContentGameTests {
             val text = lines(screen!!.text)
             helper.assertTrue(be.wiring.bootFailure == null, "boot should not fail but was ${be.wiring.bootFailure}: $text")
             helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
-        }.thenExecute {
-            val maxProcesses = be.computer.machine!!.config.maxProcesses
-            // アンロードの手順と同じく止めてから取り出す
+        }.thenWaitUntil {
+            // アンロードの手順と同じく、止めて READY を確かめてから取り出す。`$` は step の途中の fd_write で出るので、
+            // それだけでは sh が待機点にいるとは限らない（step の途中なら KILL_TRANSIENT が写しの中で殺す。#954）。
+            // READY でなければ放して次の tick にやり直す（止めたままだと燃料待ちが起こされず、READY に近づかないことがある）。
+            // 判定と書き込みは同じ止めた区間で行う（放してから書くと、判定の後に新しい step が始まる）
             be.computer.prepareUnload()
             try {
-                helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+                val readiness = be.computer.saveReadiness()
+                helper.assertTrue(readiness == SaveReadiness.READY, "the machine should be at a wait point but was $readiness")
+                maxProcesses = be.computer.machine!!.config.maxProcesses
+                writes = saveNow(be, CapturePolicy.KILL_TRANSIENT)
+            } finally {
+                be.computer.endQuiesce()
+            }
+        }.thenExecute {
+            // 中身の確かめはやり直しの外に置く（本物の失敗をタイムアウトまで繰り返さない）
+            helper.assertTrue(writes!! > 0, "the case should be saved")
+            run {
                 val identity = be.identity!!
                 val snapshot = DataInputStream(Files.newInputStream(store!!.generationFile(identity.id, identity.generation)).buffered())
                     .use { MachineSnapshot.readFrom(it) }
@@ -136,11 +152,13 @@ object MachineSnapshotContentGameTests {
                     snapshot.coldBootReason == ColdBootReason.NONE,
                     "a machine waiting for input should not need a cold boot but was ${snapshot.coldBootReason}",
                 )
+                // READY で取り出したので、写しの中で殺したプロセスはない（殺したプロセスは層のないゾンビになる）
+                helper.assertTrue(snapshot.killedPids.isEmpty(), "no process should be killed in the copy: ${snapshot.killedPids}")
                 val kinds = snapshot.sections.map { it.kind }
                 helper.assertTrue(SnapshotSection.KERNEL in kinds, "the snapshot should have the KERNEL section: $kinds")
                 helper.assertTrue(SnapshotSection.PROCESS_ABI in kinds, "the snapshot should have PROCESS_ABI sections: $kinds")
                 val contents = try {
-                    SnapshotInspection.inspect(snapshot, maxProcesses)
+                    SnapshotInspection.inspect(snapshot, maxProcesses!!)
                 } catch (e: SnapshotFormatException) {
                     throw IllegalStateException("the KERNEL and PROCESS_ABI sections should be readable", e)
                 }
@@ -169,8 +187,6 @@ object MachineSnapshotContentGameTests {
                     sh!!.originalHash!!.contentEquals(ModuleStore.sha256(osImageEntry("bin/sh"))),
                     "sh should refer to /bin/sh of the OS image",
                 )
-            } finally {
-                be.computer.endQuiesce()
             }
             be.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
