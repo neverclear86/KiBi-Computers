@@ -543,6 +543,18 @@ internal class LongTick(
     }
 }
 
+/**
+ * 負荷試験の出力の、インタプリタに回した数え口の節（#931。[LoadReport.toMarkdown]）。[entries] は段階の名前と、その段階の増分。
+ * どの段階も 0 なら1行だけ
+ */
+internal fun interpreterSection(entries: List<Pair<String, InterpreterCounts>>): String {
+    val interpreted = entries.filter { !it.second.isZero }
+    if (interpreted.isEmpty()) return "\nインタプリタに回した数え口（#931。段階ごとの増分）: どの段階も 0\n"
+    val sb = StringBuilder("\nインタプリタに回した数え口（#931。段階ごとの増分。コンパイルは JVM 全体、プロセスはサーバー全体）:\n\n")
+    for ((label, counts) in interpreted) sb.append("- ").append(label).append(": ").append(counts).append('\n')
+    return sb.toString()
+}
+
 /** 平均と最大（ミリ秒） */
 internal data class AvgMax(val avg: Double, val max: Double) {
     override fun toString(): String = String.format(Locale.ROOT, "%.3f / %.3f", avg, max)
@@ -1036,13 +1048,7 @@ internal class LoadReport(
             }
         }
         // インタプリタに回した数え口（#931）。どの段階も 0 なら1行だけ
-        val interpreted = phases.filter { !it.interpreter.isZero }
-        if (interpreted.isEmpty()) {
-            sb.append("\nインタプリタに回した数え口（#931。段階ごとの増分）: どの段階も 0\n")
-        } else {
-            sb.append("\nインタプリタに回した数え口（#931。段階ごとの増分。コンパイルは JVM 全体、プロセスはサーバー全体）:\n\n")
-            for (p in interpreted) sb.append("- ").append(p.phase.label).append(": ").append(p.interpreter).append('\n')
-        }
+        sb.append(interpreterSection(phases.map { it.phase.label to it.interpreter }))
         val withFuel = phases.filter { it.fuel != null }
         if (withFuel.isNotEmpty()) {
             sb.append("\n燃料切れの数え口（#821。測った区間の増分。サーバー全体）:\n\n")

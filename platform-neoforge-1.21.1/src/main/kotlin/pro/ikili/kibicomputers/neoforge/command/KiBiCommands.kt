@@ -1,9 +1,12 @@
 package pro.ikili.kibicomputers.neoforge.command
 
+import com.mojang.brigadier.arguments.IntegerArgumentType
 import com.mojang.brigadier.arguments.LongArgumentType
+import com.mojang.brigadier.arguments.StringArgumentType
 import com.mojang.brigadier.context.CommandContext
 import net.minecraft.commands.CommandSourceStack
 import net.minecraft.commands.Commands
+import net.minecraft.commands.SharedSuggestionProvider
 import net.minecraft.network.chat.Component
 import net.minecraft.server.level.ServerPlayer
 import net.neoforged.neoforge.common.NeoForge
@@ -12,6 +15,7 @@ import net.neoforged.neoforge.event.RegisterCommandsEvent
 import pro.ikili.kibicomputers.neoforge.computer.AccessRequests
 import pro.ikili.kibicomputers.core.kernel.InterpreterCounts
 import pro.ikili.kibicomputers.core.kernel.InterpreterRanking
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
 import pro.ikili.kibicomputers.neoforge.computer.CaseAccess
 import pro.ikili.kibicomputers.neoforge.machine.SaveCleanups
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
@@ -24,8 +28,10 @@ import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
  *   実行できるのは本物のプレイヤーだけ（FakePlayer とコンソールは不可）
  * - `/kibicomputers saves cleanup [dry-run|force]`・`saves status`（#564、ADR 0564）: 残ったディレクトリとモジュールの置き場の掃除を始める・
  *   最後の掃除の結果を見る。OP（コンフィグの `opPermissionLevel`）とコンソールだけ
- * - `/kibicomputers runtime interpreter`（#931、ADR 0088 の「追記（#931）」）: WASM をインタプリタに回した数え口（理由ごとのコンパイルの回数と
- *   プロセスの数）と、インタプリタで動くコードを持つプログラムを多く動かした上位の台（`Machine.id`・位置・ID）を見る。
+ * - `/kibicomputers runtime interpreter [<reason>|all [<limit>]]`（#931、ADR 0088 の「追記（#931）」）: WASM をインタプリタに回した数え口（理由ごとの
+ *   コンパイルの回数とプロセスの数）と、インタプリタで動くコードを持つプログラムを多く動かした上位の台（`Machine.id`・位置・ID）を見る。
+ *   台は、既定は理由を問わない回数で上位 10 台。理由（`InterpreterReason` の名前）を渡すと、その理由の回数で並べ（既定の経路の SIMD_FUNCTIONS の台に
+ *   埋もれずに、TOO_LARGE_FUNCTIONS などの台を引ける）、`limit`（最大 1,000）で台数を増やして、DEBUG の行の `Machine.id` を全部位置に結べる。
  *   OP（`opPermissionLevel`）とコンソールだけ。全台をなめるのは打ったときだけ
  */
 internal object KiBiCommands {
@@ -50,7 +56,21 @@ internal object KiBiCommands {
                 ).then(
                     Commands.literal("runtime")
                         .requires { it.hasPermission(CaseAccess.rules().opPermissionLevel) }
-                        .then(Commands.literal("interpreter").executes { ctx -> interpreter(ctx) }),
+                        .then(
+                            Commands.literal("interpreter")
+                                .executes { ctx -> interpreter(ctx, null, InterpreterRanking.DEFAULT_LIMIT) }
+                                .then(
+                                    Commands.argument("reason", StringArgumentType.word())
+                                        .suggests { _, builder -> SharedSuggestionProvider.suggest(listOf(ALL) + InterpreterReason.entries.map { it.name }, builder) }
+                                        .executes { ctx -> interpreter(ctx, StringArgumentType.getString(ctx, "reason"), InterpreterRanking.DEFAULT_LIMIT) }
+                                        .then(
+                                            Commands.argument("limit", IntegerArgumentType.integer(1, MAX_LIMIT))
+                                                .executes { ctx ->
+                                                    interpreter(ctx, StringArgumentType.getString(ctx, "reason"), IntegerArgumentType.getInteger(ctx, "limit"))
+                                                },
+                                        ),
+                                ),
+                        ),
                 ),
             )
         }
@@ -76,17 +96,29 @@ internal object KiBiCommands {
 
     /**
      * インタプリタに回した数え口と、上位の台（#931）。集計と選び方は core（[InterpreterCounts]・[InterpreterRanking]）、ここは台と位置の対応だけ。
-     * 返す値は、1回以上数えた台の数
+     * [reasonArg] が `null` か `all` なら理由を問わない回数、理由の名前なら、その理由の回数で台を並べる。上位 [limit] 台を出す。
+     * 返す値は、数えた台の数（理由を絞ったときは、その理由の台）
      */
-    private fun interpreter(ctx: CommandContext<CommandSourceStack>): Int {
+    private fun interpreter(ctx: CommandContext<CommandSourceStack>, reasonArg: String?, limit: Int): Int {
+        val source = ctx.source
+        val unfiltered = reasonArg == null || reasonArg.equals(ALL, ignoreCase = true)
+        val reason = if (unfiltered) null else InterpreterCounts.parseReason(reasonArg!!)
+        if (!unfiltered && reason == null) {
+            return reply(source, Component.translatable(KEY_INTERPRETER_BAD_REASON, reasonArg, InterpreterReason.entries.joinToString(", ") { it.name }), false)
+        }
         val manager = ServerMachines.current
         val counts = InterpreterCounts.current(manager?.scheduler)
-        val source = ctx.source
-        source.sendSuccess({ Component.translatable(KEY_INTERPRETER_COMPILES, counts.compileSummary()) }, false)
-        source.sendSuccess({ Component.translatable(KEY_INTERPRETER_PROCESSES, counts.processSummary()) }, false)
-        val ranked = InterpreterRanking.top(ServerMachines.trackedCases()) { it.computer.machine?.interpretedProcessCount ?: 0L }
+        source.sendSuccess({ Component.translatable(KEY_INTERPRETER_COMPILES, orNone(counts.compileSummary())) }, false)
+        source.sendSuccess({ Component.translatable(KEY_INTERPRETER_PROCESSES, orNone(counts.processSummary())) }, false)
+        val ranked = InterpreterRanking.top(ServerMachines.trackedCases(), limit) {
+            val machine = it.computer.machine
+            if (machine == null) 0L else if (reason == null) machine.interpretedProcessCount else machine.interpretedProcessCount(reason)
+        }
         if (ranked.machines == 0) {
-            source.sendSuccess({ Component.translatable(KEY_INTERPRETER_NO_MACHINES) }, false)
+            source.sendSuccess(
+                { if (reason == null) Component.translatable(KEY_INTERPRETER_NO_MACHINES) else Component.translatable(KEY_INTERPRETER_NO_MACHINES_REASON, reason.name) },
+                false,
+            )
             return 0
         }
         for ((i, r) in ranked.top.withIndex()) {
@@ -99,7 +131,7 @@ internal object KiBiCommands {
                 be.owner?.toString() ?: "-",
                 be.currentIdentity?.id?.toString() ?: "-",
                 r.count,
-                InterpreterCounts.formatReasons(machine?.interpretedReasons.orEmpty()),
+                orNone(InterpreterCounts.formatReasons(machine?.interpretedReasons.orEmpty())),
                 machine?.lastInterpretedProgram ?: "-",
             )
             source.sendSuccess({ line }, false)
@@ -108,11 +140,24 @@ internal object KiBiCommands {
         return ranked.machines
     }
 
+    /** core が空文字列で返した「なし」を、プレイヤーの言語の文言にする（core には特定の言語の文字列を持たない） */
+    private fun orNone(text: String): Component =
+        if (text.isEmpty()) Component.translatable(KEY_INTERPRETER_VALUE_NONE) else Component.literal(text)
+
+    /** 理由の引数で、理由を絞らない指定 */
+    private const val ALL = "all"
+
+    /** 台の数の引数の上限（目標の台数の目安） */
+    private const val MAX_LIMIT = 1000
+
     private const val KEY_INTERPRETER_COMPILES = "message.kibicomputers.runtime.interpreter.compiles"
     private const val KEY_INTERPRETER_PROCESSES = "message.kibicomputers.runtime.interpreter.processes"
     private const val KEY_INTERPRETER_MACHINE = "message.kibicomputers.runtime.interpreter.machine"
     private const val KEY_INTERPRETER_OTHERS = "message.kibicomputers.runtime.interpreter.others"
     private const val KEY_INTERPRETER_NO_MACHINES = "message.kibicomputers.runtime.interpreter.none"
+    private const val KEY_INTERPRETER_NO_MACHINES_REASON = "message.kibicomputers.runtime.interpreter.none.reason"
+    private const val KEY_INTERPRETER_VALUE_NONE = "message.kibicomputers.runtime.interpreter.value.none"
+    private const val KEY_INTERPRETER_BAD_REASON = "message.kibicomputers.runtime.interpreter.bad_reason"
 
     private const val KEY_CLEANUP_STARTED = "message.kibicomputers.saves.cleanup.started"
     private const val KEY_CLEANUP_BUSY = "message.kibicomputers.saves.cleanup.busy"

@@ -117,6 +117,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
@@ -480,6 +481,9 @@ public class Machine private constructor(
      */
     private val interpretedProcesses = AtomicLong()
 
+    /** [interpretedProcesses] の理由ごと（[InterpreterReason] の順。コンポーネントで理由が複数あれば、それぞれに数える）。書くのはカーネルロックの中 */
+    private val interpretedProcessesByReason = AtomicLongArray(InterpreterReason.entries.size)
+
     /** [interpretedProcesses] の理由の和（[InterpreterReason.bit]）。書くのはカーネルロックの中 */
     @Volatile
     private var interpretedReasonBits = 0
@@ -495,6 +499,13 @@ public class Machine private constructor(
      */
     public val interpretedProcessCount: Long get() = interpretedProcesses.get()
 
+    /**
+     * [interpretedProcessCount] のうち、[reason] でインタプリタに回したコードを持つプログラムの分（#931）。運用者の口が、理由で絞って台を並べるために読む
+     * （既定の経路の SIMD_FUNCTIONS の台が多くても、TOO_LARGE_FUNCTIONS の台を引ける）。コンポーネントで理由が複数あれば、それぞれに数えるので、
+     * 理由ごとの和は [interpretedProcessCount] より大きくなりうる
+     */
+    public fun interpretedProcessCount(reason: InterpreterReason): Long = interpretedProcessesByReason.get(reason.ordinal)
+
     /** [interpretedProcessCount] に数えたプログラムの、インタプリタに回した理由の和（#931） */
     public val interpretedReasons: Set<InterpreterReason> get() = InterpreterReason.setOf(interpretedReasonBits)
 
@@ -509,6 +520,7 @@ public class Machine private constructor(
     internal fun noteProcessProgramLocked(program: Program, pid: Int, restored: Boolean) {
         val use = program.interpreterUse ?: return
         interpretedProcesses.incrementAndGet()
+        for (r in InterpreterReason.entries) if (use.reasonBits and r.bit != 0) interpretedProcessesByReason.incrementAndGet(r.ordinal)
         lastInterpretedLabel = program.label
         scheduler.countInterpretedProcess(use)
         val fresh = use.reasonBits and interpretedReasonBits.inv()

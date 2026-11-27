@@ -14,6 +14,7 @@ import pro.ikili.kibicomputers.core.runtime.InterpreterReason
 import pro.ikili.kibicomputers.core.runtime.InterpreterUse
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import java.time.Duration
 import java.util.Collections
 import java.util.logging.Handler
@@ -92,6 +93,11 @@ class InterpreterCountsTest {
             a.spawnTest(plain, driver(), unmetered = true)
             b.spawnTest(plain, driver(), unmetered = true)
             assertEquals(3L, a.interpretedProcessCount)
+            // 理由で絞って台を並べるための、台ごとの理由別の回数（既定の経路の SIMD_FUNCTIONS に埋もれずに、TOO_LARGE_FUNCTIONS の台を引ける）
+            assertEquals(2L, a.interpretedProcessCount(InterpreterReason.TOO_LARGE_FUNCTIONS))
+            assertEquals(1L, a.interpretedProcessCount(InterpreterReason.SIMD_FUNCTIONS))
+            assertEquals(0L, a.interpretedProcessCount(InterpreterReason.WHOLE_MODULE))
+            assertEquals(0L, b.interpretedProcessCount(InterpreterReason.TOO_LARGE_FUNCTIONS))
             assertEquals(setOf(InterpreterReason.SIMD_FUNCTIONS, InterpreterReason.TOO_LARGE_FUNCTIONS), a.interpretedReasons)
             assertEquals(simd.label, a.lastInterpretedProgram)
             assertEquals(0L, b.interpretedProcessCount)
@@ -123,6 +129,50 @@ class InterpreterCountsTest {
             assertEquals(1L, h.scheduler.interpretedProcessTotal)
             hold.close()
         }
+    }
+
+    /** 中の core モジュールのうち、SIMD の関数だけを回すもの（SIMD_FUNCTIONS）と、例外処理と SIMD でモジュール全体を回すもの（SIMD_WITH_EXCEPTIONS） */
+    private val twoInterpretedModules = """
+        (component
+          (core module ${'$'}a
+            (func (export "f") (result i32) (local v128) (i32.const 1)))
+          (core module ${'$'}b
+            (tag ${'$'}t)
+            (func (export "g") (result i32) (local v128) (i32.const 2)))
+          (core instance ${'$'}ia (instantiate ${'$'}a))
+          (core instance ${'$'}ib (instantiate ${'$'}b)))
+    """
+
+    @Test
+    fun `実物のコンポーネントは、中のcoreモジュールの和で数える（ComponentProgramからProgram・台・スケジューラまで）`() = timeout(limit) {
+        Harness(sharePrograms = false).use { h ->
+            val component = LinkTesting.load(twoInterpretedModules)
+            // ComponentProgram.interpreterUse は、中の core モジュールの和（理由2つ、全体を回すモジュール 1 個、回す関数 1 個）
+            val use = checkNotNull(component.interpreterUse) { "中の core モジュールがインタプリタで動くコードを持つはず" }
+            assertEquals(setOf(InterpreterReason.SIMD_FUNCTIONS, InterpreterReason.SIMD_WITH_EXCEPTIONS), use.reasons)
+            assertEquals(1, use.wholeModules)
+            assertEquals(1, use.functions)
+            val program = Program.component(component)
+            assertEquals(use, program.interpreterUse)
+            val m = h.machine()
+            val hold = m.quiesce()
+            m.spawnTest(program, driver(), unmetered = true)
+            assertEquals(1L, m.interpretedProcessCount)
+            assertEquals(1L, m.interpretedProcessCount(InterpreterReason.SIMD_FUNCTIONS))
+            assertEquals(1L, m.interpretedProcessCount(InterpreterReason.SIMD_WITH_EXCEPTIONS))
+            assertEquals(program.label, m.lastInterpretedProgram)
+            assertEquals(1L, h.scheduler.interpretedProcessCount(InterpreterReason.SIMD_FUNCTIONS))
+            assertEquals(1L, h.scheduler.interpretedProcessCount(InterpreterReason.SIMD_WITH_EXCEPTIONS))
+            assertEquals(1L, h.scheduler.interpretedProcessTotal)
+            hold.close()
+        }
+    }
+
+    @Test
+    fun `インタプリタに回していないコンポーネントは数えない`() {
+        val plain = LinkTesting.load("(component (core module ${'$'}a (func (export \"f\") (result i32) (i32.const 1))) (core instance ${'$'}ia (instantiate ${'$'}a)))")
+        assertNull(plain.interpreterUse)
+        assertNull(Program.component(plain).interpreterUse)
     }
 
     @Test
@@ -210,8 +260,12 @@ class InterpreterCountsTest {
             // コンパイルの回数は JVM 全体なので、ほかのテストで動きうる。ここで読み込んだのはダミーなので、自分では増やさない
             assertEquals("WHOLE_MODULE 1", delta.processSummary())
             assertTrue(InterpreterCounts.ZERO.isZero)
-            assertEquals("なし", InterpreterCounts.ZERO.compileSummary())
-            assertEquals("なし", InterpreterCounts.formatReasons(emptySet()))
+            // core は特定の言語の文字列を返さない（空なら、運用者の口が言語ごとの文言にする）
+            assertEquals("", InterpreterCounts.ZERO.compileSummary())
+            assertEquals("", InterpreterCounts.ZERO.processSummary())
+            assertEquals("", InterpreterCounts.formatReasons(emptySet()))
+            assertEquals(InterpreterReason.TOO_LARGE_FUNCTIONS, InterpreterCounts.parseReason("too_large_functions"))
+            assertNull(InterpreterCounts.parseReason("nothing"))
             assertEquals("SIMD_FUNCTIONS, WHOLE_MODULE", InterpreterCounts.formatReasons(setOf(InterpreterReason.WHOLE_MODULE, InterpreterReason.SIMD_FUNCTIONS)))
         }
     }

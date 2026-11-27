@@ -35,13 +35,18 @@ public class InterpreterCounts private constructor(
         LongArray(processCounts.size) { processCounts[it] - other.processCounts[it] },
     )
 
-    /** コンパイルの回数の要約（0 でない理由だけ。どれも 0 なら `なし`）。例: `TOO_LARGE_FUNCTIONS 2, SIMD_FUNCTIONS 1` */
+    /**
+     * コンパイルの回数の要約（0 でない理由だけ。宣言の順）。例: `SIMD_FUNCTIONS 1, TOO_LARGE_FUNCTIONS 2`。
+     * どれも 0 なら空文字列（運用者の口が言語ごとの文言に差し替える。core には特定の言語の文字列を持たない）
+     */
     public fun compileSummary(): String = summary(compileCounts)
 
     /** プロセスの数の要約（[compileSummary] と同じ書き方） */
     public fun processSummary(): String = summary(processCounts)
 
-    override fun toString(): String = "インタプリタに回したコンパイル: ${compileSummary()} / インタプリタのコードを持つプロセス: ${processSummary()}"
+    /** 負荷試験の出力（日本語）の1行 */
+    override fun toString(): String =
+        "インタプリタに回したコンパイル: ${compileSummary().ifEmpty { "なし" }} / インタプリタのコードを持つプロセス: ${processSummary().ifEmpty { "なし" }}"
 
     override fun equals(other: Any?): Boolean =
         other is InterpreterCounts && compileCounts.contentEquals(other.compileCounts) && processCounts.contentEquals(other.processCounts)
@@ -63,15 +68,16 @@ public class InterpreterCounts private constructor(
             )
         }
 
-        /** 理由の並び（宣言の順。空なら `なし`）。運用者の口で、台ごとの理由を書くのに使う */
+        /** 理由の並び（宣言の順。空なら空文字列）。運用者の口で、台ごとの理由を書くのに使う */
         @JvmStatic
-        public fun formatReasons(reasons: Set<InterpreterReason>): String =
-            if (reasons.isEmpty()) "なし" else reasons.sortedBy { it.ordinal }.joinToString(", ")
+        public fun formatReasons(reasons: Set<InterpreterReason>): String = reasons.sortedBy { it.ordinal }.joinToString(", ")
 
-        private fun summary(counts: LongArray): String {
-            val parts = InterpreterReason.entries.filter { counts[it.ordinal] != 0L }.map { "${it.name} ${counts[it.ordinal]}" }
-            return if (parts.isEmpty()) "なし" else parts.joinToString(", ")
-        }
+        /** 運用者の口の引数の理由（[InterpreterReason.name]。大文字小文字を問わない）。なければ `null` */
+        @JvmStatic
+        public fun parseReason(name: String): InterpreterReason? = InterpreterReason.entries.firstOrNull { it.name.equals(name, ignoreCase = true) }
+
+        private fun summary(counts: LongArray): String =
+            InterpreterReason.entries.filter { counts[it.ordinal] != 0L }.joinToString(", ") { "${it.name} ${counts[it.ordinal]}" }
     }
 }
 
