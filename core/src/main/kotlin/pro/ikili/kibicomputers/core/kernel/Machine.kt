@@ -1962,7 +1962,6 @@ public class Machine private constructor(
         val host = KernelDrivers.COMPONENT_HOST
         val loader = scheduler.options.programLoader ?: ProgramLoader(Program::loadExecutable)
         // 公平の組の読み込みの上限で断るのはゲストの exec だけ（init は parentPid = 0。起動の失敗にしない。#738）
-        val loader = scheduler.options.programLoader ?: ProgramLoader(Program::loadExecutable)
         val future = scheduler.programs.load(id, fairShareGroup, parentPid != 0, executable.bytes, metered, waitImports) { bytes ->
             loader.load(runtime, bytes, limits, metered, waitImports, host)
         }

@@ -327,7 +327,6 @@ internal class MachineRestore(private val machine: Machine, private val request:
         val host = KernelDrivers.COMPONENT_HOST
         val loader = machine.scheduler.options.programLoader ?: ProgramLoader(Program::loadExecutable)
         // 復元は公平の組の読み込みの上限では断らない（断ると冷えた起動になり、動いていた状態を失う。#738）
-        val loader = machine.scheduler.options.programLoader ?: ProgramLoader(Program::loadExecutable)
         return machine.scheduler.programs.load(machine.id, machine.fairShareGroup, false, bytes, source.metered, waitImports) { b ->
             loader.load(runtime, b, limits, source.metered, waitImports, host)
         }
