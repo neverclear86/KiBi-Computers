@@ -16,7 +16,7 @@ import java.util.IdentityHashMap
  * フィールド 4,000 個の record を `(type (eq ..))` で受ける引数 100 個 × 100 回で約 13 秒）。そこで、ここで別に抑える。
  *
  * 見積もりは、型の確認ごとの、確かめる型の大きさの合計と、インスタンス化ごとの型の写し直しの大きさの合計と、
- * 覚えない型のたどり（自由変数と名前の確かめ）の大きさの合計（#955。[Info.scan]）。
+ * 覚えない型のたどり（自由変数と名前の確かめ）の大きさの合計（#955。[Info.scan]）と、インスタンスの export ごとの resource のパスの写し（#964）。
  *
  * - 型の確認: コンポーネントのインスタンス化の引数（種類を問わない）と、型を付けた export（`(export "x" (func $f) (func (type $t)))`）。
  *   それぞれ、渡すもの（export するもの）の型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
@@ -68,12 +68,19 @@ import java.util.IdentityHashMap
  *   1 ノードの手間は、見積もりの単位（写し直し・型の確認）よりずっと小さいので、[SCAN_NODES_PER_UNIT] ノードを 1 と数える
  *   （切り上げ。ADR 0262 の「検証の時間の見積もり」の測定）
  *
+ * - resource のパスの写し（#964。[Estimate.explicitCost]）: wasmparser は、インスタンスを export するたびに（export の並び
+ *   （[InstanceExpr.FromExports]）の `instantiate_component_exports`、コンポーネントの export と型宣言の中のインスタンスの export の
+ *   `prepare_instance_export`）、そのインスタンスの型の explicit な resource（`explicit_resources`）を 1 件ずつ、パスを 1 つ長くして写す。
+ *   型の確認もインスタンス化もないので、resource を多く export するインスタンスを並びで何度も export する形は、前は見積もりが
+ *   ほぼ 0 のまま検証が時間の上限に届いた（`(sub resource)` 2,000 個のインスタンスを 499 回 export する並び 40 個・174 KB。#935 のレビュー）。
+ *   1 件を見積もりの 1（約 0.5 µs）と数え、パスの要素の写しは型のたどりのノードとして数える。インスタンスが持つ件数 [Info.explicit] は、
+ *   export する resource の型と、export するインスタンスの件数の合計。wasmparser の表は resource の id を鍵にするので、同じ resource の
+ *   集まり（[Info.explicitKey]）のインスタンスは 1 回だけ足す（並びを並びで何度も export しても掛け算にしない）。
+ *   resource を新しく作るところ（resource を定義する型の宣言、インスタンス化）と、インスタンスの export の alias は、別の集まりとする（大きい側）
+ *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
  * ただし canon は、型を共有して膨らむ型をたどる（lift・lower・`task.return`・stream・future の read・write）ので、上の 3 つ目として数える。
- * resource を多く export するインスタンスを、export の並びで作るインスタンス（[InstanceExpr.FromExports]）で何度も
- * export する形も、型の確認もインスタンス化もないので、見積もりがほぼ 0 のまま検証が時間の上限に届く
- * （`(sub resource)` 2,000 個のインスタンスを 499 回 export する並び 40 個・174 KB。#935 のレビュー。#964 で扱う）。
  * 型を付けた export（`(export "x" (component $c) (component (type $ct)))`）の確認も、渡す側の大きさしか数えない
  * （コンポーネントの部分型は import が反変で、確認の手間は受ける側の import の数に比例する）ので、見積もりが
  * 小さいまま検証が時間の上限に届く（受ける側の import 4,000 個 × 型を付けた export 5,000 個。#935 のレビュー。#963 で扱う）。
@@ -109,7 +116,8 @@ internal object ComponentValidationCost {
 
     /**
      * 見積もり。[checkCount] は型の確認の回数、[maxTypeWeight] は型の大きさの最大、[cost] は見積もりの値（確かめる型の大きさと、
-     * 写し直しの大きさと、型のたどりの合計）、[remapCost] はそのうちの写し直しの分、[scanCost] は型のたどりの分（#955）。
+     * 写し直しの大きさと、型のたどりと、resource のパスの写しの合計）、[remapCost] はそのうちの写し直しの分、[scanCost] は
+     * 型のたどりの分（#955）、[explicitCost] は resource のパスの写しの件数（#964。パスの要素の写しは [scanCost] に入る）。
      * [work] は、写し直しの大きさをたどった手数（積んだ参照の数。見積もりそのものの手間）。[check] は、これが見積もりの上限の
      * [WORK_FACTOR] 倍を超えたら、[cost] によらず手数で断る（そのときの [cost] は途中までの値）
      */
@@ -120,6 +128,7 @@ internal object ComponentValidationCost {
         val remapCost: Long,
         val work: Long,
         val scanCost: Long,
+        val explicitCost: Long,
     )
 
     private fun maxWorkOf(budget: Long): Long = if (budget > SATURATED / WORK_FACTOR) SATURATED else budget * WORK_FACTOR
@@ -131,7 +140,7 @@ internal object ComponentValidationCost {
     private fun estimate(root: ParsedComponent, budget: Long): Estimate {
         val walker = Walker(budget, maxWorkOf(budget))
         walker.component(root, null)
-        return Estimate(walker.checks, walker.maxSize, walker.cost, walker.remapCost, walker.work, walker.scanCost)
+        return Estimate(walker.checks, walker.maxSize, walker.cost, walker.remapCost, walker.work, walker.scanCost, walker.explicitCost)
     }
 
     /** 見積もりが [limits] の上限を超えていたら [WasmLoadException] */
@@ -149,7 +158,8 @@ internal object ComponentValidationCost {
         if (e.cost > limits.maxValidationCost) {
             throw WasmLoadException(
                 "コンポーネントの検証が重すぎる見込み（型の確認 ${e.checkCount} 回、確かめる型の大きさと写し直しと型のたどりの合計 " +
-                    "${e.cost}（型の大きさの最大 ${e.maxTypeWeight}、写し直し ${e.remapCost}、型のたどり ${e.scanCost}）。" +
+                    "${e.cost}（型の大きさの最大 ${e.maxTypeWeight}、写し直し ${e.remapCost}、型のたどり ${e.scanCost}、" +
+                    "resource のパスの写し ${e.explicitCost}）。" +
                     "上限 ${limits.maxValidationCost}）",
             )
         }
@@ -184,9 +194,51 @@ internal object ComponentValidationCost {
          * export だけ、コンポーネント型・コンポーネントは import と export の合計。100 万で止めない
          */
         val scan: Long = 1,
+        /**
+         * インスタンス（インスタンス型）として export したときに、wasmparser が写す explicit な resource の数の上限
+         * （`explicit_resources`。#964）。export する resource の型と、export するインスタンスの [explicit] の合計
+         * （同じ [explicitKey] のものは 1 回だけ）。コンポーネント・コンポーネント型は、インスタンス化でできるインスタンスの分
+         */
+        val explicit: Long = 0,
+        /** [explicit] のパスの長さの最大（#964） */
+        val explicitDepth: Long = 0,
+        /** resource の型か（`(sub resource)`・`(resource ..)` と、それを `eq`・alias・export で引いたもの。#964） */
+        val isResource: Boolean = false,
+        /**
+         * [explicit] の resource の集まりの同一性（#964）。`null` なら [content]（なければ自分）。wasmparser が resource を
+         * 新しく作るところ（resource を定義する型の import・export の宣言、インスタンス化）と、引き方で同じと言い切れないところ
+         * （インスタンスの export の alias）は、新しいものにする（重なりを除かない。大きい側）
+         */
+        val resourceKey: Any? = null,
     ) {
+        /** [explicit] の重なりを除く鍵 */
+        val explicitKey: Any get() = resourceKey ?: content ?: this
+
         /** 写し直しの大きさ（まだなら -1） */
         var flat = -1L
+    }
+
+    /**
+     * インスタンス・インスタンス型の export の、explicit な resource の数とパスの長さを積む（#964）。同じ鍵
+     * （[Info.explicitKey]）のインスタンスは 1 回だけ足す（wasmparser の `explicit_resources` は resource の id を鍵にした表なので、
+     * 同じ resource を何度入れても増えない。除かないと、並びを並びで何度も export する形で掛け算になり、断る側に大きく外れる）
+     */
+    private class ExplicitAcc {
+        var count = 0L
+        var depth = 0L
+        private val seen = IdentityHashMap<Any, Unit>()
+
+        /** export したもの [info]（種類 [sort]）を足す。インスタンスはその [Info.explicit]、resource の型は 1 件 */
+        fun add(info: Info, sort: Sort) {
+            if (sort == Sort.INSTANCE) {
+                if (info.explicit == 0L || seen.put(info.explicitKey, Unit) != null) return
+                count = minOf(count + info.explicit, SATURATED)
+                depth = maxOf(depth, minOf(info.explicitDepth + 1, SATURATED))
+            } else if (sort == Sort.TYPE && info.isResource) {
+                count = minOf(count + 1, SATURATED)
+                depth = maxOf(depth, 1)
+            }
+        }
     }
 
     /** 添字空間の持ち主の種類（wasmparser の `ComponentKind`） */
@@ -368,13 +420,49 @@ internal object ComponentValidationCost {
         private fun sum(a: Long, b: Long): Long = minOf(a + b, MAX_TYPE_SIZE)
 
         /** 引けない参照の代わり（それまでの最大の大きさの、中を持たない型） */
-        private fun unknown(): Info = Info(maxSize, remapBound = maxFull, scan = maxScan)
+        private fun unknown(): Info =
+            Info(
+                maxSize, remapBound = maxFull, scan = maxScan, explicit = maxExplicit, explicitDepth = maxExplicitDepth,
+                isResource = true,
+            )
+
+        /** それまでに見た [Info.explicit] の最大（引けないインスタンスの代わり。#964） */
+        private var maxExplicit = 0L
+
+        /** それまでに見た [Info.explicitDepth] の最大 */
+        private var maxExplicitDepth = 0L
+
+        /** そのうちの resource のパスの写しの分（#964。パスの要素の写しは [scanCost] に入る） */
+        var explicitCost = 0L
+
+        private fun noteExplicit(acc: ExplicitAcc) {
+            if (acc.count > maxExplicit) maxExplicit = acc.count
+            if (acc.depth > maxExplicitDepth) maxExplicitDepth = acc.depth
+        }
+
+        /**
+         * インスタンス [info] を export する（export の並び・コンポーネントの export・型宣言の中のインスタンスの export）。
+         * wasmparser は、そのたびにインスタンスの型の explicit な resource を 1 件ずつ、パスを 1 つ長くして写す
+         * （`instantiate_component_exports`・`prepare_instance_export`。#964）。1 件を見積もりの 1 と数え（約 0.5 µs）、
+         * パスの要素の写しを型のたどりのノードとして数える。引けなければ、それまでの最大
+         */
+        private fun exportInstance(info: Info?) {
+            val n = info?.explicit ?: maxExplicit
+            if (n == 0L) return
+            val depth = info?.explicitDepth ?: maxExplicitDepth
+            cost = add(cost, n)
+            explicitCost = add(explicitCost, n)
+            scanned(mul(n, depth))
+        }
+
+        private fun mul(a: Long, b: Long): Long = if (a != 0L && b > SATURATED / a) SATURATED else minOf(a * b, SATURATED)
 
         /** wasmparser が [info] を写して新しく作る型（コンポーネントは、インスタンス化でできるインスタンスの型も引き継ぐ） */
-        private fun copied(info: Info?): Info? = info?.let {
+        private fun copied(info: Info?, fresh: Boolean = false): Info? = info?.let {
             Info(
                 it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, instanceView = it.instanceView, res = it.res,
-                scan = it.scan,
+                scan = it.scan, explicit = it.explicit, explicitDepth = it.explicitDepth, isResource = it.isResource,
+                resourceKey = if (fresh) Any() else it.explicitKey,
             )
         }
 
@@ -456,6 +544,8 @@ internal object ComponentValidationCost {
             // たどる大きさ（#955）
             var scan = 1L
             var exportScan = 1L
+            // export の explicit な resource（#964）
+            val explicitAcc = ExplicitAcc()
             for (section in c.sections) {
                 when (section) {
                     is ComponentSection.Nested -> s.components += component(section.component, s)
@@ -481,10 +571,11 @@ internal object ComponentValidationCost {
                                 // できるインスタンスの型は、そのコンポーネントの export だけ（写して新しく作る）。
                                 // export だけの型を引けないコンポーネントは、import も含めた型にする（大きい側）
                                 val view = target?.let { it.instanceView ?: it.content ?: it }
+                                // インスタンス化のたびに resource は新しくなる（#964。重なりを除かない）
                                 view?.let {
                                     Info(
                                         it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, res = it.res,
-                                        scan = it.scan,
+                                        scan = it.scan, explicit = it.explicit, explicitDepth = it.explicitDepth, resourceKey = Any(),
                                     )
                                 }
                             }
@@ -504,6 +595,10 @@ internal object ComponentValidationCost {
                             else -> copied(found)
                         }
                         val ref = info ?: unknown()
+                        // インスタンスの export は、その explicit な resource をこのコンポーネントの表に写す（#964）
+                        val instance = item.target.sort == Sort.INSTANCE
+                        if (instance) exportInstance(info)
+                        explicitAcc.add(ref, item.target.sort)
                         if (info != null) exports[item.name] = info
                         refs += ref
                         exportRefs += ref
@@ -531,13 +626,14 @@ internal object ComponentValidationCost {
                 }
             }
             val res = refs.any { it.res }
+            noteExplicit(explicitAcc)
             val view = Info(
                 exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
-                res = exportRefs.any { it.res }, scan = exportScan,
+                res = exportRefs.any { it.res }, scan = exportScan, explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
             )
             return Info(
                 size, exports, local = 1L + refs.size, refs = refs, remapBound = full, instanceView = view, res = res,
-                scan = noteScan(scan),
+                scan = noteScan(scan), explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
             )
         }
 
@@ -547,6 +643,7 @@ internal object ComponentValidationCost {
             var size = 1L
             var full = 1L
             var scan = 1L
+            val explicitAcc = ExplicitAcc()
             for ((name, idx) in items) {
                 val info = s.lookup(idx)
                 if (info != null) exports[name] = info
@@ -555,16 +652,23 @@ internal object ComponentValidationCost {
                 size = sum(size, 1 + sizeOf(info))
                 full = add(full, 1 + ref.remapBound)
                 scan = add(scan, ref.scan)
+                // インスタンスの export は、そのたびに explicit な resource を全部写す（`instantiate_component_exports`。#964）
+                val instance = idx.sort == Sort.INSTANCE
+                if (instance) exportInstance(info)
+                explicitAcc.add(ref, idx.sort)
             }
+            noteExplicit(explicitAcc)
             return Info(
                 size, exports, local = 1L + refs.size, refs = refs, remapBound = full, res = refs.any { it.res }, scan = noteScan(scan),
+                explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
             )
         }
 
         private fun alias(s: Scope, a: Alias) {
             val info = when (a) {
                 // インスタンスの export は、インスタンスごとに写した型なので、別の型として数える
-                is Alias.InstanceExport -> copied(s.instances.getOrNull(a.instance)?.exports?.get(a.name))
+                // resource の同一性は、引いたインスタンスによって違いうるので、新しいものにする（#964。大きい側）
+                is Alias.InstanceExport -> copied(s.instances.getOrNull(a.instance)?.exports?.get(a.name), fresh = true)
                 is Alias.Outer -> s.outer(a.count)?.lookup(SortIdx(a.sort, a.index)).also { aliasScan(s, a, it) }
                 is Alias.CoreInstanceExport -> null
             }
@@ -584,14 +688,15 @@ internal object ComponentValidationCost {
          * 宣言のたびにその型の export を新しい `Remapping` で全部写し直す（`prepare_instance_import`・`prepare_instance_export`）ので、
          * その分を数える（型宣言の中の宣言も、コンポーネントのインスタンス化とは別に 1 回ずつ。resource がなければ写し直さない）
          */
-        private fun declared(type: Info?): Info? = copied(type)?.also { if (it.res) remap(it) }
+        private fun declared(type: Info?): Info? = copied(type, fresh = type?.res == true)?.also { if (it.res) remap(it) }
 
         /** 記述 [desc] の型の情報（添字空間には足さない） */
         private fun descInfo(s: Scope, desc: ExternDesc): Info =
             when (desc) {
                 // `(sub resource)` は新しい resource（大きさ 1）。`(eq $t)` は、wasmparser が別の型の id を作る（同じ型を何度 eq で
                 // import・export しても、別々に写し直す）ので、同じ型への参照ではなく写して作った別の型として数える
-                is ExternDesc.Type -> if (desc.eqTypeIndex == null) Info(1, res = true) else copied(s.types.getOrNull(desc.eqTypeIndex))
+                is ExternDesc.Type ->
+                    if (desc.eqTypeIndex == null) Info(1, res = true, isResource = true) else copied(s.types.getOrNull(desc.eqTypeIndex))
                 is ExternDesc.Func -> s.types.getOrNull(desc.typeIndex)
                 // インスタンス・コンポーネントは、import・export するときに型を写して新しく作る
                 is ExternDesc.Instance -> declared(s.types.getOrNull(desc.typeIndex))
@@ -614,6 +719,7 @@ internal object ComponentValidationCost {
             var exportFull = 1L
             var scan = 1L
             var exportScan = 1L
+            val explicitAcc = ExplicitAcc()
             for (d in decls) {
                 when (d) {
                     is TypeDecl.CoreType -> s.coreTypes += Info(coreType(d.type))
@@ -629,6 +735,10 @@ internal object ComponentValidationCost {
                     }
                     is TypeDecl.Export -> {
                         val info = extern(s, d.desc)
+                        // インスタンスの export の宣言も、その explicit な resource をこの型の表に写す（`prepare_instance_export`。#964）
+                        val instance = d.desc is ExternDesc.Instance
+                        if (instance) exportInstance(info)
+                        explicitAcc.add(info, d.desc.sort)
                         exports[d.name] = info
                         refs += info
                         exportRefs += info
@@ -642,10 +752,11 @@ internal object ComponentValidationCost {
                     }
                 }
             }
+            noteExplicit(explicitAcc)
             val view = if (component) {
                 Info(
                     exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
-                    res = exportRefs.any { it.res }, scan = exportScan,
+                    res = exportRefs.any { it.res }, scan = exportScan, explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
                 )
             } else {
                 null
@@ -654,7 +765,7 @@ internal object ComponentValidationCost {
                 note(size), exports, local = 1L + refs.size, refs = refs, remapBound = noteFull(full), instanceView = view,
                 res = refs.any { it.res },
                 // インスタンス型は export だけ（import はない）、コンポーネント型は import と export
-                scan = noteScan(scan),
+                scan = noteScan(scan), explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
             )
         }
 
@@ -730,7 +841,10 @@ internal object ComponentValidationCost {
                 else -> local += refs.size
             }
             val size = note(n)
-            return Info(size, local = minOf(local, full).coerceAtLeast(1), refs = refs, remapBound = noteFull(full), scan = noteScan(scan))
+            return Info(
+                size, local = minOf(local, full).coerceAtLeast(1), refs = refs, remapBound = noteFull(full), scan = noteScan(scan),
+                isResource = def is ResourceType,
+            )
         }
 
         /** core の型の大きさ（関数は引数と結果の数、モジュール型は宣言の数） */

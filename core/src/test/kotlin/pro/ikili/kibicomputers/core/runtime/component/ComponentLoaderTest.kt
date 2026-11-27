@@ -714,6 +714,99 @@ class ComponentLoaderTest {
         assertEquals(1L, estimateOf(ascribed).checkCount)
     }
 
+    /** resource を [r] 個 export するインスタンス型を 1 回 import した `$i` と、その前置き（#964） */
+    private fun resourceInstance(r: Int): String {
+        val exports = (0 until r).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }
+        return """(import "i" (instance ${'$'}i $exports))"""
+    }
+
+    /** `$i` を [n] 回 export する export の並びのインスタンスを [k] 個（#964） */
+    private fun exportBags(n: Int, k: Int, of: String = "${'$'}i"): String =
+        (0 until k).joinToString(" ") { b -> "(instance ${(0 until n).joinToString(" ") { """(export "a$it" (instance $of))""" }})" }
+
+    @Test
+    fun `resourceを多く持つインスタンスをexportの並びで何度もexportする形は検証の前に断る`() {
+        // #964: wasmparser は、export の並びでインスタンスを export するたびに、その型の explicit な resource を 1 件ずつ写す
+        // （`instantiate_component_exports`）。resource 2,000 個 × 499 回 × 並び 10 個（58 KB）で CPU 5.0 秒、40 個で時間の上限に届いた。
+        // 型の確認もインスタンス化もないので、前は見積もりが import の写し直し（4,001）だけだった
+        val bomb = wat("(component ${resourceInstance(2_000)} ${exportBags(499, 10)})")
+        val e = estimateOf(bomb)
+        assertEquals(0L, e.checkCount)
+        assertEquals(10L * 499 * 2_000, e.explicitCost)
+        // パスの要素の写し（長さ 1）は、型のたどりとして数える
+        assertTrue(e.scanCost >= 10L * 499 * 2_000 / 16) { "${e.scanCost}" }
+        assertEquals(e.cost, e.remapCost + e.scanCost + e.explicitCost)
+        rejectedBeforeValidation(bomb)
+    }
+
+    @Test
+    fun `exportの並びの小さい形は見積もりどおりに数えて検証も通る`() {
+        // resource 20 個のインスタンスを 10 回 export する並び 2 つ。1 回の export で 20 件写す
+        val small = wat("(component ${resourceInstance(20)} ${exportBags(10, 2)})")
+        val e = estimateOf(small)
+        assertEquals(2L * 10 * 20, e.explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+    }
+
+    @Test
+    fun `exportの並びを並びで何度もexportしても掛け算にならない`() {
+        // wasmparser の explicit な resource は resource の id を鍵にした表なので、同じインスタンスを何度入れても増えない。
+        // 並び $l1 は $i を 10 回、$l2 は $l1 を 10 回、$l3 は $l2 を 10 回 export する。どの並びも explicit は 20 件
+        val text = """
+            (component
+              ${resourceInstance(20)}
+              (instance ${'$'}l1 ${(0 until 10).joinToString(" ") { """(export "a$it" (instance ${'$'}i))""" }})
+              (instance ${'$'}l2 ${(0 until 10).joinToString(" ") { """(export "b$it" (instance ${'$'}l1))""" }})
+              (instance ${'$'}l3 ${(0 until 10).joinToString(" ") { """(export "c$it" (instance ${'$'}l2))""" }})
+            )
+        """
+        val c = wat(text)
+        val e = estimateOf(c)
+        assertEquals(3L * 10 * 20, e.explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(c, policy = ComponentImportPolicy { null }) }
+        // 並びに入れた resource の型も 1 件ずつ数え、それを export する並びは、その件数を写す
+        val types = wat(
+            """
+            (component
+              ${resourceInstance(20)}
+              ${(0 until 5).joinToString(" ") { "(alias export ${'$'}i \"r$it\" (type ${'$'}t$it))" }}
+              (instance ${'$'}l1 ${(0 until 5).joinToString(" ") { "(export \"t$it\" (type ${'$'}t$it))" }})
+              (instance ${'$'}l2 (export "x" (instance ${'$'}l1)) (export "y" (instance ${'$'}l1)))
+            )
+            """,
+        )
+        assertEquals(2L * 5, estimateOf(types).explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(types, policy = ComponentImportPolicy { null }) }
+    }
+
+    @Test
+    fun `resourceを多く持つインスタンスをコンポーネントから何度もexportする形も数える`() {
+        // wasmparser は、コンポーネントの export でも、インスタンスを export するたびにその explicit な resource を写す
+        // （`prepare_instance_export`。#964）
+        fun body(n: Int) = "${resourceInstance(2_000)} ${(0 until n).joinToString(" ") { """(export "e$it" (instance ${'$'}i))""" }}"
+        val e = estimateOf(wat("(component ${body(10)})"))
+        assertEquals(10L * 2_000, e.explicitCost)
+        // 1 つのコンポーネントでは、wasmparser が型の大きさ（100 万）で 500 回ほどまでに抑える（resource 2,000 個 × 500 回で CPU 約 0.9 秒）が、
+        // 入れ子のコンポーネントに分けると抑えない。400 回 export する入れ子 10 個は、検証の前に断る
+        val nestedBomb = wat("(component ${"(component ${body(400)})".repeat(10)})")
+        assertEquals(10L * 400 * 2_000, estimateOf(nestedBomb).explicitCost)
+        rejectedBeforeValidation(nestedBomb)
+        // インスタンス型の中のインスタンスの export の宣言も同じ。resource を定義する型は宣言ごとに resource が新しくなるので、
+        // 外側の型は 3 回分の resource を持つ（それを import して並びで export すると 3 × 20 件を写す）
+        val nested = wat(
+            """
+            (component
+              (type ${'$'}t (instance ${(0 until 20).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }}))
+              (import "o" (instance ${'$'}o (export "x" (instance (type ${'$'}t))) (export "y" (instance (type ${'$'}t))) (export "z" (instance (type ${'$'}t)))))
+              (instance (export "a" (instance ${'$'}o)))
+            )
+            """,
+        )
+        // 型の中の 3 回の宣言（20 件ずつ）と、並びでの 1 回（60 件）
+        assertEquals(3L * 20 + 60, estimateOf(nested).explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(nested, policy = ComponentImportPolicy { null }) }
+    }
+
     @Test
     fun `ツールチェーンが作るコンポーネントの見積もりは上限に十分収まる`() {
         // WASI の filesystem に近い規模のインターフェース（record・variant・enum・flags・resource と関数 40 個）を
