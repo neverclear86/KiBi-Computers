@@ -67,6 +67,19 @@ class SharedProgramsTest {
     }
 
     @Test
+    fun `スレッドのスタックが既定より小さいスケジューラは、共有の表を使わない`() = timeout(Duration.ofSeconds(120)) {
+        val shared = Harness(execRuntime = EndiveRuntime()).use { execPrompt(it) }
+        val small = SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64)
+            .threadStackBytes(SharedPrograms.DEFAULT_THREAD_STACK_BYTES / 2).build()
+        val own = Harness(small, execRuntime = EndiveRuntime()).use { execPrompt(it) }
+        assertNotSame(shared, own)
+        assertEquals(shared.hash, own.hash)
+        val large = SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64)
+            .threadStackBytes(SharedPrograms.DEFAULT_THREAD_STACK_BYTES * 2).build()
+        assertSame(shared, Harness(large, execRuntime = EndiveRuntime()).use { execPrompt(it) }, "既定より大きいスタックなら共有する")
+    }
+
+    @Test
     fun `同じキーなら同じものを返し、キーの要素が違えば別に読み込む`() = timeout(Duration.ofSeconds(120)) {
         val base = load()
         assertSame(base, load())

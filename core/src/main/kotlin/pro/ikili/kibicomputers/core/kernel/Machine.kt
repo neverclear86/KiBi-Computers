@@ -1960,8 +1960,8 @@ public class Machine private constructor(
         // コンポーネントは待機点への変換を使わないので、キーの止まりうる import を空にそろえる（#687。二重に読み込まない）
         val waitImports = Program.cacheWaitImports(executable.bytes, if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet())
         val host = KernelDrivers.COMPONENT_HOST
-        // 公平の組の読み込みの上限で断るのはゲストの exec だけ（init は parentPid = 0。起動の失敗にしない。#738）
         val loader = scheduler.options.programLoader ?: ProgramLoader(Program::loadExecutable)
+        // 公平の組の読み込みの上限で断るのはゲストの exec だけ（init は parentPid = 0。起動の失敗にしない。#738）
         val future = scheduler.programs.load(id, fairShareGroup, parentPid != 0, executable.bytes, metered, waitImports) { bytes ->
             loader.load(runtime, bytes, limits, metered, waitImports, host)
         }

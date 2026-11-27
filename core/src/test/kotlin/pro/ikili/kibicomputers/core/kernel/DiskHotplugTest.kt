@@ -638,10 +638,17 @@ class DiskHotplugTest {
     }
 
     /** kibi-fs-wasi（p1 の `kibi:fs/mounts`）を [args] で動かし、出力を返す */
-    private fun runKibiFs(h: Harness, m: Machine, vararg args: String): String = runKibiFsMeasuring(h, m, *args).first
+    private fun runKibiFs(h: Harness, m: Machine, vararg args: String): String = runKibiFsMeasuring(h, m, *args).out
 
-    /** [runKibiFs] と、終わるまでにスケジューラが数えた燃料の使用量（[MachineScheduler.fuelConsumedTotal]。壁時計に左右されない） */
-    private fun runKibiFsMeasuring(h: Harness, m: Machine, vararg args: String, metered: Boolean = false): Pair<String, Long> {
+    /**
+     * [runKibiFsMeasuring] の結果: 出力 [out]、終わるまでにスケジューラが数えた燃料の使用量 [fuel]
+     * （[MachineScheduler.fuelConsumedTotal]。壁時計に左右されない）、終わるまでに回した tick の数 [ticks]
+     * （読み込みや待ちの間の空回りで増えるので、下限にだけ使う）
+     */
+    private data class KibiFsRun(val out: String, val fuel: Long, val ticks: Int)
+
+    /** [runKibiFs] と、使った燃料・回した tick の数 */
+    private fun runKibiFsMeasuring(h: Harness, m: Machine, vararg args: String, metered: Boolean = false): KibiFsRun {
         val output = m.lock.withLockValue { m.kernel.objects.add(ByteStream(64 * 1024)) }
         val options = SpawnOptions(
             allowUnmetered = !metered,
@@ -657,8 +664,10 @@ class DiskHotplugTest {
             val program = Program.load(EndiveRuntime(), resource("kibi-fs-wasi.wasm"))
             m.spawn(program, WasiP1Driver(program.module), options)
         }
+        var ticks = 0
         eventually(60_000, "終わらない") {
             h.scheduler.tick()
+            ticks++
             m.stateOf(pid).isTerminal
         }
         val text = m.lock.withLockValue {
@@ -667,7 +676,7 @@ class DiskHotplugTest {
             if (buf.isNotEmpty()) s.read(buf, 0, buf.size, m.wakeSink)
             String(buf, Charsets.UTF_8)
         }
-        return text to (h.scheduler.fuelConsumedTotal - fuelBefore)
+        return KibiFsRun(text, h.scheduler.fuelConsumedTotal - fuelBefore, ticks)
     }
 
     @Test
@@ -873,8 +882,9 @@ class DiskHotplugTest {
 
     @Test
     fun `mountは固定の燃料を払うので、mountとunmountを繰り返すゲストは少ない燃料では進めない`() = timeout(limit) {
-        // 比べるのは、スケジューラが数えた燃料の使用量（fuelConsumedTotal）。tick を回した回数は、待っている間の空回りで壁時計に
-        // 左右されるので使わない。燃料の計測は命令の数で決まるので、JVM の中の共有の表（#991）で読み込みを飛ばしても結果は変わらない
+        // 2 つの実行の比べは、スケジューラが数えた燃料の使用量（fuelConsumedTotal）で行う。tick を回した回数は、待っている間の
+        // 空回りで壁時計に左右される（増える向きだけ）ので、「補充を待たされた」ことの下限にだけ使う。燃料の計測は命令の数で
+        // 決まるので、JVM の中の共有の表（#991）で読み込みを飛ばしても結果は変わらない
         Harness(execRuntime = EndiveRuntime()).use { h ->
             // 1 tick の燃料を、mount 1回の固定分（MOUNT_FUEL = 50,000）の 2 倍にする
             val root = rootFs()
@@ -886,15 +896,23 @@ class DiskHotplugTest {
             m.unmountAt(VfsPath.parse("/mnt/d1"))
             val cycles = 20
             val mountArgs = (1..cycles).flatMap { listOf("mount", "disk:d1", "/x", "0", "unmount", "/x") }.toTypedArray()
-            val (out, mountFuel) = runKibiFsMeasuring(h, m, *mountArgs, metered = true)
+            val (out, mountFuel, mountTicks) = runKibiFsMeasuring(h, m, *mountArgs, metered = true)
             assertEquals(cycles * 2, out.lines().count { it == "mount 0" || it == "unmount 0" })
             // 同じ数の呼び出しでも、mount でない unmount（失敗）なら燃料は 100 ずつ
             val cheapArgs = (1..cycles).flatMap { listOf("unmount", "/nowhere", "unmount", "/nowhere") }.toTypedArray()
-            val (_, cheapFuel) = runKibiFsMeasuring(h, m, *cheapArgs, metered = true)
+            val (_, cheapFuel, _) = runKibiFsMeasuring(h, m, *cheapArgs, metered = true)
             // 20 回の mount の固定分（50,000 ずつで 1,000,000）が、使った燃料に入っている
             val fixed = cycles * MachineLimits.MOUNT_FUEL
             assertTrue(mountFuel >= fixed, "mount の燃料が払われていない: mount $mountFuel、unmount だけ $cheapFuel")
             assertTrue(mountFuel - cheapFuel >= fixed / 2, "mount: $mountFuel、unmount だけ: $cheapFuel")
+            // 固定分は前借り（負の燃料）としてマシンに持ち越されるので、1 tick の補充（100,000）では払いきれず、補充を待たされる。
+            // tick ごとの補充は、燃料が 0 以上なら 100,000 にそろえ、負なら 100,000 を足すだけなので、k 回の tick で使えるのは
+            // 始めの手持ち（100,000 以下）+ k × 100,000 と、終わったときの借り（mount 1 回の 50,000 とスライスのはみ出し）まで。
+            // 1,000,000 を払うには、k ≥ (1,000,000 - 100,000 - 50,000) / 100,000 = 8.5 で、少なくとも 9 回は tick を待つ
+            // （借りを持ち越さずに手持ちから引くだけなら、数 tick で終わる）。数え方のずれ（最初の tick の前の補充など）に 1 tick の余裕を見て、
+            // 7 回以上を確かめる。空回りの tick は増える向きにだけ効くので、下限は壁時計に左右されない
+            val minTicks = ((fixed - 2 * 100_000L - MachineLimits.MOUNT_FUEL) / 100_000L).toInt()
+            assertTrue(mountTicks >= minTicks, "補充を待たずに進んだ: $mountTicks tick（$minTicks 以上のはず）、mount の燃料 $mountFuel")
             m.close()
         }
     }
