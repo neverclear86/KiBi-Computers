@@ -687,6 +687,129 @@ test('確かめが runId を数値で返しても、そのまま merge-rerun に
   assert.match(r.promptOf('merge-rerun'), /run 123456 の落ちたジョブを回し直した/)
 })
 
+// ---- 長い Gradle の待ち方と、孤児のログの結果の扱い（#962） ----
+
+// Gradle を動かす全段階のプロンプトを集める（段階の種類 → プロンプト）
+async function gradleStagePrompts() {
+  const out = {}
+  const take = (r, kinds) => { for (const k of kinds) { const p = r.promptOf(k); if (p) out[k] = p } }
+  take(await run({ ci: [CONFLICT, OK_CI], conflict: [{ outcome: 'merged', pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }] }), ['implement', 'conflict', 'merge', 'cleanup'])
+  take(await run({ ci: [FAILED_CI, OK_CI], 'ci-fix': [{ pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }] }), ['ci-fix'])
+  take(await run({ review: [{ findings: [FINDING] }], verify: [{ confirmed: [0], notes: '' }], fix: [{ pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }] }), ['fix'])
+  take(await run({
+    implement: [{ ...IMPL, openQuestions: ['q'] }],
+    'cross-check': [{ premiseSound: true, needsHuman: false, findings: 'f', question: null, guidance: 'g' }],
+    resolve: [{ pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+  }), ['resolve'])
+  take(await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [MERGED] }), ['merge-restart'])
+  take(await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] }), ['merge-flaky'])
+  return out
+}
+
+test('プロンプト: Gradle を動かす全段階に、ターンを終えない待ち方（前景のループ）があり、Monitor で待てとは書かない', async () => {
+  const prompts = await gradleStagePrompts()
+  const kinds = ['implement', 'conflict', 'ci-fix', 'fix', 'resolve', 'merge', 'merge-restart', 'merge-flaky', 'cleanup']
+  assert.deepEqual(Object.keys(prompts).sort(), [...kinds].sort())
+  for (const k of kinds) {
+    const p = prompts[k]
+    assert.match(p, /ツールを呼ばない返事[^。]*でターンを終えない/, k)
+    assert.match(p, /timeout: 600000/, k)
+    assert.match(p, /seq 1 57/, k)
+    assert.match(p, /待ちに Monitor を使わない/, k)
+    assert.doesNotMatch(p, /Monitor (など)?で待つ/, k)
+    assert.doesNotMatch(p, /前景の `sleep` は使えない/, k)
+  }
+  for (const k of kinds.filter(k => k !== 'cleanup')) {
+    const p = prompts[k]
+    assert.match(p, /20〜25 分/, k)
+    assert.match(p, /\.exit` は自分で書かない/, k)
+    assert.match(p, /<名前>\.tree/, k)
+    assert.match(p, /GIT_INDEX_FILE=\$t git write-tree/, k)
+    assert.match(p, /起動から 150 分/, k)
+  }
+  assert.match(prompts['merge-restart'], /90 秒以上置く/)
+  assert.match(prompts.implement, /90 秒以上置いてから/)
+})
+
+test('プロンプト: 待つやり直しは、孤児のログを採る 3 つの条件と、起動していないログの扱いと、60 分の待ちを書く', async () => {
+  const r = await run({ merge: [fail('build', 'a', PENDING)], 'merge-wait': [MERGED] })
+  const p = r.promptOf('merge-wait')
+  assert.match(p, /最大 60 分待つ/)
+  assert.match(p, /Win32_Process/)
+  assert.match(p, /\^BUILD SUCCESSFUL in /)
+  assert.match(p, /<名前>\.tree` があり、その中身が今の作業ツリーの木の hash/)
+  assert.match(p, /java のプロセスがない/)
+  assert.match(p, /`runningLogs` にあって `\.log` がないもの/)
+  assert.match(p, /<名前>\.orphan/)
+  assert.match(p, /孤児のログ <名前> を採った（BUILD SUCCESSFUL）/)
+  assert.doesNotMatch(p, /参考にとどめる/)
+  assert.doesNotMatch(p, /Monitor (など)?で待つ/)
+})
+
+const ORPHAN_SUCCESS = '孤児のログ merge-build-3 を採った（BUILD SUCCESSFUL、.exit はない）'
+
+test('孤児のログを採った文は、同じ一文に「.exit はない」があっても、待つやり直しに入らない', async () => {
+  const merge = await run({ merge: [fail('build', `${ORPHAN_SUCCESS}。:core:test が落ちた`)] })
+  assert.equal(merge.count('merge-wait'), 0)
+  const fix = await run({
+    review: [{ findings: [FINDING] }],
+    verify: [{ confirmed: [0], notes: '' }],
+    fix: [{ pushed: false, summary: `${ORPHAN_SUCCESS}。直すものはなかった`, gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(fix.count('fix-wait'), 0)
+})
+
+test('孤児のログを採った文と一緒でも、別の一文が未完了を示せば（#889 の文）、待つやり直しに入る', async () => {
+  const r = await run({ merge: [fail('build', `${ORPHAN_SUCCESS}。${PR889_REASON}`)], 'merge-wait': [MERGED] })
+  assert.equal(r.count('merge-wait'), 1)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('孤児のログを採った句と、別のログの未完了が同じ一文に入っていても、待つやり直しに入る（#962）', async () => {
+  const mixed = '孤児のログ merge-build-3 を採ったが（BUILD SUCCESSFUL）、merge-build-4 は .exit がなく終了コードを読めていない'
+  const r = await run({ merge: [fail('build', mixed)], 'merge-wait': [MERGED] })
+  assert.equal(r.count('merge-wait'), 1)
+  assert.equal(r.issue.status, 'merged')
+  const paren = await run({ merge: [fail('build', `${ORPHAN_SUCCESS}、merge-build-4 は終了コードを読めていない`)], 'merge-wait': [MERGED] })
+  assert.equal(paren.count('merge-wait'), 1)
+})
+
+test('「孤児のログを採ったかは分からない」のような文は、採った句ではないので、未完了の手がかりを外さない（#962）', async () => {
+  const r = await run({ merge: [fail('build', '孤児のログを採ったかは分からない。.exit がなく、終了コードを読めていない')], 'merge-wait': [MERGED] })
+  assert.equal(r.count('merge-wait'), 1)
+  const same = await run({ merge: [fail('build', '孤児のログを採ったかは分からず、.exit がない')], 'merge-wait': [MERGED] })
+  assert.equal(same.count('merge-wait'), 1)
+})
+
+test('孤児のログの名前が完全なパスやバッククォートで囲んだものでも、採った句として外す（#972 のレビュー）', async () => {
+  const names = [
+    'D:/Projects/KiBi-Computers/.worktrees/.logs/issue-962/merge-build-3',
+    String.raw`D:\Projects\KiBi-Computers\.worktrees\.logs\issue-962\merge-build-3`,
+    '`merge-build-3`',
+    '`merge-build-3` と `merge-gametest-neoforge-1.21.1-2`',
+    'merge-build-3、merge-gametest-2',
+  ]
+  for (const n of names) {
+    const r = await run({ merge: [fail('build', `孤児のログ ${n} を採った（BUILD SUCCESSFUL、.exit はない）。:core:test が落ちた`)] })
+    assert.equal(r.count('merge-wait'), 0, n)
+  }
+})
+
+test('「を採った」が続かない長い名前の文でも、すぐに判定が終わる（入れ子の量指定子のバックトラックがない。#972 のレビュー）', async () => {
+  const long = 'fix2-gametest-neoforge-1.21.1-3'.repeat(20)
+  const texts = [
+    `孤児のログ ${long} は採らなかった。.exit がなく、終了コードを読めていない`,
+    `孤児のログ ${'a、'.repeat(500)}b は採らなかった。.exit がない`,
+    `孤児のログ ${'a '.repeat(500)}は採らなかった。.exit がない`,
+  ]
+  for (const t of texts) {
+    const t0 = Date.now()
+    const r = await run({ merge: [fail('build', t)], 'merge-wait': [MERGED] })
+    assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`)
+    assert.equal(r.count('merge-wait'), 1)
+  }
+})
+
 // ---- 結果を返さなかった段階（#953） ----
 
 test('CI 待ちが 1 回結果を返さなければ、1 回だけ呼び直して進み、stalled に回復として載る', async () => {
