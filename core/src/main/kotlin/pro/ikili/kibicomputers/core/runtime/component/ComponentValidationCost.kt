@@ -77,6 +77,14 @@ import java.util.IdentityHashMap
  *   export する resource の型と、export するインスタンスの件数の合計。wasmparser の表は resource の id を鍵にするので、同じ resource の
  *   集まり（[Info.explicitKey]）のインスタンスは 1 回だけ足す（並びを並びで何度も export しても掛け算にしない）。
  *   resource を新しく作るところ（resource を定義する型の宣言、インスタンス化）と、インスタンスの export の alias は、別の集まりとする（大きい側）
+ * - 写し直しでの resource のパスの写し（#964。[Info.explicitSelf]。数は [Estimate.remapCost] に入る）: wasmparser の `remap_component_instance_type_id`
+ *   （`prepare_instance_import`・`prepare_instance_export`・インスタンス化の `remap_component_entity` から呼ばれる）は、写し直しのたびに、
+ *   たどれるインスタンス型を 1 つずつ、explicit な resource の表（全件とパスの Vec）を丸ごと写して作り直す。export が 1 つで explicit な
+ *   resource が n 件のインスタンス型を d 段つないだ型を、resource を定義する型の宣言（[Info.defines]）が受けると、宣言 1 回で d × n 件を写す
+ *   （n = 2,000・d = 64 の型を持つ import を 300 個並べた 70 KB で、見積もり約 195 万のまま検証が CPU 14.7 秒）。写し直しの大きさ（[Info.local]）の
+ *   たどりと同じ道で、たどれるインスタンス型（インスタンス）の [Info.explicitSelf] を足して数える（上限は [Info.explicitBound]。
+ *   [Info.remapBound] では抑えない。重なりは同じ写し直しの中で 1 回だけ。インスタンス化でできるインスタンスの型も同じ）。
+ *   resource を定義しない型の宣言は、写し直しもこの分も数えない
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
@@ -210,12 +218,34 @@ internal object ComponentValidationCost {
          * （インスタンスの export の alias）は、新しいものにする（重なりを除かない。大きい側）
          */
         val resourceKey: Any? = null,
+        /**
+         * resource を新しく定義するか（`(sub resource)` を import・export する型、それを含む型。#964）。[res] と違い、resource の型を
+         * `eq`・alias で引いただけのものは入らない。wasmparser が宣言のたびに写し直す（[declared]）のはこちらの型
+         */
+        val defines: Boolean = false,
+        /**
+         * インスタンス型（インスタンス）として写されるときの、explicit な resource の表の大きさ（#964）。wasmparser の
+         * `remap_component_instance_type_id` は、たどれるインスタンス型を 1 つずつ、表を丸ごと写して作り直す。コンポーネントは入らない
+         * （インスタンス化でできるインスタンスの型は、その export だけの型 [instanceView]）
+         */
+        val explicitSelf: Long = 0,
+        /** [explicitSelf] を、参照している型の分まで、重なりを除かずに足した上限（写し直しの [remapBound] にあたる。#964） */
+        val explicitBound: Long = sumBound(explicitSelf, refs),
     ) {
         /** [explicit] の重なりを除く鍵 */
         val explicitKey: Any get() = resourceKey ?: content ?: this
 
         /** 写し直しの大きさ（まだなら -1） */
         var flat = -1L
+
+        /** [flat] と同時に決まる、explicit な resource の表を写す件数（#964） */
+        var flatExplicit = 0L
+    }
+
+    private fun sumBound(self: Long, refs: List<Info>): Long {
+        var n = self
+        for (r in refs) n = minOf(n + r.explicitBound, SATURATED)
+        return n
     }
 
     /**
@@ -381,10 +411,18 @@ internal object ComponentValidationCost {
          * インスタンス化での、コンポーネント [target] の import と export の型の写し直しを数える（型の確認の回数には入れない）。
          * 引けなければ、それまでの最大
          */
-        private fun remap(target: Info?) {
-            val n = if (target == null) maxFull else flatOf(target, 0)
+        private fun remap(target: Info?, explicit: Boolean = true) {
+            var n = if (target == null) maxFull else flatOf(target, 0)
+            // たどれるインスタンス型の explicit な resource の表も、1 件ずつ写す（#964。[Info.explicitSelf]）
+            if (explicit) n = add(n, if (target == null) maxExplicit else explicitOf(target))
             cost = add(cost, n)
             remapCost = add(remapCost, n)
+        }
+
+        /** [flatOf] で数えた、[info] の explicit な resource の表を写す件数（たどらなかったときは上限） */
+        private fun explicitOf(info: Info): Long {
+            val target = info.content ?: info
+            return if (target.flat >= 0) target.flatExplicit else target.explicitBound
         }
 
         /** 型の確認を 1 回数える。確かめるのは [info] の型（引けなければ、それまでの最大） */
@@ -423,7 +461,7 @@ internal object ComponentValidationCost {
         private fun unknown(): Info =
             Info(
                 maxSize, remapBound = maxFull, scan = maxScan, explicit = maxExplicit, explicitDepth = maxExplicitDepth,
-                isResource = true,
+                isResource = true, explicitSelf = maxExplicit,
             )
 
         /** それまでに見た [Info.explicit] の最大（引けないインスタンスの代わり。#964） */
@@ -463,6 +501,8 @@ internal object ComponentValidationCost {
                 it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, instanceView = it.instanceView, res = it.res,
                 scan = it.scan, explicit = it.explicit, explicitDepth = it.explicitDepth, isResource = it.isResource,
                 resourceKey = if (fresh) Any() else it.explicitKey,
+                // resource の型を写しても、resource を新しく定義したことにはならない
+                defines = it.defines && !it.isResource, explicitSelf = it.explicitSelf, explicitBound = it.explicitBound,
             )
         }
 
@@ -476,27 +516,32 @@ internal object ComponentValidationCost {
             if (target.flat >= 0) return target.flat
             if (cost > budget || depth > MAX_FLAT_DEPTH) return target.remapBound
             var total = target.local
+            // explicit な resource の表を写す件数（#964）。[Info.remapBound] とは別の上限で、両方に届くまでたどる
+            var explicitTotal = target.explicitSelf
             val seen = IdentityHashMap<Info, Unit>()
             if (!spend(target.refs.size)) return target.remapBound
             val stack = ArrayList<Info>(target.refs)
-            while (stack.isNotEmpty() && total < target.remapBound) {
+            while (stack.isNotEmpty() && (total < target.remapBound || explicitTotal < target.explicitBound)) {
                 // 積むときに数えたので、取り出すときは数えない（参照 1 本で 1 手）
                 val n = stack.removeAt(stack.size - 1)
                 if (seen.put(n, Unit) != null) continue
                 if (n.content != null) {
                     total = add(total, flatOf(n, depth + 1))
+                    explicitTotal = add(explicitTotal, explicitOf(n))
                     // 中で手数が尽きたら、たどり直さずに止める
                     if (exhausted) return target.remapBound
                 } else {
                     total = add(total, n.local)
+                    explicitTotal = add(explicitTotal, n.explicitSelf)
                     // 上限に届いたら、その先は積まない（積んでも足さない）
-                    if (total >= target.remapBound) break
+                    if (total >= target.remapBound && explicitTotal >= target.explicitBound) break
                     if (!spend(n.refs.size)) return target.remapBound
                     stack.addAll(n.refs)
                 }
             }
             val result = minOf(total, target.remapBound)
             target.flat = result
+            target.flatExplicit = minOf(explicitTotal, target.explicitBound)
             return result
         }
 
@@ -576,6 +621,7 @@ internal object ComponentValidationCost {
                                     Info(
                                         it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, res = it.res,
                                         scan = it.scan, explicit = it.explicit, explicitDepth = it.explicitDepth, resourceKey = Any(),
+                                        explicitSelf = it.explicitSelf, explicitBound = it.explicitBound,
                                     )
                                 }
                             }
@@ -630,9 +676,11 @@ internal object ComponentValidationCost {
             val view = Info(
                 exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
                 res = exportRefs.any { it.res }, scan = exportScan, explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
+                defines = exportRefs.any { it.defines }, explicitSelf = explicitAcc.count,
             )
             return Info(
                 size, exports, local = 1L + refs.size, refs = refs, remapBound = full, instanceView = view, res = res,
+                defines = refs.any { it.defines },
                 scan = noteScan(scan), explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
             )
         }
@@ -661,6 +709,7 @@ internal object ComponentValidationCost {
             return Info(
                 size, exports, local = 1L + refs.size, refs = refs, remapBound = full, res = refs.any { it.res }, scan = noteScan(scan),
                 explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
+                defines = refs.any { it.defines }, explicitSelf = explicitAcc.count,
             )
         }
 
@@ -688,7 +737,7 @@ internal object ComponentValidationCost {
          * 宣言のたびにその型の export を新しい `Remapping` で全部写し直す（`prepare_instance_import`・`prepare_instance_export`）ので、
          * その分を数える（型宣言の中の宣言も、コンポーネントのインスタンス化とは別に 1 回ずつ。resource がなければ写し直さない）
          */
-        private fun declared(type: Info?): Info? = copied(type, fresh = type?.res == true)?.also { if (it.res) remap(it) }
+        private fun declared(type: Info?): Info? = copied(type, fresh = type?.res == true)?.also { if (it.res) remap(it, explicit = it.defines) }
 
         /** 記述 [desc] の型の情報（添字空間には足さない） */
         private fun descInfo(s: Scope, desc: ExternDesc): Info =
@@ -696,7 +745,7 @@ internal object ComponentValidationCost {
                 // `(sub resource)` は新しい resource（大きさ 1）。`(eq $t)` は、wasmparser が別の型の id を作る（同じ型を何度 eq で
                 // import・export しても、別々に写し直す）ので、同じ型への参照ではなく写して作った別の型として数える
                 is ExternDesc.Type ->
-                    if (desc.eqTypeIndex == null) Info(1, res = true, isResource = true) else copied(s.types.getOrNull(desc.eqTypeIndex))
+                    if (desc.eqTypeIndex == null) Info(1, res = true, isResource = true, defines = true) else copied(s.types.getOrNull(desc.eqTypeIndex))
                 is ExternDesc.Func -> s.types.getOrNull(desc.typeIndex)
                 // インスタンス・コンポーネントは、import・export するときに型を写して新しく作る
                 is ExternDesc.Instance -> declared(s.types.getOrNull(desc.typeIndex))
@@ -757,6 +806,7 @@ internal object ComponentValidationCost {
                 Info(
                     exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
                     res = exportRefs.any { it.res }, scan = exportScan, explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
+                    defines = exportRefs.any { it.defines }, explicitSelf = explicitAcc.count,
                 )
             } else {
                 null
@@ -766,6 +816,7 @@ internal object ComponentValidationCost {
                 res = refs.any { it.res },
                 // インスタンス型は export だけ（import はない）、コンポーネント型は import と export
                 scan = noteScan(scan), explicit = explicitAcc.count, explicitDepth = explicitAcc.depth,
+                defines = refs.any { it.defines }, explicitSelf = if (component) 0 else explicitAcc.count,
             )
         }
 

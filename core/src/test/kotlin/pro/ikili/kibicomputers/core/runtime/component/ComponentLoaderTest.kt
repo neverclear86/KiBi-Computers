@@ -807,6 +807,118 @@ class ComponentLoaderTest {
         assertDoesNotThrow { ComponentLoader.load(nested, policy = ComponentImportPolicy { null }) }
     }
 
+    /** resource を [r] 個 export する入れ子のコンポーネント `$c`（resource は `(type (resource (rep i32)))`。#964） */
+    private fun localResourceComponent(r: Int, name: String = "c"): String =
+        "(component ${'$'}$name ${(0 until r).joinToString(" ") { "(type ${'$'}t$it (resource (rep i32)))" }} " +
+            "${(0 until r).joinToString(" ") { """(export "r$it" (type ${'$'}t$it))""" }})"
+
+    /** 引いたインスタンス `$x` を export の並びで [n] 回 export する並びを [k] 個。`$x` の作り方が違う形を、[r] 件の resource ごとに返す */
+    private fun explicitForms(r: Int, n: Int, k: Int): Map<String, String> {
+        val bags = exportBags(n, k, "${'$'}x")
+        val resExports = (0 until r).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }
+        return mapOf(
+            // インスタンス化でできたインスタンス
+            "instantiate" to "(component ${localResourceComponent(r)} (instance ${'$'}x (instantiate ${'$'}c)) $bags)",
+            // import したインスタンスの export を alias で引いたインスタンス
+            "alias" to """
+                (component
+                  (import "o" (instance ${'$'}o (export "x" (instance $resExports))))
+                  (alias export ${'$'}o "x" (instance ${'$'}x))
+                  $bags
+                )
+            """,
+            // import したコンポーネントのインスタンス化
+            "imported" to "(component (import \"c\" (component ${'$'}c $resExports)) (instance ${'$'}x (instantiate ${'$'}c)) $bags)",
+            // インスタンス化したものが export するインスタンスを alias で引いたインスタンス
+            "instantiated-alias" to """
+                (component
+                  (component ${'$'}c
+                    ${localResourceComponent(r, "in")}
+                    (instance ${'$'}ii (instantiate ${'$'}in))
+                    (export "x" (instance ${'$'}ii))
+                  )
+                  (instance ${'$'}i (instantiate ${'$'}c))
+                  (alias export ${'$'}i "x" (instance ${'$'}x))
+                  $bags
+                )
+            """,
+        )
+    }
+
+    @Test
+    fun `インスタンス化・aliasで引いたインスタンスと入れ子のコンポーネントのresourceも並びでexportするたびに数える`() {
+        // どの形も、引いたインスタンスの explicit な resource 500 件を、並び 3 個 × 100 回 export する
+        val r = 500
+        val expected = mapOf(
+            "instantiate" to 3L * 100 * r,
+            // import の型の中の `(export "x" (instance ..))` の宣言でも、1 回 r 件を写す
+            "alias" to r + 3L * 100 * r,
+            "imported" to 3L * 100 * r,
+            // 入れ子のコンポーネントの `(export "x" (instance $ii))` でも、1 回 r 件を写す
+            "instantiated-alias" to r + 3L * 100 * r,
+        )
+        for ((name, text) in explicitForms(r, n = 100, k = 3)) {
+            assertEquals(expected.getValue(name), estimateOf(wat(text)).explicitCost) { name }
+        }
+        // 小さな形は、wasm-tools の検証も通る（text が正しいことの確認）
+        for ((name, text) in explicitForms(r = 5, n = 3, k = 2)) {
+            try {
+                ComponentLoader.load(wat(text), policy = ComponentImportPolicy { null })
+            } catch (e: WasmLoadException) {
+                throw AssertionError("$name: ${e.message}", e)
+            }
+        }
+    }
+
+    @Test
+    fun `引けないインスタンスをexportする並びは、それまでの最大の件数で数える`() {
+        // `$o` の型の explicit は 5 件。存在しない export の alias で引いた `$m` は引けないので、5 件として数える（並びを複数にすると、前の並びの件数まで最大に入る）
+        val resExports = (0 until 5).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }
+        val text = """
+            (component
+              (import "o" (instance ${'$'}o $resExports))
+              (alias export ${'$'}o "missing" (instance ${'$'}m))
+              ${exportBags(10, 1, "${'$'}m")}
+            )
+        """
+        assertEquals(10L * 5, estimateOf(wat(text)).explicitCost)
+    }
+
+    /**
+     * resource を [r] 個 export する（[d] 段の）インスタンス型の鎖 `$U0`（resource の型を alias で引いて `eq` で export する）…`$U(d-1)` を、
+     * resource を定義する型 `$T` が `eq` で export し、それを import する宣言を [k] 個並べる（#964）
+     */
+    private fun instanceChainComponent(r: Int, d: Int, k: Int): String {
+        val aliases = (0 until r).joinToString(" ") { "(alias outer 1 $it (type))" }
+        val exports = (0 until r).joinToString(" ") { """(export "e$it" (type (eq $it)))""" }
+        val chain = (1 until d).joinToString(" ") { j ->
+            "(type ${'$'}U$j (instance (alias outer 1 ${'$'}U${j - 1} (type ${'$'}x)) (export \"a\" (instance (type ${'$'}x)))))"
+        }
+        val top = "(type ${'$'}T (instance (alias outer 1 ${'$'}U${d - 1} (type ${'$'}u)) " +
+            "(export \"d\" (type (sub resource))) (export \"t\" (type (eq ${'$'}u)))))"
+        val imports = (0 until k).joinToString(" ") { """(import "x$it" (instance (type ${'$'}T)))""" }
+        return "(component ${(0 until r).joinToString(" ") { """(import "r$it" (type (sub resource)))""" }} " +
+            "(type ${'$'}U0 (instance $aliases $exports)) $chain $top $imports)"
+    }
+
+    @Test
+    fun `resourceを定義する型の宣言は、たどれるインスタンス型のresourceの表の写しも数える`() {
+        // #964（レビュー）: wasmparser は import・export の宣言のたびに、たどれるインスタンス型を 1 つずつ、explicit な resource の表を
+        // 丸ごと写す（`remap_component_instance_type_id`）。export が 1 つで resource が 2,000 件のインスタンス型を 64 段つないだ型を
+        // 300 個 import する 70 KB で、見積もりは約 195 万のまま検証が CPU 14.7 秒かかった。表の写しは 64 × 2,000 件ずつ
+        val bomb = wat(instanceChainComponent(r = 1_000, d = 64, k = 40))
+        val e = estimateOf(bomb)
+        assertTrue(e.remapCost >= 40L * 64 * 1_000) { "${e.remapCost}" }
+        rejectedBeforeValidation(bomb)
+        // 小さな形は通る
+        val small = wat(instanceChainComponent(r = 20, d = 4, k = 3))
+        assertTrue(estimateOf(small).remapCost >= 3L * 4 * 20) { "${estimateOf(small).remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+        // resource を定義しない型の宣言は、写し直さないので数えない（鎖だけで 64 × 64 / 2 × 1,000 件にならない）
+        val noDefine = wat(instanceChainComponent(r = 1_000, d = 64, k = 0))
+        assertTrue(estimateOf(noDefine).remapCost < 64L * 64 / 2 * 1_000 / 4) { "${estimateOf(noDefine).remapCost}" }
+    }
+
     @Test
     fun `ツールチェーンが作るコンポーネントの見積もりは上限に十分収まる`() {
         // WASI の filesystem に近い規模のインターフェース（record・variant・enum・flags・resource と関数 40 個）を
