@@ -24,6 +24,8 @@ import java.io.ByteArrayOutputStream
  * `v128.const` と GC の提案の命令は、定数式としてそのまま写し、これでは断らない（#851）。ただし、止まりうる関数があるモジュールは、
  * 型付きの参照型（`(ref i31)` など）のグローバルや型を持てば、定数式の命令とは別に断る（型を追えない。#384）。
  * struct・array の型の定義（rec グループの中のものも）は、それだけでは断らない（止まりうる関数があっても。#891）。
+ * 止まりうる関数の中の、止まりうる `call_ref`（外の型に当たるものも）と、待ち点をまたいだ関数の参照を渡す `call_ref` は断る
+ * （参照は待ち点をまたいで退避できず、一時ローカルに移すと型が funcref になる。#923）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
@@ -50,7 +52,7 @@ internal enum class AsyncifyDebug {
  * ほかのコードを飛ばして進む。止まりうる import に着いたら、ホストが状態を `NORMAL` に戻して、その呼び出しをやり直す。
  *
  * binaryen はコードを平らにして（Flatten）からこれを行う。ここでは平らにせず、次の形にする:
- * - 止まりうる呼び出し（止まりうる import・止まりうる関数・`call_indirect`・`call_ref`）と、それを含む構造（block・loop・if・try_table）を
+ * - 止まりうる呼び出し（止まりうる import・止まりうる関数・`call_indirect`）と、それを含む構造（block・loop・if・try_table）を
  *   「待ち点」とする。待ち点の直前で、オペランドスタックに積まれている値をすべて一時ローカルに移し（スタックを空にする）、直後に戻す
  * - 待ち点の間の命令の並び（ラン）は `if (state == NORMAL)` で包む。巻き直し中は飛ばされる。ランの中の分岐は、包んだ分だけ深さを足す
  * - 呼び出しは `if (state == NORMAL || k == K)` で包む（K はその関数の中の呼び出しの番号）
@@ -158,7 +160,7 @@ internal object Asyncify {
      * セグメントの課金を `FuelSites.weight` 倍にして、変換が足したコードの分を見込む。`null` なら課金は変えない（#389 の前と同じ出力）。
      *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
-     *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
+     *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出し、止まりうる `call_ref`（#923）など）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
      *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は断らない（#851）
      * @throws WasmLoadException WASM として読めない（定数式に使えない命令を含む。グローバル・能動な要素セグメントのものは Endive の検証が、
      *   パッシブ・宣言の要素セグメントのものは定数式の写しが断る。#851）、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
@@ -211,7 +213,8 @@ internal object Asyncify {
         /**
          * 変換する（[Asyncify.transform] と同じ）。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（#757）。
          * import・export したテーブルへの `call_indirect` と `call_ref` は、型がこのどれかでも止まりうるとみなす
-         * （テーブルの中身や関数の参照は、ほかのモジュールが入れられるため）。空なら今までと同じ出力になる
+         * （テーブルの中身や関数の参照は、ほかのモジュールが入れられるため）。止まりうる関数の中の、そうして止まりうるとみなした
+         * `call_ref` は断る（#923）。空なら今までと同じ出力になる
          *
          * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（[Asyncify.transform]）
          * @throws WasmLoadException 時間の上限を超えた
@@ -301,6 +304,13 @@ private const val BOT = -1
 
 /** funcref（略記の `(ref null func)` も同じ番号になる。[code]） */
 private const val FUNCREF = 0x70
+
+/**
+ * 型の追跡だけで使う印: `ref.func` が積んだ、型付きの関数の参照（`(ref $t)`。#923）。値の型としては [FUNCREF] と同じに扱い、
+ * 一時ローカルに移すと [FUNCREF] になる（`FunctionRewriter` の `alloc`。宣言する型は今までと同じ）。
+ * 待ち点をまたいで型を失った（[FUNCREF] になった）参照を `call_ref` に渡すと、出力が検証に通らないので断る
+ */
+private const val REF_FUNC = 0x170
 
 private fun isRef(t: Int) = t != I32 && t != I64 && t != F32 && t != F64 && t != V128 && t != BOT
 
@@ -905,7 +915,11 @@ private class Transformer(
             return localTypes.size - 1
         }
 
-        private fun alloc(t: Int): Int = free[t]?.removeFirstOrNull() ?: newLocal(t)
+        private fun alloc(type: Int): Int {
+            // 型付きの関数の参照（[REF_FUNC]）は、funcref の一時ローカルに移す（#923。宣言する型は #923 の前と同じ）
+            val t = if (type == REF_FUNC) FUNCREF else type
+            return free[t]?.removeFirstOrNull() ?: newLocal(t)
+        }
 
         /** 共有しない一時ローカル（構造の結果） */
         private val dedicated = HashSet<Int>()
@@ -1268,7 +1282,11 @@ private class Transformer(
 
         private fun isSuspendCall(ins: AnnotatedInstruction): Boolean = when (ins.opcode()) {
             OpCode.CALL -> ins.operand(0).toInt() in suspendable || isYieldCall(ins)
-            OpCode.CALL_INDIRECT, OpCode.CALL_REF -> indirectMaySuspend(ins)
+            OpCode.CALL_INDIRECT -> indirectMaySuspend(ins)
+            // 待ち点の直前で、参照を一時ローカルに移す（型が funcref になり、call_ref に渡せない）。参照の型の一時ローカルにしても、
+            // 参照は退避できない（巻き戻しで null でなければ trap。ADR 0329）ので、必ず null でない call_ref の参照では巻き戻せない（#923）
+            OpCode.CALL_REF ->
+                if (indirectMaySuspend(ins)) throw AsyncifyUnsupported("止まりうる call_ref（関数の参照の提案）には対応していない（参照は待ち点をまたいで退避できない）") else false
             OpCode.RETURN_CALL -> if (ins.operand(0).toInt() in suspendable) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
             OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
                 if (indirectMaySuspend(ins)) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
@@ -1362,7 +1380,9 @@ private class Transformer(
                     call(st, typeSig(ins.operand(0).toInt()))
                 }
                 0x14 -> {
-                    st.pop()
+                    // 型付きの参照は [REF_FUNC]（待ち点をまたいでいない ref.func）か [BOT]。funcref は、待ち点をまたいで
+                    // funcref の一時ローカルに移した参照（正しいモジュールでは、ほかに call_ref に funcref は届かない）。出力が検証に通らないので断る（#923）
+                    if (st.pop() == FUNCREF) throw AsyncifyUnsupported("関数の参照を持ったまま待ってから call_ref で呼ぶことには対応していない（待ち点をまたぐと参照の型が funcref になる）")
                     call(st, typeSig(ins.operand(0).toInt()))
                 }
                 0x1A -> st.pop()
@@ -1445,7 +1465,7 @@ private class Transformer(
                     st.push(if (heapType >= 0) BOT else (heapType + 0x80).toInt())
                 }
                 0xD1 -> un(st, I32)
-                0xD2 -> st.push(0x70)
+                0xD2 -> st.push(REF_FUNC)
                 0xD3 -> bin(st, I32)
                 0xD4 -> {
                     val t = st.pop()

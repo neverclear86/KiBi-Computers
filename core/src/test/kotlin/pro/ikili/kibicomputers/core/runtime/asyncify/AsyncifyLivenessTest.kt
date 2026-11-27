@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.TestWasiP1
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
@@ -16,6 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
@@ -305,6 +307,119 @@ class AsyncifyLivenessTest {
         for (debug in AsyncifyDebug.entries) assertThrows<WasmTrapException>("$debug") { runWithWait(liveFunc, debug) }
     }
 
+    // --- call_ref（#923） ---
+
+    /** `w.wait` を import し、型 `$v_i`（`() -> i32`。止まりうる関数の型）と `$v_l`（`() -> i64`。止まりうる関数の型でない）を持つモジュール */
+    private fun callRefModule(funcs: String): ByteArray = WitTool.wat(
+        """
+        (module
+          (type ${'$'}v_i (func (result i32)))
+          (type ${'$'}v_l (func (result i64)))
+          (import "w" "wait" (func ${'$'}wait (type ${'$'}v_i)))
+          (table 1 funcref)
+          (elem declare func ${'$'}wait ${'$'}seven)
+          (func ${'$'}seven (type ${'$'}v_l) (i64.const 7))
+          $funcs)
+        """.trimIndent(),
+    )
+
+    private fun assertRejected(wasm: ByteArray, vararg parts: String) {
+        for (debug in AsyncifyDebug.entries) {
+            val e = assertThrows<AsyncifyUnsupported>("$debug") { Asyncify.transform(wasm, setOf("w.wait"), debug = debug) }
+            for (part in parts) assertTrue(e.message!!.contains(part), "$debug: ${e.message}")
+        }
+    }
+
+    @Test
+    fun `止まりうるcall_refは、変換で断る`() {
+        // Issue の例。参照を一時ローカルに移すと funcref になって検証に通らず、参照の型にしても巻き戻しで必ず trap する（null でない参照は退避できない）
+        val wasm = callRefModule("(func (export \"run\") (result i32) (call_ref ${'$'}v_i (ref.func ${'$'}wait)))")
+        EndiveRuntime().load(wasm)
+        assertRejected(wasm, "止まりうる関数 #2（export run） の中", "止まりうる call_ref")
+        // 燃料の計測コードの挿入と燃料切れの待ち点化を通す読み込み（exec の経路）も、変換できない理由を持って断る
+        val e = assertThrows<WasmLoadException> { Program.loadMetered(EndiveRuntime(), wasm, null, setOf("w.wait")) }
+        val reason = Program.unsuspendableReason(e)
+        assertTrue(reason?.contains("call_ref") == true, e.message)
+        // 止まりうる import がなければ、止まりうる関数がないので断らない（#384）
+        assertEquals(0, Asyncify.transform(wasm, emptySet()).instrumented)
+    }
+
+    @Test
+    fun `外の型のcall_refも、変換で断る`() {
+        // 型 $v_l は、このモジュールの中では止まりうる関数の型でない。外の型（#757）に入れると、止まりうる call_ref になる
+        val wasm = callRefModule("(func (export \"run\") (result i64) (call_ref ${'$'}v_l (ref.func ${'$'}seven)))")
+        val external = setOf(Asyncify.Signature(emptyList(), listOf(0x7E)))
+        val prepared = Asyncify.prepare(wasm)
+        // 解析は断らない（コンポーネントは解析を不動点まで回す）
+        assertEquals(setOf("run"), prepared.analyze(emptySet(), external).suspendableExports)
+        val e = assertThrows<AsyncifyUnsupported> { prepared.transform(emptySet(), external) }
+        assertTrue(e.message!!.contains("止まりうる関数 #2（export run） の中") && e.message!!.contains("止まりうる call_ref"), e.message)
+        // 外の型がなければ、止まりうる関数がない
+        assertEquals(0, prepared.transform(emptySet()).instrumented)
+    }
+
+    @Test
+    fun `関数の参照を持ったまま待ってからcall_refで呼ぶ形は、止まりうる型でなくても断る`() {
+        // ref.func → 待ち点 → call_ref。参照が funcref の一時ローカルを通るので、出力が検証に通らない（run の型は () -> i32 なので、$v_l は止まりうる型でない）
+        val crossing = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (ref.func ${'$'}seven)
+              (drop (call ${'$'}wait))
+              (call_ref ${'$'}v_l)
+              i32.wrap_i64)
+            """.trimIndent(),
+        )
+        EndiveRuntime().load(crossing)
+        assertRejected(crossing, "止まりうる関数 #2（export run） の中", "call_ref で呼ぶこと")
+        // ref.as_non_null を通しても、型は戻らない
+        val asNonNull = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (ref.func ${'$'}seven)
+              (drop (call ${'$'}wait))
+              (ref.as_non_null)
+              (call_ref ${'$'}v_l)
+              i32.wrap_i64)
+            """.trimIndent(),
+        )
+        EndiveRuntime().load(asNonNull)
+        assertRejected(asNonNull, "call_ref で呼ぶこと")
+    }
+
+    @Test
+    fun `待ち点をまたがない止まりうる型でないcall_refは、今までどおり変換して巻き戻せる`() {
+        // wait() + i32.wrap(call_ref $v_l (ref.func $seven))。待ち点の後で ref.func を積むので、参照は一時ローカルを通らない
+        val wasm = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (call ${'$'}wait)
+              (i32.wrap_i64 (call_ref ${'$'}v_l (ref.func ${'$'}seven)))
+              i32.add)
+            """.trimIndent(),
+        )
+        assertTrue(EndiveRuntime().load(Asyncify.transform(wasm, setOf("w.wait")).bytes).isAsyncified)
+        for (debug in AsyncifyDebug.entries) assertEquals(48L, runWithWait(wasm, debug), "$debug")
+    }
+
+    @Test
+    fun `関数の参照を持ったまま待ってからcall_ref以外に渡す形は、今までどおり変換する`() {
+        // i32.const 0; ref.func; 待ち点; table.set。funcref の一時ローカルのままで検証に通る（巻き戻せば、null でない参照で trap する）
+        val wasm = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (i32.const 0)
+              (ref.func ${'$'}seven)
+              (drop (call ${'$'}wait))
+              (table.set 0)
+              (i32.const 1))
+            """.trimIndent(),
+        )
+        val r = Asyncify.transform(wasm, setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        assertTrue(EndiveRuntime().load(r.bytes).isAsyncified)
+    }
+
     /**
      * lua.wasm にない形の待ち点を並べた `run() -> i32`（一時ローカルの選別 [Asyncify] の `savedTemps` を、[AsyncifyDebug.POISON_UNSAVED] で確かめる）:
      * - 待ち点の前にスタックに残る値（keep）
@@ -313,7 +428,7 @@ class AsyncifyLivenessTest {
      * - 引数のある定義済みの関数への直接の call（引数は呼ばれた側が戻す）・call_indirect
      * - 外から止まりうるとみなす型（`externalSuspendTypes`。#757）の、export したテーブルへの call_indirect（`w.ext`。この型の止まりうる関数はモジュールの中にない）
      *
-     * `call_ref` は、参照を一時ローカルに移すと型が funcref になり、変換の出力が検証に通らないので、ここでは扱わない（#923）
+     * 止まりうる `call_ref` は、変換で断る（参照は待ち点をまたいで退避できない。#923）ので、ここには入れない（上の call_ref のテスト）
      */
     private val shapes by lazy {
         WitTool.wat(
