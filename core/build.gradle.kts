@@ -213,6 +213,9 @@ fun Test.coreTestDefaults(classFilter: (FileTreeElement) -> Boolean = { true }) 
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // ThreadDumpWatchdogScriptTest が回す CI の見張りのスクリプト（#927）。同じ理由で入力に宣言する（スクリプトだけの変更でもテストが走るように）
+    inputs.file(rootProject.layout.projectDirectory.file(".github/scripts/with-thread-dump-watchdog.sh"))
+        .withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("threadDumpWatchdogScript")
     // 組の絞り込み（#984）。クラスファイルの集合も入力になるが、キャッシュのキーをはっきり分けるために値も入力にする
     inputs.property("kibi.test.shard", testShardSpec ?: "all")
     inputs.property("kibi.test.serialClasses", serialTestClasses.sorted())
