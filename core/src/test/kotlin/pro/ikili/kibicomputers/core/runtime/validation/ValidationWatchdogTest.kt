@@ -153,12 +153,43 @@ class ValidationWatchdogTest {
             caller.join()
             assertTrue(ran.await(10, TimeUnit.SECONDS))
             val t = worker.get()
-            assertEquals("KiBi-wasm-watchdog", t.name)
+            assertEquals(ValidationWatchdog.THREAD_NAME, t.name)
             assertEquals(Thread.NORM_PRIORITY, t.priority)
             assertTrue(t.isDaemon)
             // 仕事がなければスレッドが終わる（ワールドを出入りしても溜まらない）
             t.join(10_000)
             assertFalse(t.isAlive) { "タイマーのスレッドが仕事の後に終わらない" }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `見張りを終えた後は長い予定が残らずタイマーのスレッドが終わる`() {
+        // 本番の使い方（watch → finish）で、取り消した予定が待ち行列に残らず、スレッドが仕事の後に終わる
+        // （#990。Harness.close はこのスレッドを数えず、予定の数で finish の呼び忘れを見る）
+        val executor = ValidationWatchdog.newExecutor(idleMillis = 50)
+        try {
+            val watchdog = ValidationWatchdog(timer = { delay, task -> executor.schedule(task, delay, TimeUnit.NANOSECONDS) })
+            // スレッドを立てて捕まえる
+            val worker = AtomicReference<Thread>()
+            val ran = CountDownLatch(1)
+            executor.schedule(
+                {
+                    worker.set(Thread.currentThread())
+                    ran.countDown()
+                },
+                0,
+                TimeUnit.MILLISECONDS,
+            )
+            assertTrue(ran.await(10, TimeUnit.SECONDS))
+            val w = watchdog.watch(LoadDeadline(3_600 * second))
+            assertEquals(1, executor.queue.size)
+            assertFalse(w.finish())
+            assertEquals(0, executor.queue.size)
+            val t = worker.get()
+            t.join(10_000)
+            assertFalse(t.isAlive) { "見張りを終えた後もタイマーのスレッドが終わらない" }
         } finally {
             executor.shutdownNow()
         }
