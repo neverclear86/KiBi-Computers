@@ -146,7 +146,10 @@ internal class ValidationWatchdog(
         /** 別のスレッドの CPU 時間が読めないとき、経過時間を割り引く倍率（上限の何倍の経過時間まで待つか） */
         const val WALL_FALLBACK_FACTOR: Long = 4
 
-        private const val THREAD_NAME = "KiBi-wasm-watchdog"
+        /**
+         * タイマーのスレッドの名前。JVM に 1 本で、スケジューラのものではない（テストの補助が、カーネルのスレッドの残りから除くのに使う。#990）
+         */
+        const val THREAD_NAME: String = "KiBi-wasm-watchdog"
 
         /** 仕事がないときにタイマーのスレッドを残しておく時間（ミリ秒。検証が続くあいだは残り、止まればすぐ終わる） */
         private const val IDLE_MILLIS = 1_000L
@@ -187,7 +190,14 @@ internal class ValidationWatchdog(
                 allowCoreThreadTimeOut(true)
             }
 
-        private val executor: ScheduledThreadPoolExecutor by lazy { newExecutor(IDLE_MILLIS) }
+        private val executorLazy: Lazy<ScheduledThreadPoolExecutor> = lazy { newExecutor(IDLE_MILLIS) }
+        private val executor: ScheduledThreadPoolExecutor by executorLazy
+
+        /**
+         * 共有の見張りの待ち行列に残っている予定の数（テスト用。#990）。`Watch.finish` の呼び忘れを、スレッドが終わるのを待たずに見つける。
+         * 共有の実行器をまだ作っていなければ、作らずに 0 を返す
+         */
+        fun sharedPendingCount(): Int = if (executorLazy.isInitialized()) executorLazy.value.queue.size else 0
 
         /** 全体で共有する見張り（タイマーのスレッド1本） */
         val shared: ValidationWatchdog by lazy {
