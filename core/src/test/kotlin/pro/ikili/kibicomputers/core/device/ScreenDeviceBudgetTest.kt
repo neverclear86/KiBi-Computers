@@ -24,6 +24,7 @@ import java.util.concurrent.locks.LockSupport
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.awaitOrFail
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 /** 1台・1 tick の、メインスレッドでの端末の処理量（#357・#355）。同梱イメージ testboot（Lua の REPL）で、実際の出力を流す */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
@@ -183,7 +184,7 @@ class ScreenDeviceBudgetTest {
                 }
             } finally {
                 release.countDown()
-                holder.join()
+                holder.joinOrFail("表示デバイスのロックを持つスレッドが終わらない") // 割り込まれた後も、期限つきで待って元の失敗を残す（#916）
             }
             // ロックが空けば、書き手が続きを書き、出力は止まらない
             val before = lines(screen)
