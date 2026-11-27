@@ -89,7 +89,7 @@ internal object FarChunks {
      * #871 と同じく、生成は上限なしに同期で待ち、tick の待ちはその後の昇格（メインスレッドの数 tick）だけにする。
      *
      * メインスレッドを止めるので、読む範囲は送れる状態に要る分（[radius] = 1）に絞る。[reserve] の「まだ読み込まれていない」の
-     * 確かめの後で、読み込みを保つチケット（プレイヤー・リージョン）を付けてから呼ぶ（`getChunk` の一時のチケットは 1 tick で外れるため）
+     * 確かめの後で、読み込みを保つチケット（リージョン）を付けてから呼ぶ（`getChunk` の一時のチケットは 1 tick で外れるため）
      */
     fun generate(level: ServerLevel, chunk: ChunkPos, radius: Int = 1) {
         for (dx in -radius..radius) {

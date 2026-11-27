@@ -23,6 +23,7 @@ import net.minecraft.world.level.chunk.status.ChunkStatus
 import net.minecraft.world.level.portal.DimensionTransition
 import net.minecraft.world.phys.Vec3
 import net.neoforged.neoforge.common.NeoForge
+import net.neoforged.neoforge.event.EventHooks
 import net.neoforged.neoforge.event.level.ChunkWatchEvent
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
@@ -658,7 +659,11 @@ object ScreenSyncGameTests {
 
     /**
      * [SEND_TEST_TICKET] の距離。段階は 33 − 距離なので、1 で中心がブロックの tick する段（32。送れる状態）になり、FULL になるのは
-     * まわりの 3×3 だけで済む（2 だと 5×5 を生成する）
+     * まわりの 3×3 だけで済む（2 だと 5×5 を生成する）。
+     *
+     * 離れたチャンクを使う 2 つのテストは、どちらもこのチケットで読み込み、プレイヤーのチケットは付けない（#934）。プレイヤーのチケットは
+     * サーバーの視距離（GameTest では 2）の範囲に段階 31 を付けるので、FULL で約 9×9、その外にさらに下の段階までがワーカーで生成され、
+     * 同じバッチのほかのテストの生成と CPU を取り合う
      */
     private const val SEND_TEST_TICKET_DISTANCE = 1
 
@@ -670,25 +675,29 @@ object ScreenSyncGameTests {
      * だれも使わない離れたチャンク（[FarChunks]）に付け、失敗しても必ず外す。
      *
      * 新しいチャンクの生成は実時間かかるので、tick の上限の中で待たず、先に同期で生成しておく（[FarChunks.generate]、#934）。
+     * 読み込みは、送れる状態に要る 3×3 だけを生成するテスト用のチケットで保つ（[SEND_TEST_TICKET_DISTANCE]）。
      * 後始末は、タイムアウトのときも走るように、テストが終わったときに走らせる。
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun sentChunkStaysWatchedWhileSendIsDelayed(helper: GameTestHelper) {
         val level = helper.level
-        // だれも読み込んでいない離れたチャンク（#747）。プレイヤーのチケットで読み込む
+        val cache = level.chunkSource
+        // だれも読み込んでいない離れたチャンク（#747）。テスト用のチケットで読み込む
         val far = FarChunks.reserve(helper)
         val farPos = far.getMiddleBlockPosition(helper.absolutePos(POS).y)
         ScreenSync.transport = CAPTURE
         val player = helper.makeMockServerPlayerInLevel()
         val client = FakeClient(ScreenTier.COLOR, farPos)
         clients[player] = client
-        // 画面の東 2 ブロックに立つ（目の高さを画面の中心にそろえる）
+        // 画面の東 2 ブロックに立つ（目の高さを画面の中心にそろえる）。`ChunkMap.move` は呼ばない（偽物のプレイヤーは接続が
+        // tick されないので、ほかからも呼ばれない）。呼ぶと、プレイヤーのチケットで離れたチャンクのまわりの広い範囲を生成しはじめる
+        // （[SEND_TEST_TICKET_DISTANCE]）。追跡の範囲と送る順番待ちには、送れる状態になってから入れる
         player.teleportTo(farPos.x + 2.5, farPos.y + 0.5 - player.eyeHeight, farPos.z + 0.5)
-        level.chunkSource.move(player)
         val delay = CompletableFuture<Any?>()
         var screen: ScreenBlockEntity? = null
         var sent = 0
+        var queued = false
         var cleaned = false
         // 何度呼んでもよい（成功の段と、テストが終わったときの両方から呼ぶ）
         fun cleanUpAll() {
@@ -696,16 +705,28 @@ object ScreenSyncGameTests {
             cleaned = true
             delay.complete(null)
             if (screen != null) level.setBlock(farPos, Blocks.AIR.defaultBlockState(), 3)
+            cache.removeRegionTicket(SEND_TEST_TICKET, far, SEND_TEST_TICKET_DISTANCE, far)
             cleanUp(helper, player)
         }
+        // 中心のチャンクがブロックの tick する段（送れる状態）になるチケット。まわりの 3×3 が FULL になる
+        cache.addRegionTicket(SEND_TEST_TICKET, far, SEND_TEST_TICKET_DISTANCE, far)
         whenTestEnds(helper) { cleanUpAll() }
-        // プレイヤーのチケットを付けた後に、送れる状態に要る 3×3 を生成しておく
+        // チケットを付けた後に、送れる状態に要る 3×3 を生成しておく
         FarChunks.generate(level, far)
         val startTick = level.server.tickCount
         val startNanos = System.nanoTime()
         helper.startSequence()
-            // プレイヤーのチケットで読み込まれ、送れる状態になったら届ける
+            // 送れる状態になったら、追跡の範囲と送る順番待ちに入れて届ける
             .thenWaitUntil {
+                cache.runDistanceManagerUpdates()
+                val chunk = cache.chunkMap.getChunkToSend(far.toLong())
+                if (chunk != null && !queued) {
+                    queued = true
+                    player.setChunkTrackingView(ChunkTrackingView.of(far, 2))
+                    // `ChunkMap.markChunkPendingToSend` と同じ（順番待ちに入れて、Watch を出す）
+                    player.connection.chunkSender.markChunkPendingToSend(chunk)
+                    EventHooks.fireChunkWatch(player, chunk, level)
+                }
                 deliverChunks(player, farPos)
                 if (!ScreenSync.isChunkSent(level, player, far)) {
                     helper.fail("the far chunk should be sent to the player (${farChunkState(level, far, player, startTick, startNanos)})")
