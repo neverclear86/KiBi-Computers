@@ -191,3 +191,35 @@ internal class WallClockWait(private val limitMillis: Long, private val stepMill
 
     override fun toString(): String = "${elapsedMillis}ms over $ticks ticks (limit ${limitMillis}ms)"
 }
+
+/**
+ * 待ちにした claim の確定を待つ上限（壁時計。#881・#912）。読みは列の外の読み手か、その ID の仕事が残っていれば書き込みのスレッドの列の
+ * 後ろで行う（#877）。GameTest のサーバーは tick の間で待たず全速で回すので、tick の数では読みが終わるまでの時間を保証できない。そのため
+ * 待つ tick ごとに [CLAIM_DECIDE_STEP_MILLIS] まで眠り（[WallClockWait]）、壁時計で打ち切る。
+ * 置き場の待ちの上限 `claimWaitMillis`（既定 30 秒）より短く保つ（長いと、置き場が先に新しい ID にして、原因の分かりにくい失敗になる）
+ */
+internal const val CLAIM_DECIDE_LIMIT_MILLIS = 20_000
+
+/** 確定を待つ tick に眠る上限（ミリ秒） */
+internal const val CLAIM_DECIDE_STEP_MILLIS = 50
+
+/**
+ * 確定の待ちに取っておく GameTest の tick の数。待つ tick は 1 回 [CLAIM_DECIDE_STEP_MILLIS] 以上かかるので、この数の tick は壁時計では
+ * [CLAIM_DECIDE_LIMIT_MILLIS] の 3 倍（60 秒）より前に尽きない。待ちに入った時点で少なくともこれだけ tick が残っていれば、壁時計の上限が
+ * 必ず先に来て、診断の値つきで落ちる（確定の待ちの前に tick を使うテストは、`timeoutTicks` にこの数を足す）
+ */
+internal const val CLAIM_DECIDE_TIMEOUT_TICKS = CLAIM_DECIDE_LIMIT_MILLIS / CLAIM_DECIDE_STEP_MILLIS * 3
+
+/** 確定の待ちを始める（待ちに入った tick に作る） */
+internal fun claimDecideWait() = WallClockWait(CLAIM_DECIDE_LIMIT_MILLIS.toLong(), CLAIM_DECIDE_STEP_MILLIS.toLong())
+
+/** 確定しなかったときの診断（遅れたのか止まったのかを 1 行で見分ける。#852）。[helper] があれば、tick の進みも出す */
+internal fun claimDecideDiagnostics(
+    store: MachineSaveStore,
+    wait: WallClockWait,
+    cases: List<CaseBlockEntity>,
+    helper: GameTestHelper? = null,
+) = "waited $wait; deferred in store=${cases.map { store.isClaimDeferred(it) }}, waitingClaims=${store.waitingClaims}, " +
+    "sideOwnerReadRequests=${store.sideOwnerReadRequests}, sideOwnerReadRetries=${store.sideOwnerReadRetries}, " +
+    "writerOwnerReadRequests=${store.writerOwnerReadRequests}, deferredClaimTimeouts=${store.deferredClaimTimeouts}, " +
+    "claimWaitMillis=${store.claimWaitMillis}" + (helper?.let { ", tick=${it.tick}" } ?: "")
