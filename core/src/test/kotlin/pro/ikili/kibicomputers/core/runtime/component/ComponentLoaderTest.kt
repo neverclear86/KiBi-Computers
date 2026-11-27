@@ -714,6 +714,290 @@ class ComponentLoaderTest {
         assertEquals(1L, estimateOf(ascribed).checkCount)
     }
 
+    /** resource を [r] 個 export するインスタンス型を 1 回 import した `$i` と、その前置き（#964） */
+    private fun resourceInstance(r: Int): String {
+        val exports = (0 until r).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }
+        return """(import "i" (instance ${'$'}i $exports))"""
+    }
+
+    /** `$i` を [n] 回 export する export の並びのインスタンスを [k] 個（#964） */
+    private fun exportBags(n: Int, k: Int, of: String = "${'$'}i"): String =
+        (0 until k).joinToString(" ") { b -> "(instance ${(0 until n).joinToString(" ") { """(export "a$it" (instance $of))""" }})" }
+
+    @Test
+    fun `resourceを多く持つインスタンスをexportの並びで何度もexportする形は検証の前に断る`() {
+        // #964: wasmparser は、export の並びでインスタンスを export するたびに、その型の explicit な resource を 1 件ずつ写す
+        // （`instantiate_component_exports`）。resource 2,000 個 × 499 回 × 並び 10 個（58 KB）で CPU 5.0 秒、40 個で時間の上限に届いた。
+        // 型の確認もインスタンス化もないので、前は見積もりが import の写し直し（4,001）だけだった
+        val bomb = wat("(component ${resourceInstance(2_000)} ${exportBags(499, 10)})")
+        val e = estimateOf(bomb)
+        assertEquals(0L, e.checkCount)
+        assertEquals(10L * 499 * 2_000, e.explicitCost)
+        // パスの要素の写し（長さ 1）は、型のたどりとして数える
+        assertTrue(e.scanCost >= 10L * 499 * 2_000 / 16) { "${e.scanCost}" }
+        assertEquals(e.cost, e.remapCost + e.scanCost + e.explicitCost)
+        rejectedBeforeValidation(bomb)
+    }
+
+    @Test
+    fun `exportの並びの小さい形は見積もりどおりに数えて検証も通る`() {
+        // resource 20 個のインスタンスを 10 回 export する並び 2 つ。1 回の export で 20 件写す
+        val small = wat("(component ${resourceInstance(20)} ${exportBags(10, 2)})")
+        val e = estimateOf(small)
+        assertEquals(2L * 10 * 20, e.explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+    }
+
+    @Test
+    fun `exportの並びを並びで何度もexportしても掛け算にならない`() {
+        // wasmparser の explicit な resource は resource の id を鍵にした表なので、同じインスタンスを何度入れても増えない。
+        // 並び $l1 は $i を 10 回、$l2 は $l1 を 10 回、$l3 は $l2 を 10 回 export する。どの並びも explicit は 20 件
+        val text = """
+            (component
+              ${resourceInstance(20)}
+              (instance ${'$'}l1 ${(0 until 10).joinToString(" ") { """(export "a$it" (instance ${'$'}i))""" }})
+              (instance ${'$'}l2 ${(0 until 10).joinToString(" ") { """(export "b$it" (instance ${'$'}l1))""" }})
+              (instance ${'$'}l3 ${(0 until 10).joinToString(" ") { """(export "c$it" (instance ${'$'}l2))""" }})
+            )
+        """
+        val c = wat(text)
+        val e = estimateOf(c)
+        assertEquals(3L * 10 * 20, e.explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(c, policy = ComponentImportPolicy { null }) }
+        // 並びに入れた resource の型も 1 件ずつ数え、それを export する並びは、その件数を写す
+        val types = wat(
+            """
+            (component
+              ${resourceInstance(20)}
+              ${(0 until 5).joinToString(" ") { "(alias export ${'$'}i \"r$it\" (type ${'$'}t$it))" }}
+              (instance ${'$'}l1 ${(0 until 5).joinToString(" ") { "(export \"t$it\" (type ${'$'}t$it))" }})
+              (instance ${'$'}l2 (export "x" (instance ${'$'}l1)) (export "y" (instance ${'$'}l1)))
+            )
+            """,
+        )
+        assertEquals(2L * 5, estimateOf(types).explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(types, policy = ComponentImportPolicy { null }) }
+    }
+
+    @Test
+    fun `resourceを多く持つインスタンスをコンポーネントから何度もexportする形も数える`() {
+        // wasmparser は、コンポーネントの export でも、インスタンスを export するたびにその explicit な resource を写す
+        // （`prepare_instance_export`。#964）
+        fun body(n: Int) = "${resourceInstance(2_000)} ${(0 until n).joinToString(" ") { """(export "e$it" (instance ${'$'}i))""" }}"
+        val e = estimateOf(wat("(component ${body(10)})"))
+        assertEquals(10L * 2_000, e.explicitCost)
+        // 1 つのコンポーネントでは、wasmparser が型の大きさ（100 万）で 500 回ほどまでに抑える（resource 2,000 個 × 500 回で CPU 約 0.9 秒）が、
+        // 入れ子のコンポーネントに分けると抑えない。400 回 export する入れ子 10 個は、検証の前に断る
+        val nestedBomb = wat("(component ${"(component ${body(400)})".repeat(10)})")
+        assertEquals(10L * 400 * 2_000, estimateOf(nestedBomb).explicitCost)
+        rejectedBeforeValidation(nestedBomb)
+        // インスタンス型の中のインスタンスの export の宣言も同じ。resource を定義する型は宣言ごとに resource が新しくなるので、
+        // 外側の型は 3 回分の resource を持つ（それを import して並びで export すると 3 × 20 件を写す）
+        val nested = wat(
+            """
+            (component
+              (type ${'$'}t (instance ${(0 until 20).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }}))
+              (import "o" (instance ${'$'}o (export "x" (instance (type ${'$'}t))) (export "y" (instance (type ${'$'}t))) (export "z" (instance (type ${'$'}t)))))
+              (instance (export "a" (instance ${'$'}o)))
+            )
+            """,
+        )
+        // 型の中の 3 回の宣言（20 件ずつ）と、並びでの 1 回（60 件）
+        assertEquals(3L * 20 + 60, estimateOf(nested).explicitCost)
+        assertDoesNotThrow { ComponentLoader.load(nested, policy = ComponentImportPolicy { null }) }
+    }
+
+    /** resource を [r] 個 export する入れ子のコンポーネント `$c`（resource は `(type (resource (rep i32)))`。#964） */
+    private fun localResourceComponent(r: Int, name: String = "c"): String =
+        "(component ${'$'}$name ${(0 until r).joinToString(" ") { "(type ${'$'}t$it (resource (rep i32)))" }} " +
+            "${(0 until r).joinToString(" ") { """(export "r$it" (type ${'$'}t$it))""" }})"
+
+    /** 引いたインスタンス `$x` を export の並びで [n] 回 export する並びを [k] 個。`$x` の作り方が違う形を、[r] 件の resource ごとに返す */
+    private fun explicitForms(r: Int, n: Int, k: Int): Map<String, String> {
+        val bags = exportBags(n, k, "${'$'}x")
+        val resExports = (0 until r).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }
+        return mapOf(
+            // インスタンス化でできたインスタンス
+            "instantiate" to "(component ${localResourceComponent(r)} (instance ${'$'}x (instantiate ${'$'}c)) $bags)",
+            // import したインスタンスの export を alias で引いたインスタンス
+            "alias" to """
+                (component
+                  (import "o" (instance ${'$'}o (export "x" (instance $resExports))))
+                  (alias export ${'$'}o "x" (instance ${'$'}x))
+                  $bags
+                )
+            """,
+            // import したコンポーネントのインスタンス化
+            "imported" to "(component (import \"c\" (component ${'$'}c $resExports)) (instance ${'$'}x (instantiate ${'$'}c)) $bags)",
+            // インスタンス化したものが export するインスタンスを alias で引いたインスタンス
+            "instantiated-alias" to """
+                (component
+                  (component ${'$'}c
+                    ${localResourceComponent(r, "in")}
+                    (instance ${'$'}ii (instantiate ${'$'}in))
+                    (export "x" (instance ${'$'}ii))
+                  )
+                  (instance ${'$'}i (instantiate ${'$'}c))
+                  (alias export ${'$'}i "x" (instance ${'$'}x))
+                  $bags
+                )
+            """,
+        )
+    }
+
+    @Test
+    fun `インスタンス化・aliasで引いたインスタンスと入れ子のコンポーネントのresourceも並びでexportするたびに数える`() {
+        // どの形も、引いたインスタンスの explicit な resource 500 件を、並び 3 個 × 100 回 export する
+        val r = 500
+        val expected = mapOf(
+            "instantiate" to 3L * 100 * r,
+            // import の型の中の `(export "x" (instance ..))` の宣言でも、1 回 r 件を写す
+            "alias" to r + 3L * 100 * r,
+            "imported" to 3L * 100 * r,
+            // 入れ子のコンポーネントの `(export "x" (instance $ii))` でも、1 回 r 件を写す
+            "instantiated-alias" to r + 3L * 100 * r,
+        )
+        for ((name, text) in explicitForms(r, n = 100, k = 3)) {
+            assertEquals(expected.getValue(name), estimateOf(wat(text)).explicitCost) { name }
+        }
+        // 小さな形は、wasm-tools の検証も通る（text が正しいことの確認）
+        for ((name, text) in explicitForms(r = 5, n = 3, k = 2)) {
+            try {
+                ComponentLoader.load(wat(text), policy = ComponentImportPolicy { null })
+            } catch (e: WasmLoadException) {
+                throw AssertionError("$name: ${e.message}", e)
+            }
+        }
+    }
+
+    @Test
+    fun `引けないインスタンスをexportする並びは、それまでの最大の件数で数える`() {
+        // `$o` の型の explicit は 5 件。存在しない export の alias で引いた `$m` は引けないので、5 件として数える（並びを複数にすると、前の並びの件数まで最大に入る）
+        val resExports = (0 until 5).joinToString(" ") { """(export "r$it" (type (sub resource)))""" }
+        val text = """
+            (component
+              (import "o" (instance ${'$'}o $resExports))
+              (alias export ${'$'}o "missing" (instance ${'$'}m))
+              ${exportBags(10, 1, "${'$'}m")}
+            )
+        """
+        assertEquals(10L * 5, estimateOf(wat(text)).explicitCost)
+    }
+
+    /**
+     * resource を [r] 個 export する（[d] 段の）インスタンス型の鎖 `$U0`（resource の型を alias で引いて `eq` で export する）…`$U(d-1)` を、
+     * resource を定義する型 `$T` が `eq` で export し、それを import する宣言を [k] 個並べる（#964）
+     */
+    private fun instanceChainComponent(r: Int, d: Int, k: Int): String {
+        val aliases = (0 until r).joinToString(" ") { "(alias outer 1 $it (type))" }
+        val exports = (0 until r).joinToString(" ") { """(export "e$it" (type (eq $it)))""" }
+        val chain = (1 until d).joinToString(" ") { j ->
+            "(type ${'$'}U$j (instance (alias outer 1 ${'$'}U${j - 1} (type ${'$'}x)) (export \"a\" (instance (type ${'$'}x)))))"
+        }
+        val top = "(type ${'$'}T (instance (alias outer 1 ${'$'}U${d - 1} (type ${'$'}u)) " +
+            "(export \"d\" (type (sub resource))) (export \"t\" (type (eq ${'$'}u)))))"
+        val imports = (0 until k).joinToString(" ") { """(import "x$it" (instance (type ${'$'}T)))""" }
+        return "(component ${(0 until r).joinToString(" ") { """(import "r$it" (type (sub resource)))""" }} " +
+            "(type ${'$'}U0 (instance $aliases $exports)) $chain $top $imports)"
+    }
+
+    /** [instanceChainComponent] の鎖と `$T` を前置きにして、その後ろに [body] を足したコンポーネント */
+    private fun withInstanceChain(r: Int, d: Int, body: String): String =
+        instanceChainComponent(r, d, k = 0).removeSuffix(")") + " $body)"
+
+    @Test
+    fun `resourceを定義する型の宣言は、たどれるインスタンス型のresourceの表の写しも数える`() {
+        // #964（レビュー）: wasmparser は import・export の宣言のたびに、たどれるインスタンス型を 1 つずつ、explicit な resource の表を
+        // 丸ごと写す（`remap_component_instance_type_id`）。export が 1 つで resource が 2,000 件のインスタンス型を 64 段つないだ型を
+        // 300 個 import する 70 KB で、見積もりは約 195 万のまま検証が CPU 14.7 秒かかった。表の写しは 64 × 2,000 件ずつ
+        val bomb = wat(instanceChainComponent(r = 1_000, d = 64, k = 40))
+        val e = estimateOf(bomb)
+        assertTrue(e.remapCost >= 40L * 64 * 1_000) { "${e.remapCost}" }
+        rejectedBeforeValidation(bomb)
+        // 小さな形は通る
+        val small = wat(instanceChainComponent(r = 20, d = 4, k = 3))
+        assertTrue(estimateOf(small).remapCost >= 3L * 4 * 20) { "${estimateOf(small).remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+        // resource を定義しない型の宣言は、写し直さないので数えない（鎖だけで 64 × 64 / 2 × 1,000 件にならない）
+        val noDefine = wat(instanceChainComponent(r = 1_000, d = 64, k = 0))
+        assertTrue(estimateOf(noDefine).remapCost < 64L * 64 / 2 * 1_000 / 4) { "${estimateOf(noDefine).remapCost}" }
+    }
+
+    /**
+     * resource を定義しない、鎖の `$U(d-1)` のインスタンスを import するだけのコンポーネント型 `$CT` を付けて、import した `$c` を
+     * [k] 回 export する（#964 のレビュー）
+     */
+    private fun typedComponentExports(r: Int, d: Int, k: Int): String = withInstanceChain(
+        r,
+        d,
+        "(type ${'$'}CT (component (alias outer 1 ${'$'}U${d - 1} (type ${'$'}u)) (import \"u\" (instance (type ${'$'}u))))) " +
+            "(import \"c\" (component ${'$'}c (type ${'$'}CT))) " +
+            (0 until k).joinToString(" ") { "(export \"e$it\" (component ${'$'}c) (component (type ${'$'}CT)))" },
+    )
+
+    @Test
+    fun `型を付けたコンポーネントのexportは、確かめるたびにインスタンス型のresourceの表の写しを数える`() {
+        // #964 のレビュー: wasmparser のコンポーネントの部分型の確認（`SubtypeCx::component_type` → `open_instance_type`）は、
+        // 確かめるたびに import・export のインスタンス型を `remap_component_instance_type_id` で表ごと写し直す。resource を定義しない
+        // コンポーネント型（explicit が多いインスタンス型の鎖を import するだけ）を付けた export は、前は 1 回あたり見積もり約 8,500 のまま
+        // 検証が約 64 ms かかった（r = 2,000・d = 64）。K = 295 個（30 KB）で見積もりは上限未満のまま、検証が CPU 10 秒を超えた
+        val r = 1_000
+        val d = 64
+        val base = estimateOf(wat(typedComponentExports(r, d, k = 0)))
+        val one = estimateOf(wat(typedComponentExports(r, d, k = 1)))
+        // 渡す側と付けた型の両方で、鎖の d × r 件ずつ
+        assertTrue(one.remapCost - base.remapCost >= 2L * d * r) { "${one.remapCost - base.remapCost}" }
+        rejectedBeforeValidation(wat(typedComponentExports(r, d, k = 20)))
+        // 小さな形は通る（text が正しいことの確認）
+        val small = wat(typedComponentExports(r = 20, d = 4, k = 3))
+        assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+    }
+
+    @Test
+    fun `インスタンス化の写し直しは、たどれるインスタンス型のresourceの表の写しも数える`() {
+        // #964 のレビュー: インスタンス化の `remap_component_entity` も、コンポーネントの import のインスタンス型を表ごと写す。
+        // 入れ子の $c は鎖の型 $T のインスタンスを import する。インスタンス化 1 回ごとに、写し直しに鎖の d × r 件が入る
+        val r = 100
+        val d = 32
+        fun instantiations(m: Int) = withInstanceChain(
+            r,
+            d,
+            "(import \"a\" (instance ${'$'}a (type ${'$'}T))) " +
+                "(component ${'$'}c (alias outer 1 ${'$'}T (type ${'$'}t)) (import \"x\" (instance (type ${'$'}t)))) " +
+                (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}c (with \"x\" (instance ${'$'}a))))" },
+        )
+        val one = estimateOf(wat(instantiations(1)))
+        val two = estimateOf(wat(instantiations(2)))
+        val perInstantiation = two.remapCost - one.remapCost
+        assertTrue(perInstantiation >= d.toLong() * r) { "$perInstantiation" }
+        // 写し直しの大きさ（違う宣言の大きさ）は、鎖の件数よりずっと小さい（表の件数が 2 回分入っていない）
+        assertTrue(perInstantiation < 2L * d * r) { "$perInstantiation" }
+    }
+
+    @Test
+    fun `入れ子のインスタンスをexportすると、resourceのパスの長さの分だけ型のたどりが増える`() {
+        // #964: インスタンスを export するたびに、explicit な resource を 1 件ずつ、パスを 1 つ長くして写す。パスの要素の写しは
+        // 型のたどり（16 ノードで 1）に数える。$i のパスの長さは 1、$i を並びで包んだ $l1 は 2、$l1 を包んだ $l2 は 3
+        val r = 16
+        val n = 100
+        val chain = "(instance ${'$'}l1 (export \"a\" (instance ${'$'}i))) (instance ${'$'}l2 (export \"b\" (instance ${'$'}l1)))"
+        val flat = estimateOf(wat("(component ${resourceInstance(r)} $chain ${exportBags(n, 1)})"))
+        val deep = estimateOf(wat("(component ${resourceInstance(r)} $chain ${exportBags(n, 1, "${'$'}l2")})"))
+        assertEquals(flat.explicitCost, deep.explicitCost)
+        // 差は n × r × (3 - 1) ノード
+        nearly(n.toLong() * r * 2 / 16, deep.scanCost - flat.scanCost)
+        // インスタンス化でできたインスタンスも、コンポーネントの export のパスの長さを引き継ぐ。入れ子の $c が、resource の型を
+        // 直に export する（長さ 1）か、並びで包んで export する（長さ 2。その export で r 件・長さ 1 を 1 回写す）か
+        val types = (0 until r).joinToString(" ") { "(type ${'$'}t$it (resource (rep i32)))" }
+        val bag = (0 until r).joinToString(" ") { "(export \"r$it\" (type ${'$'}t$it))" }
+        fun instantiated(c: String) =
+            estimateOf(wat("(component $c (instance ${'$'}x (instantiate ${'$'}c)) ${exportBags(n, 1, "${'$'}x")})"))
+        val direct = instantiated("(component ${'$'}c $types $bag)")
+        val wrapped = instantiated("(component ${'$'}c $types (instance ${'$'}l $bag) (export \"x\" (instance ${'$'}l)))")
+        assertEquals(direct.explicitCost + r, wrapped.explicitCost)
+        nearly((n.toLong() + 1) * r / 16, wrapped.scanCost - direct.scanCost)
+    }
+
     @Test
     fun `ツールチェーンが作るコンポーネントの見積もりは上限に十分収まる`() {
         // WASI の filesystem に近い規模のインターフェース（record・variant・enum・flags・resource と関数 40 個）を
