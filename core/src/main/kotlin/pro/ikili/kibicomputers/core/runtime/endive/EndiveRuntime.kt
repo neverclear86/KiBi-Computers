@@ -624,6 +624,7 @@ public class EndiveRuntime internal constructor(
          *
          * 式の先頭の `ref.func` の範囲（flag 1・3 の番号の並びを含む）は、Endive の検証（`Validator` のコンストラクターの `declaredFunctions`）が
          * もう断るので、ここに届くのは先頭でない `ref.func` だけ。
+         * 型が合うかは [valTypeMatches]（Endive の `ValType.matches` に、`none` を eq・struct・array・i31 の部分型として扱わない穴を足したもの）で決める。
          * 判定は読み込みのときに 1 回だけで、式の長さの和に比例する（関数の型とグローバルの一覧は 1 回だけ作る）。
          * Endive が直ったら、この判定を外す
          */
@@ -707,7 +708,7 @@ public class EndiveRuntime internal constructor(
             fun pop(op: OpCode, want: ValType): ValType {
                 if (stack.isEmpty()) fail("スタックの値が足りない")
                 val actual = stack.removeAt(stack.size - 1)
-                if (!ValType.matches(actual, want, types)) fail("命令 $op が取る値の型（$actual）が期待する型（$want）に合わない")
+                if (!valTypeMatches(actual, want, types)) fail("命令 $op が取る値の型（$actual）が期待する型（$want）に合わない")
                 return actual
             }
             // struct のフィールド・array の要素の型を、スタックの値の型にしたもの（i8・i16 は i32）
@@ -810,11 +811,36 @@ public class EndiveRuntime internal constructor(
                 }
                 if (stack.size != 1) fail("定数式の値が ${stack.size} 個（1 個でない）")
                 val actual = stack[0]
-                if (!ValType.matches(actual, expected, types)) fail("値の型（$actual）が$what（$expected）に合わない")
+                if (!valTypeMatches(actual, expected, types)) fail("値の型（$actual）が$what（$expected）に合わない")
             } catch (e: ConstExprProblem) {
                 return e.message
             }
             return null
+        }
+
+        /**
+         * [actual] が [want] の部分型か（[constExprProblem] が使う）。Endive 1.2.0 の `ValType.matches` に、null の底の型 `none` の穴を足したもの。
+         *
+         * Endive の `heapTypeSubtype` は、`none` を any と番号の struct・array の型の部分型としか扱わず、eq・struct・array・i31 の部分型として扱わない
+         * （仕様では `none` は any の階層の全部の型の部分型）。そのままでは、`(struct.new $X (ref.null none))`（`$X` のフィールドが eqref など）のような
+         * 正しい WASM を断ってしまう（`ref.null none` は Binaryen が any の階層の null に出す標準の形）。`nofunc`・`noextern`・`noexn` は Endive が
+         * 正しく扱うので、そのまま任せる。null を持てるかは、`ValType.matches` と同じく、[actual] が null を持てるなら [want] も持てるときだけ通す。
+         * Endive が直ったら、`ValType.matches` に戻す（#1013）
+         */
+        internal fun valTypeMatches(actual: ValType, want: ValType, types: TypeSection): Boolean {
+            if (actual.isReference && want.isReference && actual.typeIdx() == ValType.TypeIdxCode.NONE.code()) {
+                if (actual.isNullable && !want.isNullable) return false
+                val heap = want.typeIdx()
+                return when (heap) {
+                    ValType.TypeIdxCode.NONE.code(), ValType.TypeIdxCode.ANY.code(), ValType.TypeIdxCode.EQ.code(),
+                    ValType.TypeIdxCode.I31.code(), ValType.TypeIdxCode.STRUCT.code(), ValType.TypeIdxCode.ARRAY.code(),
+                    -> true
+                    else -> heap >= 0 && heap < types.subTypeCount() && types.getSubType(heap).compType().let {
+                        it.structType() != null || it.arrayType() != null
+                    }
+                }
+            }
+            return ValType.matches(actual, want, types)
         }
 
         /** 値をスタックから取って、GC のオブジェクト（struct・array）の中に入れる命令（`*.new_default`・`array.new_elem`・`array.new_data` は値を取らない） */

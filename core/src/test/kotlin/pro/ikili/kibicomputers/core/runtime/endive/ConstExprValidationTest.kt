@@ -36,8 +36,13 @@ class ConstExprValidationTest {
 
     private fun module(body: String) = WitTool.wat("(module $head $body)")
 
-    /** 読み込みのすべての経路（計測あり・待機点への変換ありを含む）で、正しくない WASM として、[where] の場所を付けて断る */
-    private fun assertRejectedEverywhere(name: String, bytes: ByteArray, where: String) {
+    /**
+     * 読み込みのすべての経路（計測あり・待機点への変換ありを含む）で、正しくない WASM として、[where] の場所を付けて断る。
+     * [meteredRejectedBefore] は、計測ありの経路で、この判定より先に挿入が断るときの文面の一部（初期値の式を持つ表・グローバルの import。
+     * `FuelInjector` が対応していない）。
+     * そのときは、計測ありの経路でこの判定が効くことは確かめられないので、先に断る文面であることだけを確かめる
+     */
+    private fun assertRejectedEverywhere(name: String, bytes: ByteArray, where: String, meteredRejectedBefore: String? = null) {
         assertTrue(WitTool.validate(bytes) != null, "テストの入力が正しくない WASM になっている（$name）")
         // Endive の検証は通す（Endive の穴。直ったらここが落ちるので、判定を外す）
         val parsed = Parser.parse(bytes)
@@ -56,6 +61,14 @@ class ConstExprValidationTest {
             for (waits in listOf(emptySet(), setOf("w.wait"))) {
                 val e = assertThrows<WasmLoadException>("$name: loadMetered $waits") { Program.loadMetered(runtime, bytes, null, waits) }
                 assertNull(Program.unsuspendableReason(e), "$name: loadMetered $waits: ${e.message}")
+                // 挿入・変換を通ってから、最後の読み込みでこの判定が断る（挿入で番号が変わりうるので、理由までは比べない）
+                val message = e.message!!
+                val ok = if (meteredRejectedBefore == null) {
+                    message.startsWith("WASM の検証に通らない: $where")
+                } else {
+                    message.contains(meteredRejectedBefore)
+                }
+                assertTrue(ok, "$name: loadMetered $waits: $message")
             }
         }
     }
@@ -90,11 +103,13 @@ class ConstExprValidationTest {
             "struct.new の型違い",
             module("(table 1 (ref null \$SF) (struct.new \$SF (i32.const -5)))"),
             "表 2 の初期値: ",
+            TABLE_INIT_UNSUPPORTED,
         )
         assertRejectedEverywhere(
             "ref.i31 の型違い",
             module("(table 1 i31ref (ref.i31 (i64.const 0)))"),
             "表 2 の初期値: ",
+            TABLE_INIT_UNSUPPORTED,
         )
     }
 
@@ -103,7 +118,7 @@ class ConstExprValidationTest {
         // 仕様（と wasm-tools）では、表の初期値から見えるのは import したグローバルだけ。Endive の検証は全グローバルで通すが、
         // インスタンスを作るときに表の初期値をグローバルの初期化より前に評価するので、読み込みで断る
         val bytes = module("(global \$gd funcref (ref.func \$f)) (table 1 funcref (global.get \$gd))")
-        assertRejectedEverywhere("定義したグローバル", bytes, "表 2 の初期値: ")
+        assertRejectedEverywhere("定義したグローバル", bytes, "表 2 の初期値: ", TABLE_INIT_UNSUPPORTED)
         assertEquals(
             "WASM の検証に通らない: 表 2 の初期値: global.get が読むグローバル 0（import を数えた番号）はここでは読めない（import したものだけ）",
             assertThrows<WasmLoadException> { EndiveRuntime().load(bytes) }.message,
@@ -123,7 +138,7 @@ class ConstExprValidationTest {
               (table 1 funcref (global.get ${'$'}gd)))
             """,
         )
-        assertRejectedEverywhere("import のあるモジュール", bytes, "表 0 の初期値: ")
+        assertRejectedEverywhere("import のあるモジュール", bytes, "表 0 の初期値: ", GLOBAL_IMPORT_UNSUPPORTED)
         assertEquals(
             "WASM の検証に通らない: 表 0 の初期値: global.get が読むグローバル 2（import を数えた番号）はここでは読めない（import したものだけ）",
             assertThrows<WasmLoadException> { EndiveRuntime().load(bytes) }.message,
@@ -283,5 +298,110 @@ class ConstExprValidationTest {
         assertNull(EndiveRuntime.invalidConstExpr(Parser.parse(bytes)))
         EndiveRuntime(false).load(bytes)
         EndiveRuntime().load(bytes)
+    }
+
+    /** null の底の型（`none`・`nofunc`・`noextern`・`noexn`）を取る値にする式のための型（[head] の型の前に置く） */
+    private val bottomTypes = """
+        (type ${'$'}S0 (struct (field i32)))
+        (type ${'$'}t0 (func (result i32)))
+        (type ${'$'}E (struct (field eqref) (field i32)))
+        (type ${'$'}SR (struct (field structref)))
+        (type ${'$'}AR (struct (field arrayref)))
+        (type ${'$'}IR (struct (field i31ref)))
+        (type ${'$'}AN (struct (field anyref)))
+        (type ${'$'}CS (struct (field (ref null ${'$'}S0))))
+        (type ${'$'}AE (array eqref))
+        (type ${'$'}AS (array structref))
+        (type ${'$'}AA (array arrayref))
+        (type ${'$'}AI (array i31ref))
+        (type ${'$'}CF (struct (field (ref null ${'$'}t0))))
+        (type ${'$'}FR (struct (field funcref)))
+        (type ${'$'}XR (struct (field externref)))
+        (type ${'$'}NR (struct (field exnref)))
+        (type ${'$'}NE (struct (field (ref eq))))
+    """
+
+    private fun bottomModule(body: String) = WitTool.wat("(module $bottomTypes $head $body)")
+
+    @Test
+    fun `null の底の型を取る値にする正しい式は断らない`() {
+        // Endive 1.2.0 の ValType.matches は none を eq・struct・array・i31 の部分型として扱わない（#942 のレビュー）。
+        // ref.null none は Binaryen が any の階層の null に出す標準の形なので、正しい WASM を断らないことを確かめる
+        val bytes = bottomModule(
+            """
+            (global ${'$'}ge (ref ${'$'}E) (struct.new ${'$'}E (ref.null none) (i32.const 42)))
+            (global (ref ${'$'}SR) (struct.new ${'$'}SR (ref.null none)))
+            (global (ref ${'$'}AR) (struct.new ${'$'}AR (ref.null none)))
+            (global (ref ${'$'}IR) (struct.new ${'$'}IR (ref.null none)))
+            (global (ref ${'$'}AN) (struct.new ${'$'}AN (ref.null none)))
+            (global (ref ${'$'}CS) (struct.new ${'$'}CS (ref.null none)))
+            (global ${'$'}ga (ref ${'$'}AE) (array.new ${'$'}AE (ref.null none) (i32.const 2)))
+            (global (ref ${'$'}AS) (array.new_fixed ${'$'}AS 1 (ref.null none)))
+            (global (ref ${'$'}AA) (array.new_fixed ${'$'}AA 1 (ref.null none)))
+            (global (ref ${'$'}AI) (array.new_fixed ${'$'}AI 2 (ref.null none) (ref.i31 (i32.const 1))))
+            (global (ref ${'$'}CF) (struct.new ${'$'}CF (ref.null nofunc)))
+            (global (ref ${'$'}FR) (struct.new ${'$'}FR (ref.null nofunc)))
+            (global (ref ${'$'}XR) (struct.new ${'$'}XR (ref.null noextern)))
+            (global (ref ${'$'}NR) (struct.new ${'$'}NR (ref.null noexn)))
+            (table ${'$'}te 1 (ref null ${'$'}AE))
+            (elem (table ${'$'}te) (i32.const 0) (ref null ${'$'}AE) (array.new_fixed ${'$'}AE 1 (ref.null none)))
+            (elem eqref (ref.null none) (ref.i31 (i32.const 3)))
+            (elem structref (ref.null none))
+            (elem arrayref (ref.null none))
+            (elem i31ref (ref.null none))
+            (elem (ref null ${'$'}E) (struct.new ${'$'}E (ref.null none) (i32.const 1)))
+            (func (export "v") (result i32) (struct.get ${'$'}E 1 (global.get ${'$'}ge)))
+            (func (export "f0") (result i32) (ref.is_null (struct.get ${'$'}E 0 (global.get ${'$'}ge))))
+            (func (export "alen") (result i32) (array.len (global.get ${'$'}ga)))
+            (func (export "te") (result i32)
+              (ref.is_null (array.get ${'$'}AE (ref.as_non_null (table.get ${'$'}te (i32.const 0))) (i32.const 0))))
+            """,
+        )
+        assertEquals(null, WitTool.validate(bytes))
+        assertNull(EndiveRuntime.invalidConstExpr(Parser.parse(bytes)))
+        for (runtime in listOf(EndiveRuntime(false), EndiveRuntime())) {
+            runtime.load(bytes).instantiate(WasmInstanceConfig.builder().build()).use { inst ->
+                assertEquals(42L, inst.call("v").single())
+                assertEquals(1L, inst.call("f0").single())
+                assertEquals(2L, inst.call("alen").single())
+                assertEquals(1L, inst.call("te").single())
+            }
+            Program.loadMetered(runtime, bytes, null, emptySet())
+            Program.loadMetered(runtime, bytes, null, setOf("w.wait"))
+        }
+        // 表の初期値（計測ありの経路は、初期値の式を持つ表にまだ対応していないので、計測なしだけ）
+        val table = bottomModule("(table 1 (ref null ${'$'}E) (struct.new ${'$'}E (ref.null none) (i32.const 7)))")
+        assertEquals(null, WitTool.validate(table))
+        assertNull(EndiveRuntime.invalidConstExpr(Parser.parse(table)))
+        EndiveRuntime(false).load(table)
+        EndiveRuntime().load(table)
+    }
+
+    @Test
+    fun `null の底の型でも階層か null の可否が違えば断る`() {
+        val globals = listOf(
+            // none は func の階層にない
+            "(global (ref \$FR) (struct.new \$FR (ref.null none)))",
+            // nofunc は any の階層にない
+            "(global (ref \$E) (struct.new \$E (ref.null nofunc) (i32.const 0)))",
+            // noextern は any の階層にない
+            "(global (ref \$AN) (struct.new \$AN (ref.null noextern)))",
+            // null を持てないフィールドに null
+            "(global (ref \$NE) (struct.new \$NE (ref.null none)))",
+        )
+        for (g in globals) assertRejectedEverywhere(g, bottomModule(g), "グローバル 0 の初期値: ")
+        assertRejectedEverywhere(
+            "パッシブの要素の階層違い",
+            bottomModule("(elem funcref (ref.null none))"),
+            "要素セグメント 0（パッシブ）の項目 0: ",
+        )
+    }
+
+    private companion object {
+        /** 計測ありの経路で、初期値の式を持つ表を `FuelInjector` が先に断る文面の一部 */
+        const val TABLE_INIT_UNSUPPORTED = "初期値の式を持つテーブルには対応していない"
+
+        /** 計測ありの経路で、グローバルを import するモジュールを `FuelInjector` が先に断る文面の一部 */
+        const val GLOBAL_IMPORT_UNSUPPORTED = "グローバルの import には対応していない"
     }
 }
