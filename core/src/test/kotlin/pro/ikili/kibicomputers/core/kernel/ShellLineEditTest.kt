@@ -117,7 +117,8 @@ class ShellLineEditTest {
      * 打ち終えたら、[exit] なら終わるまで、そうでなければ [settled] が真になるまで待つ。
      * [steps] は [charset] でバイトにする（ISO-8859-1 なら、不正な UTF-8 のバイトをそのまま打てる）。
      * [splittable] なら貼り付けと同じく分けて入れてよい入力として渡す（raw の TTY の 4 KiB を超える行を打つため。#609）。
-     * どちらでも、TTY が 1 バイトも捨てずに受け付けたことを確かめる
+     * どちらでも、TTY が 1 バイトも捨てずに受け付けたことを確かめる。
+     * カーネルの TTY の幅は、はじめは [consoleColumns]（画面の幅とは別にできる）で、[beforeStep] が i 番目の step を打つ直前に呼ばれる
      */
     private fun session(
         steps: List<String>,
@@ -125,6 +126,8 @@ class ShellLineEditTest {
         env: Map<String, String> = emptyMap(),
         columns: Int = 80,
         rows: Int = 25,
+        consoleColumns: Int = columns,
+        beforeStep: (Int, Machine) -> Unit = { _, _ -> },
         exit: Boolean = true,
         read: List<String> = emptyList(),
         charset: Charset = Charsets.UTF_8,
@@ -134,7 +137,7 @@ class ShellLineEditTest {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ScreenHost(columns, rows)
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
-            if (columns != 80 || rows != 25) m.resizeConsole(columns, rows)
+            if (consoleColumns != 80 || rows != 25) m.resizeConsole(consoleColumns, rows)
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             for (d in listOf("/bin", "/tmp", "/home")) m.vfs.createDirectory(VfsPath.parse(d))
             for (name in listOf("sh", "echo", "true", "false")) m.put("/bin/$name", imageFile("/bin/$name"))
@@ -155,6 +158,7 @@ class ShellLineEditTest {
                 if (next < steps.size && end > seen && m.stateOf(pid) == ProcessState.WAITING_EVENT) {
                     seen = end
                     promptFuel += h.scheduler.fuelConsumedTotal
+                    beforeStep(next, m)
                     val bytes = steps[next++].toByteArray(charset)
                     assertEquals(bytes.size, m.offerConsoleInput(bytes, splittable = splittable), "TTY が入力を捨てた")
                 }
@@ -693,6 +697,56 @@ class ShellLineEditTest {
         assertEquals(listOf("$ echo 01234567890あ", "い", "01234567890あい"), rows.subList(i + 3, i + 6), shown)
         assertEquals(listOf("$ echo 012345678901", "あ", "012345678901あ"), rows.subList(i + 6, i + 9), shown)
         assertTrue(rows[i + 9].startsWith("$ exit"), shown)
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `行をまたぐ末尾のBackspaceの後に描き直しても、画面が崩れない`() {
+        // 描き直さない Backspace が、カーソルの行（描き直すときにプロンプトの頭へ戻る数）を正しく保つか（#993）。
+        // Backspace の後に ← と途中への挿入で描き直す。カーソルの行がずれていると、プロンプトの頭でない行から描き直して画面が崩れる
+        val s = session(
+            listOf(
+                // 3 行から 1 行目の右端の手前まで戻る（画面の行の頭の文字・保留の文字・同じ行の文字を消す）
+                "echo 0123456789abcdefghijklmnopqrstuvwxyz" + "\u007f".repeat(24) + left + "Z\r",
+                // 1 行目の右端の保留（カーソルは 2 行目の頭）で止める
+                "echo 0123456789abcdefghijklmnopqrstuvwxyz" + "\u007f".repeat(23) + left + "Z\r",
+                "exit\r",
+            ),
+            columns = 20,
+            rows = 25,
+        )
+        val rows = s.host.rows()
+        val shown = rows.joinToString("\n")
+        val i = rows.indexOf("$ echo 0123456789aZb")
+        assertTrue(i >= 0, shown)
+        assertEquals(
+            listOf("0123456789aZb", "$ echo 0123456789abZ", "c", "0123456789abZc"),
+            rows.subList(i + 1, i + 5),
+            shown,
+        )
+        assertTrue(rows[i + 5].startsWith("$ exit"), shown)
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `プロンプトを出した後に画面の幅が変わっても、末尾に足す文字とBackspaceは新しい幅で書く`() {
+        // プロンプトは幅 80 で描き、打つ前に幅を 20 にする。描き直さない末尾への追加と Backspace も、書く前に幅を読み直す（#993）
+        val s = session(
+            listOf(
+                "echo 0123456789abcdefghijklmnopqrstuvwxyz" + "\u007f".repeat(24) + "XY\r",
+                "exit\r",
+            ),
+            columns = 20,
+            rows = 25,
+            consoleColumns = 80,
+            beforeStep = { i, m -> if (i == 0) m.resizeConsole(20, 25) },
+        )
+        val rows = s.host.rows()
+        val shown = rows.joinToString("\n")
+        val i = rows.indexOf("$ echo 0123456789abX")
+        assertTrue(i >= 0, shown)
+        assertEquals(listOf("Y", "0123456789abXY"), rows.subList(i + 1, i + 3), shown)
+        assertTrue(rows[i + 3].startsWith("$ exit"), shown)
         assertEquals(0, s.exitCode)
     }
 

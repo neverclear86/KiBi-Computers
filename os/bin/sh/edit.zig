@@ -306,6 +306,15 @@ fn updateSize() void {
     } else |_| cols = 80;
 }
 
+/// 画面の幅を読み直し、前に読んだとき（前に描き直したとき）から変わったら true。
+/// 描き直さずに書く処理（[typed] の末尾への追加・[backspaceAtEnd]）は、前に描いた幅のままの位置で書くので、
+/// 幅が変わったら描き直しに回す（#993。前は折り返しと Backspace が毎回描き直し、そこで幅を読み直していた）
+fn sizeChanged() bool {
+    const old = cols;
+    updateSize();
+    return cols != old;
+}
+
 /// 行の全体を描き直す
 fn refresh() void {
     updateSize();
@@ -478,9 +487,10 @@ fn setLineFrom(index: usize, total: usize) bool {
 }
 
 /// 普通の文字を入れたときの表示。行の末尾に足して、カーソルのある画面の行に収まるなら、その文字だけ書く。
-/// 右端でちょうど折り返しの保留になったら、[refresh] と同じく改行を書いて次の行の頭に出ておく（#993）
+/// 右端でちょうど折り返しの保留になったら、[refresh] と同じく改行を書いて次の行の頭に出ておく（#993）。
+/// 画面の幅が前に描いたときから変わっていれば、描き直す
 fn typed(s: []const u8) void {
-    if (pos == len) {
+    if (pos == len and !sizeChanged()) {
         var p: Pos = .{};
         if (tail_len == len - s.len and tail_cols == cols) {
             // 足す前の末尾の位置を覚えている（#993）
@@ -525,6 +535,8 @@ fn isPrintableAscii(c: u8) bool {
 fn backspaceAtEnd() bool {
     if (pos != len or len == 0 or tail_len != len or tail_cols != cols or cols < 2) return false;
     if (!isPrintableAscii(line[len - 1])) return false;
+    // 幅が変わったら描き直す（呼び出し元が消して描き直す）
+    if (sizeChanged()) return false;
     const p = tail_pos;
     var q: Pos = undefined;
     if (p.pending) {
