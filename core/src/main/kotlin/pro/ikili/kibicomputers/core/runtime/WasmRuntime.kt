@@ -346,6 +346,12 @@ internal interface WasmTableBudget {
 
     /** [tryReserveBytes] で確保した分のうち [bytes] バイト（1 以上）を返す */
     fun releaseBytes(bytes: Long)
+
+    /**
+     * [tryReserveBytes] と同じだが、断っても断った記録（メモリ不足の表示に使うもの）を残さない（#939。GC のオブジェクトの前借り）。
+     * 前借りを断られても、要る分だけなら数えられることがあるため。既定は [tryReserveBytes]
+     */
+    fun tryPrefetchBytes(bytes: Long): Boolean = tryReserveBytes(bytes)
 }
 
 /**
@@ -401,6 +407,13 @@ public object WasmFuel {
 
     /** 燃料の残りを入れる、可変の i64 のグローバルの export 名 */
     public const val EXPORT_GLOBAL: String = "kibi_fuel"
+
+    /**
+     * GC のオブジェクト（struct・array）を作る前に、そのバイト数を RAM に数える import の名前（#939）。モジュール名は [IMPORT_MODULE]、型は
+     * [IMPORT_TYPE]（引数はバイト数、戻り値は使わない）。オブジェクトを作る命令を持つモジュールにだけ足す。数えられなければ
+     * [WasmTrapKind.OUT_OF_MEMORY] のトラップでプロセスを止める
+     */
+    public const val GC_ALLOC_NAME: String = "gc_alloc"
 
     /** 燃料切れを知らせる import の型 */
     @JvmField

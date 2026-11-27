@@ -180,15 +180,20 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
     override fun tryReserveBytes(bytes: Long): Boolean = tryReserveBytes(bytes, 0)
 
     /** プロセスとマシンのそれぞれで、数えた後の残りが [keepBytes] 以上になるときだけ数える（#408。サーバー全体には [keepBytes] をかけない） */
-    override fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
+    override fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean = reserveBytes(bytes, keepBytes, record = true)
+
+    /** 断っても [lastRefusal]・[refusalCount] を変えない（#939。GC のオブジェクトの前借り） */
+    override fun tryPrefetchBytes(bytes: Long): Boolean = reserveBytes(bytes, 0, record = false)
+
+    private fun reserveBytes(bytes: Long, keepBytes: Long, record: Boolean): Boolean {
         require(bytes > 0) { "バイト数は正: $bytes" }
         // 段の途中で尽きないよう、何も数えないうちに確かめる（#856。足りなければ何も触らずに StackOverflowError）
         StackHeadroom.ensure(StackHeadroom.MEMORY_ACCOUNT_FRAMES)
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return refused(MemoryRefusal.PROCESS)
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return record && refused(MemoryRefusal.PROCESS)
         val refusal = machine.reserveBytes(bytes, keepBytes)
         if (refusal != null) {
             usedBytesCounter.addAndGet(-bytes)
-            return refused(refusal)
+            return record && refused(refusal)
         }
         return true
     }
