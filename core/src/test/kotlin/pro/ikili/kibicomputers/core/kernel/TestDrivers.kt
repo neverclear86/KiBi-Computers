@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.FakeWasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
@@ -27,7 +28,10 @@ import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.runtime.validation.ValidationWatchdog
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.withLock
 
@@ -140,6 +144,8 @@ internal class Harness(
      * 実際の時間の予算が効いて通知が次の tick に回り、テストが不安定にならないように）。予算を確かめるテストは手で進める時計を渡す
      */
     nanoTime: () -> Long = { 0L },
+    /** [close] が、スケジューラの終わりを 1 回目に待つ長さ（過ぎたら残った `KiBi-` スレッドに割り込んでもう 1 回待つ。#916） */
+    private val firstCloseWaitMillis: Long = 10_000,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
@@ -147,6 +153,16 @@ internal class Harness(
         SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore, rebootBackoff = rebootBackoff, nanoTime = nanoTime),
     )
     private var counter = 0
+    private val closeActions = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /**
+     * [close] の最初（スケジューラを止める前）に [action] を呼ぶ（#916）。期限なしの門（フックの中の `release.await()` など）で止めた
+     * スレッドを、テストが門を開ける前に落ちても放してから止めるために使う（放さないと、close がスレッドの終わりを待って落ち、
+     * 残ったスレッドが後に続くテストの [assertNoKernelThreads] も落とす）。通った回は門がもう開いているので、何もしない
+     */
+    fun releaseOnClose(action: () -> Unit) {
+        closeActions += action
+    }
 
     /** 通知の記録（tick() の中で配られたもの） */
     val events: MutableList<Pair<Long, MachineState>> = java.util.Collections.synchronizedList(ArrayList())
@@ -187,10 +203,62 @@ internal class Harness(
 
     fun module(program: Program): WasmModule = program.module
 
+    /**
+     * このスケジューラの起動用（`KiBi-boot-*`）・ワーカー（`KiBi-worker-*`）のプールが作ったスレッド（#916）。
+     * プールの [java.util.concurrent.ThreadFactory] を包んで記録する（プールは作ったスレッドを外に見せないため）。
+     * 名前の連番はスケジューラごとなので、名前では選ばない
+     */
+    private val poolThreads: MutableSet<Thread> = java.util.Collections.newSetFromMap(ConcurrentHashMap())
+
+    /** ワーカーのプールの executor（差し替えたときはそれ）。本番の [pro.ikili.kibicomputers.core.kernel.sched.WorkerPool] にテスト用の口を足さないように、反射で読む */
+    private val workerExecutor: ExecutorService = workerPoolField("executor") as ExecutorService
+
+    init {
+        // 起動用・ワーカーのスレッドは、使われたときに初めてできる（プールはコア 0 か、コアのスレッドを先に作らない）ので、ここで包めば取り逃さない
+        val workerPool = workerPoolField("pool") as java.util.concurrent.ThreadPoolExecutor?
+        for (pool in listOfNotNull(scheduler.bootExecutor, workerPool)) {
+            val inner = pool.threadFactory
+            pool.threadFactory = java.util.concurrent.ThreadFactory { r -> inner.newThread(r)?.also { poolThreads += it } }
+        }
+    }
+
+    private fun workerPoolField(name: String): Any? =
+        scheduler.workers.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(scheduler.workers)
+
+    /** このスケジューラのスレッド（マシンのプロセスの専用スレッド、ディスパッチャー、起動用・ワーカーのプールのスレッド）のうち、まだ生きているもの */
+    private fun ownKernelThreads(): List<Thread> =
+        (ArrayList(scheduler.dedicatedThreads) + scheduler.dispatcher.thread + poolThreads).distinct().filter { it.isAlive }
+
+    /** [own] と、このスケジューラの起動用・ワーカーのプールのスレッド（`shutdownNow` が割り込む）に割り込む。ほかのスケジューラ・テストのスレッドには触れない */
+    private fun interruptOwnThreads(own: List<Thread>) {
+        own.forEach { it.interrupt() }
+        scheduler.bootExecutor.shutdownNow()
+        workerExecutor.shutdownNow()
+    }
+
     override fun close() {
-        scheduler.close()
-        assertTrue(scheduler.awaitTermination(10_000), "スケジューラが終わらない")
-        assertNoKernelThreads()
+        // 保険のタイムアウトで割り込まれた後（failOnInterrupt がフラグを立て直している）でも後始末の待ちが動くように、フラグを下ろしてから
+        // 待ち、最後に戻す（#916。立ったままだと最初の待ちがその場で InterruptedException を投げ、何も待たず、割り込みの後始末にも届かない）
+        withInterruptCleared {
+            closeActions.forEach { it() }
+            scheduler.close()
+            // 期限なしの門（フックの中の `release.await()` など）で止まったスレッドが残っていたら、このスケジューラのスレッドだけに割り込んで放す
+            // （#916。テストが門を開ける前に落ちたときも、スレッドを JVM に残さない。残すと、後に続く Harness のテストがすべて
+            // assertNoKernelThreads で落ちる）。JVM の `KiBi-` スレッド全部には割り込まない: 保険のタイムアウトで捨てられた本体のこの close は、
+            // 次のテストと並行に走るので、名前だけで選ぶと次のテストのスレッドや、同じテストの別の Harness・MachineSaveStore のスレッドまで巻き込む。
+            // 放しても、スケジューラが 1 回目の待ちで終わらなかったことは失敗として残す
+            val ended = scheduler.awaitTermination(firstCloseWaitMillis)
+            var stuck = ""
+            if (!ended) {
+                val own = ownKernelThreads()
+                stuck = own.joinToString("\n") { "  ${it.name}\n" + it.stackTrace.take(12).joinToString("\n") { f -> "    at $f" } }
+                reportSlowWait("スケジューラが $firstCloseWaitMillis ms で終わらない。残ったスレッドに割り込む:\n$stuck")
+                interruptOwnThreads(own)
+                scheduler.awaitTermination(10_000)
+            }
+            assertTrue(ended, "スケジューラが終わらない。残ったスレッド:\n$stuck")
+            assertNoKernelThreads()
+        }
     }
 }
 
@@ -209,18 +277,145 @@ internal fun Machine.spawnRt(program: Program, driver: ProcessDriver, options: S
 
 internal fun Machine.stateOf(pid: Int): ProcessState = processState(pid)!!
 
-/** [condition] が true になるまで待つ（最大 [timeoutMillis]） */
+/**
+ * [condition] が true になるまで待つ。
+ *
+ * 期限は合否に使わない（#916）。実スレッドの完了を壁時計の短い期限で待つと、負荷の高い CI で正しく動いていても落ちるため。
+ * [timeoutMillis] は遅れを報告する閾値で、過ぎたら [message] を [SLOW_WAIT_MARKER] で始まる行として標準出力に出し（core の `test`
+ * タスクが Gradle のコンソールに写す）、そのまま待ち続ける。止まったときは、保険のタイムアウト（`:core:test` の既定のタイムアウトか、
+ * クラス・メソッドの `@Timeout`）がテストのスレッドに割り込み、[message] を付けて落ちる。
+ * 本体を `assertTimeoutPreemptively` で包んでいて、それが先に切れたときは、JUnit は「execution timed out」だけを報告し、この [message] の
+ * AssertionError は捨てられたスレッドに残る。そのため、割り込まれた時点で [message] を [SLOW_WAIT_MARKER] の行として標準出力にも出す
+ * （[failOnInterrupt]）。止まった原因は、レポートの失敗の本文でなく、コンソール・CI のログと system-out のこの行で追う
+ */
 internal fun eventually(timeoutMillis: Long = 5_000, message: String = "条件がそろわない", condition: () -> Boolean) =
     eventuallyDescribe(timeoutMillis, { message }, condition)
 
-/** [eventually] の、失敗したときの説明を後で作る形 */
+/** [eventually] の、遅れの報告と失敗の説明を後で作る形（期限は合否に使わない。#916） */
 internal fun eventuallyDescribe(timeoutMillis: Long = 5_000, describe: () -> String, condition: () -> Boolean) {
-    val deadline = System.currentTimeMillis() + timeoutMillis
+    val start = System.nanoTime()
+    var reported = false
     while (!condition()) {
-        if (System.currentTimeMillis() > deadline) fail(describe())
-        Thread.sleep(1)
+        if (!reported && System.nanoTime() - start > timeoutMillis * 1_000_000) {
+            reported = true
+            reportSlowWait("${(System.nanoTime() - start) / 1_000_000} ms を超えた: ${describe()}")
+        }
+        failOnInterrupt(describe) { Thread.sleep(1) }
     }
 }
+
+/** 待ちが遅れたことを報告する行の頭（#916）。core の `test` タスクが、この頭の行を Gradle のコンソール（CI のログ）に写す */
+internal const val SLOW_WAIT_MARKER = "#916 遅れ"
+
+/** [text] を、行ごとに [SLOW_WAIT_MARKER] を付けて標準出力に出す（Gradle は標準出力を行ごとに受け取り、頭の付いた行だけを写すため） */
+internal fun reportSlowWait(text: String) {
+    println(text.lines().joinToString("\n") { "$SLOW_WAIT_MARKER: $it" })
+}
+
+/**
+ * [block] が割り込まれたら、割り込みのフラグを立て直してから、[describe] の説明を付けて落とす（#916）。
+ *
+ * 期限なしの待ちを抜けるのは、保険のタイムアウトの割り込みだけ。フラグを立て直さないと、後始末（`finally` の `join()` など）が
+ * 2 回目の割り込みを待って止まり続ける（JUnit は 1 回しか割り込まない）
+ */
+internal inline fun <T> failOnInterrupt(describe: () -> String, block: () -> T): T =
+    try {
+        block()
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        val message = "待っている間に割り込まれた（止まったときの保険のタイムアウト。#916）: ${describe()}"
+        // 外側の assertTimeoutPreemptively が先に切れたときは、JUnit は「execution timed out」を報告し終えていて、この例外は捨てられた実行スレッドの
+        // Future に入ったまま誰にも読まれない。説明（何を待っていたか）が失敗の手がかりとして残るように、標準出力にも出す
+        // （core の `test` タスクがコンソールと CI のログに写す）
+        reportSlowWait("$message\n${e.stackTrace.take(12).joinToString("\n") { "    at $it" }}")
+        throw AssertionError(message, e)
+    }
+
+/**
+ * 割り込みのフラグを下ろして [block] を呼び、終わったら（[block] が落ちても）フラグを元に戻す（#916）。
+ *
+ * 保険のタイムアウトで割り込まれた後の後始末（[Harness.close] など）に使う。[failOnInterrupt] がフラグを立て直しているので、
+ * 下ろさないと後始末の待ちがその場で `InterruptedException` を投げ、何も待たない
+ */
+internal inline fun <T> withInterruptCleared(block: () -> T): T {
+    val interrupted = Thread.interrupted()
+    try {
+        return block()
+    } finally {
+        if (interrupted) Thread.currentThread().interrupt()
+    }
+}
+
+/**
+ * 割り込みのフラグが立ったまま呼ばれた待ち（保険のタイムアウトで落ちている途中の、`finally` の後始末）を、期限つきで済ませる（#916）。
+ *
+ * フラグが立っていれば、フラグを下ろして [timedWait]（待つ上限のミリ秒を受け取り、終わったら `true`）で最大 [graceMillis] 待ち、
+ * フラグを戻して `true` を返す。待ち切れなくても投げずに、[SLOW_WAIT_MARKER] の行で報告して返す（投げると、`finally` の外へ出ていく
+ * 元の失敗の説明を置き換えるため。テストは保険のタイムアウトで既に落ちている）。
+ * フラグが立っていなければ何もせず `false` を返す（呼び出し側が期限なしで待つ）
+ */
+internal fun cleanupWaitIfInterrupted(describe: () -> String, graceMillis: Long = CLEANUP_WAIT_MILLIS, timedWait: (Long) -> Boolean): Boolean {
+    if (!Thread.currentThread().isInterrupted) return false
+    withInterruptCleared {
+        val done = try {
+            timedWait(graceMillis)
+        } catch (e: InterruptedException) {
+            false
+        }
+        if (!done) reportSlowWait("割り込まれた後の後始末で、$graceMillis ms 待っても終わらない: ${describe()}")
+    }
+    return true
+}
+
+/** [cleanupWaitIfInterrupted] が待つ上限 */
+internal const val CLEANUP_WAIT_MILLIS = 10_000L
+
+/**
+ * `finally` の後始末の、期限つきの待ち（[timedWait] は待つ上限のミリ秒を受け取り、終わったら `true`）を、最大 [timeoutMillis] 待つ（#916）。
+ *
+ * 割り込みのフラグが立っていれば（保険のタイムアウトで落ちている途中。[failOnInterrupt] がフラグを立て直している）、
+ * [cleanupWaitIfInterrupted] でフラグを下ろして待ち、`true` を返す（待ち切れなくても投げず、元の失敗の説明を置き換えない。
+ * 立ったまま待つと、その場で `InterruptedException` を投げ、何も待たずに元の失敗を置き換える）。
+ * フラグがなければ、そのまま待って結果を返す
+ */
+internal fun awaitInCleanup(describe: () -> String, timeoutMillis: Long, timedWait: (Long) -> Boolean): Boolean =
+    cleanupWaitIfInterrupted(describe, timeoutMillis, timedWait) || timedWait(timeoutMillis)
+
+/** `finally` の後始末で [MachineManager.shutdown] する（#916。割り込まれた後の扱いは [awaitInCleanup]） */
+internal fun MachineManager<*>.shutdownInCleanup(timeoutMillis: Long = 10_000): Boolean =
+    awaitInCleanup({ "MachineManager が止まらない: $this" }, timeoutMillis) { shutdown(it) }
+
+/**
+ * 期限なしで [CountDownLatch.await] する（#916）。割り込まれたら [message] を付けて落ちる。
+ * 割り込みのフラグが立ったまま呼ばれたら（割り込まれた後の後始末）、[cleanupWaitIfInterrupted] で期限つきで待って返す
+ */
+internal fun CountDownLatch.awaitOrFail(message: String = "ラッチが開かない") {
+    val describe = { "$message（残り $count）" }
+    if (cleanupWaitIfInterrupted(describe) { await(it, TimeUnit.MILLISECONDS) }) return
+    failOnInterrupt(describe) { await() }
+}
+
+/**
+ * 期限なしで [Thread.join] する（#916）。割り込まれたら [message] と、相手のスレッドのスタックを付けて落ちる。
+ * 割り込みのフラグが立ったまま呼ばれたら（割り込まれた後の後始末）、[cleanupWaitIfInterrupted] で期限つきで待って返す
+ */
+internal fun Thread.joinOrFail(message: String = "スレッドが終わらない") {
+    val describe = { "$message: $name\n${stackTrace.joinToString("\n") { "    at $it" }}" }
+    if (cleanupWaitIfInterrupted(describe) { join(it); !isAlive }) return
+    failOnInterrupt(describe) { join() }
+}
+
+/**
+ * 期限なしで [ExecutorService.awaitTermination] する（#916。テストが作ったプールに使う）。割り込まれたら [message] を付けて落ちる。
+ * 割り込みのフラグが立ったまま呼ばれたら（割り込まれた後の後始末）、[cleanupWaitIfInterrupted] で期限つきで待って返す
+ */
+internal fun ExecutorService.awaitTerminationOrFail(message: String = "プールのスレッドが終わらない") {
+    if (cleanupWaitIfInterrupted({ message }) { awaitTermination(it, TimeUnit.MILLISECONDS) }) return
+    failOnInterrupt({ message }) { while (!awaitTermination(1, TimeUnit.DAYS)) Unit }
+}
+
+/** 期限なしで [Future.get] する（#916）。割り込まれたら [message] を付けて落ちる（値が要るので、後始末の期限つきの待ちはしない） */
+internal fun <T> Future<T>.getOrFail(message: String = "結果が届かない"): T = failOnInterrupt({ message }) { get() }
 
 /**
  * init が CPU を取って動き出し、専用スレッドの登録を済ませた（`register()` の後・`unregister()` の前）か。
@@ -276,13 +471,26 @@ internal fun Harness.awaitRestoreCleanup(m: Machine) {
  */
 private val JVM_WIDE_THREAD_NAMES: Set<String> = setOf(ValidationWatchdog.THREAD_NAME)
 
-/** 名前が `KiBi-` で始まるスレッド（[JVM_WIDE_THREAD_NAMES] を除く）が残っておらず、共有の見張りの予定も残っていない */
-internal fun assertNoKernelThreads() {
-    eventuallyDescribe(5_000, {
-        "カーネルのスレッドか見張りの予定が残っている: threads=${kernelThreadNames()}, " +
+/**
+ * 名前が `KiBi-` で始まるスレッド（[JVM_WIDE_THREAD_NAMES] を除く）が残っておらず、共有の見張りの予定も残っていない。
+ *
+ * [eventually] と違い、期限で落とす（#916）。JVM 全体のスレッドを見るので、前のテストが漏らしたスレッドがあると、後に続く
+ * [Harness] のテストがすべてここで止まり、保険のタイムアウト（10 分）が 1 本ずつ積み重なって CI の段の上限を超えるため。
+ * 期限は、負荷の高い CI でスレッドが終わるのに十分な長さにする
+ */
+internal fun assertNoKernelThreads(timeoutMillis: Long = KERNEL_THREADS_EXIT_MILLIS, prefix: String = "KiBi-") {
+    val deadline = System.nanoTime() + timeoutMillis * 1_000_000
+    fun leftover(): String =
+        "カーネルのスレッドか見張りの予定が残っている: threads=${kernelThreadNames(prefix)}, " +
             "watchdogPending=${ValidationWatchdog.sharedPendingCount()}"
-    }) { kernelThreadNames().isEmpty() && ValidationWatchdog.sharedPendingCount() == 0 }
+    while (kernelThreadNames(prefix).isNotEmpty() || ValidationWatchdog.sharedPendingCount() != 0) {
+        if (System.nanoTime() > deadline) fail(leftover())
+        failOnInterrupt({ leftover() }) { Thread.sleep(1) }
+    }
 }
+
+/** [assertNoKernelThreads] が、スレッドが終わるのを待つ上限 */
+private const val KERNEL_THREADS_EXIT_MILLIS = 30_000L
 
 /** 名前が [prefix] で始まる、生きているスレッドの名前（[JVM_WIDE_THREAD_NAMES] を除く） */
 internal fun kernelThreadNames(prefix: String = "KiBi-"): List<String> =

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -53,6 +54,7 @@ internal fun meteredSpin(meter: ConcurrencyMeter, progress: AtomicInteger, asSta
     return if (asStart) b.start { ctx, _ -> body(ctx) }.build() else b.export("run", VOID) { ctx, _ -> body(ctx) }.build()
 }
 
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class SchedulerTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -269,7 +271,7 @@ class SchedulerTest {
                 }),
             )
             h.scheduler.tick()
-            assertTrue(inHost.await(5, TimeUnit.SECONDS))
+            inHost.awaitOrFail()
             m.stop()
             assertEquals(MachineState.STOPPING, m.state)
             assertThrows<IllegalStateException> { m.spawnTest(h.program(emptyModule()), runDriver()) }
@@ -404,6 +406,7 @@ class SchedulerTest {
             eventually { m.stateOf(p) == ProcessState.WAITING_EVENT }
             eventually { h.scheduler.workers.activeSteps.get() == 0 }
             val gate = CountDownLatch(1)
+            h.releaseOnClose { gate.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
             val atGate = CountDownLatch(1)
             h.scheduler.hooks.afterStepPermit = { _, pid ->
                 if (pid == p) {
@@ -414,7 +417,7 @@ class SchedulerTest {
             val before = h.scheduler.permits.availablePermits()
             val fuel = m.lock.withLockValue { m.kernel.fuel }
             m.lock.withLockValue { s.write(byteArrayOf(1), 0, 1, m.registry) }
-            assertTrue(atGate.await(5, TimeUnit.SECONDS))
+            atGate.awaitOrFail()
             m.lock.withLockValue { s.read(ByteArray(1), 0, 1, m.registry) }
             h.scheduler.hooks.afterStepPermit = null
             gate.countDown()

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
@@ -47,6 +48,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 今挿さっているディスクの表は [MachineEnvironment.disks] と [Machine.disksChanged] で入れる。
  * init は kibi-power-wasi の `hold`（止められるまで眠る）
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class DiskHotplugTest {
     @TempDir
     lateinit var dir: Path
@@ -89,7 +91,10 @@ class DiskHotplugTest {
     ) : BootVolumeOpener {
         val fs = ConcurrentHashMap<String, CountingDisk>()
         val opens = ConcurrentHashMap<String, AtomicInteger>()
-        val gates = ConcurrentHashMap<String, Gate>()
+        val gates = GateMap()
+
+        /** [gates] に差した門を、置き換えで表から消えたものも含めて全部開ける（#916。期限なしの `release.await()` で止まったスレッドを、テストが落ちても放す） */
+        fun releaseAllGates() = gates.everPut.forEach { it.release.countDown() }
 
         /** 識別子 → 開くときに返すファイルシステム（本物の `DiskFileSystem` などに差し替える。#453） */
         val overrides = ConcurrentHashMap<String, FileSystem>()
@@ -97,6 +102,16 @@ class DiskHotplugTest {
         class Gate {
             val entered = CountDownLatch(1)
             val release = CountDownLatch(1)
+        }
+
+        /** 差した門を、置き換えられても覚えておく表 */
+        class GateMap : ConcurrentHashMap<String, Gate>() {
+            val everPut = java.util.concurrent.CopyOnWriteArrayList<Gate>()
+
+            override fun put(key: String, value: Gate): Gate? {
+                everPut += value
+                return super.put(key, value)
+            }
         }
 
         fun disk(id: String): CountingDisk = fs.computeIfAbsent(id) { CountingDisk() }
@@ -107,7 +122,8 @@ class DiskHotplugTest {
             opens.computeIfAbsent(diskId) { AtomicInteger() }.incrementAndGet()
             gates[diskId]?.let { g ->
                 g.entered.countDown()
-                check(g.release.await(15, TimeUnit.SECONDS)) { "門が開かない" }
+                // 期限なし（#916）。テストが落ちたときは、Harness の close の前に開ける（boot の releaseOnClose）
+                g.release.await()
             }
             if (diskId in rootIds) return BootVolume(root, readOnly = rootReadOnly)
             if (diskId.startsWith("bad")) return null
@@ -130,6 +146,7 @@ class DiskHotplugTest {
         config: BootConfig = BootConfig.builder().addBootDisk("root").build(),
     ): Booted {
         h.scheduler.hooks.bootVolumes = disks
+        h.releaseOnClose { disks.releaseAllGates() }
         val m = h.machine(fuelPerTick = fuel, environment = MachineEnvironment.builder().disks(snapshot(*ids)).build())
         assertTrue(m.boot(config))
         if (wait) awaitRunning(h, m)
@@ -372,7 +389,7 @@ class DiskHotplugTest {
             val gate = Disks.Gate()
             b.disks.gates["d1"] = gate
             assertFalse(m.disksChanged(snapshot("root", "d1")))
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             assertEquals(Errno.BUSY, assertThrows<FsException> { m.mountDisk("disk:d1", VfsPath.parse("/x"), false) }.errno)
             gate.release.countDown()
             eventually(10_000, "マウントしない") { m.mountAt("/mnt/d1") == "disk:d1" }
@@ -392,7 +409,7 @@ class DiskHotplugTest {
             val gate = Disks.Gate()
             b.disks.gates[id] = gate
             assertFalse(m.disksChanged(snapshot("root", "other", id)))
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             m.mountDisk("disk:other", VfsPath.parse("/mnt/abcdef12"), false)
             gate.release.countDown()
             eventually(10_000, "マウントしない") { m.mountAt("/mnt/abcdef12-0") == "disk:$id" }
@@ -471,7 +488,7 @@ class DiskHotplugTest {
             val gate = Disks.Gate()
             b.disks.gates["root2"] = gate
             assertFalse(m.disksChanged(snapshot("root", "root2")))
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             // init が自分で終わる（stopLocked を通らずに STOPPED）
             m.lock.withLockValue { m.killRuntimeLocked(m.runtimes.getValue(m.kernel.initPid), KillSignal.KILL) }
             eventually(10_000, "止まらない") {
@@ -518,10 +535,10 @@ class DiskHotplugTest {
                 )
             }
             t.start()
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             m.stop()
             gate.release.countDown()
-            assertEquals(Errno.IO, error.get(10, TimeUnit.SECONDS))
+            assertEquals(Errno.IO, error.getOrFail())
             assertNull(m.mountAt("/x"))
             assertEquals(0, m.diskClaimCount)
             t.join()
@@ -540,7 +557,7 @@ class DiskHotplugTest {
             val gate = Disks.Gate()
             b.disks.gates["d2"] = gate
             assertFalse(m.disksChanged(snapshot("root", "d0", "d2")))
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             // 挿してから抜くまでを1つのロックの区間にする（d1 の挿し込みで積まれた自動マウントの仕事が、間に割り込んで d1 を予約しないように）
             m.lock.withLockValue {
                 assertFalse(m.disksChanged(snapshot("root", "d0", "d2", "d1")))
@@ -562,11 +579,12 @@ class DiskHotplugTest {
             val gate = Disks.Gate()
             disks.gates["root"] = gate
             val stopped = CountDownLatch(1)
-            h.scheduler.hooks.beforeInitExec = { _ -> stopped.await(30, TimeUnit.SECONDS) }
+            h.scheduler.hooks.beforeInitExec = { _ -> stopped.await() }
+            h.releaseOnClose { stopped.countDown() }
             val b = boot(h, "x", disks = disks, wait = false)
             val m = b.m
             // 根の候補 root を開いている途中に root を挿しても、予約より後なので表にない（起動は root を飛ばす）
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             gate.release.countDown()
             eventually(10_000, "起動が終わらない") { !m.isBooting }
             stopped.countDown()
@@ -578,10 +596,11 @@ class DiskHotplugTest {
             val go = CountDownLatch(1)
             h.scheduler.hooks.beforeInitExec = { _ ->
                 reached.countDown()
-                go.await(30, TimeUnit.SECONDS)
+                go.await()
             }
+            h.releaseOnClose { go.countDown() }
             val b = boot(h, "root", wait = false)
-            assertTrue(reached.await(30, TimeUnit.SECONDS))
+            reached.awaitOrFail()
             assertTrue(b.m.disksChanged(DiskSnapshot.EMPTY), "根が抜けたら止める")
             go.countDown()
             b.m.close()
@@ -697,13 +716,14 @@ class DiskHotplugTest {
     private fun blockBootThreads(h: Harness, release: CountDownLatch) {
         val executor = h.scheduler.bootExecutor
         val started = CountDownLatch(executor.maximumPoolSize)
+        h.releaseOnClose { release.countDown() }
         repeat(executor.maximumPoolSize) {
             executor.execute {
                 started.countDown()
-                release.await(30, TimeUnit.SECONDS)
+                release.await()
             }
         }
-        assertTrue(started.await(10, TimeUnit.SECONDS), "起動用のスレッドを塞げない")
+        started.awaitOrFail("起動用のスレッドを塞げない")
     }
 
     private fun awaitBootThreadsIdle(h: Harness) =
@@ -770,7 +790,7 @@ class DiskHotplugTest {
                 )
             }
             t.start()
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             // 仕事が動く: 予約があるので d1 を飛ばして終わる
             val runs = m.autoMountRuns.get()
             hold.countDown()
@@ -778,7 +798,7 @@ class DiskHotplugTest {
             awaitBootThreadsIdle(h)
             assertEquals(emptyList<Triple<String, String, String>>(), m.diskEvents(q), "マウントが終わるまで出さない")
             gate.release.countDown()
-            assertEquals(null, error.get(10, TimeUnit.SECONDS))
+            assertEquals(null, error.getOrFail())
             t.join()
             assertEquals("disk:d1", m.mountAt("/x"))
             eventually(10_000, "disk-inserted が来ない") { m.diskEvents(q).isNotEmpty() }
@@ -805,13 +825,13 @@ class DiskHotplugTest {
             val gateA = Disks.Gate()
             b.disks.gates["d1"] = gateA
             assertFalse(m.disksChanged(snapshot("root", "d1")))
-            assertTrue(gateA.entered.await(10, TimeUnit.SECONDS))
+            gateA.entered.awaitOrFail()
             // A が開いている途中に抜き、挿し直す（B）
             assertFalse(m.disksChanged(snapshot("root")))
             val gateB = Disks.Gate()
             b.disks.gates["d1"] = gateB
             assertFalse(m.disksChanged(snapshot("root", "d1")))
-            assertTrue(gateB.entered.await(10, TimeUnit.SECONDS))
+            gateB.entered.awaitOrFail()
             assertEquals(1, m.diskClaimCount, "B の予約だけが残る")
             // A を進める: マウントせず、開いたものを閉じる。B の予約は残る
             gateA.release.countDown()
@@ -936,7 +956,7 @@ class DiskHotplugTest {
             val b = boot(h, "root", wait = false)
             val m = b.m
             awaitRunning(h, m)
-            assertEquals(false, changed.get(10, TimeUnit.SECONDS))
+            assertEquals(false, changed.getOrFail())
             eventually(10_000, "起動の後にマウントしない") { m.mountAt("/mnt/d1") == "disk:d1" }
             eventually(10_000, "disk-inserted が来ない") { m.diskEvents(queue!!).isNotEmpty() }
             assertEquals(listOf(Triple("disk-inserted", "d1", "/mnt/d1")), m.diskEvents(queue!!))
@@ -1191,7 +1211,7 @@ class DiskHotplugTest {
             val gate = Disks.Gate()
             b.disks.gates["d1"] = gate
             assertFalse(m.disksChanged(snapshot("root", "d1")))
-            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            gate.entered.awaitOrFail()
             try {
                 // 予約（DiskClaim）の間は、まだマウントの表にないので位置なし
                 assertNull(m.listDisks().single { it.diskId == "d1" }.mountPoint)

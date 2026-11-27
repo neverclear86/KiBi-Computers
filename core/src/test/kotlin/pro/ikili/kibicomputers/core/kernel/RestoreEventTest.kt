@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
@@ -44,6 +45,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 復元のイベント `restored`（#87、ADR 0087）: 成功した復元で、戻したキューに1件ずつ届き、値は実時間・ゲーム内時間の飛び。
  * 戻せなかったとき（後段の失敗・冷えた起動・取り消し）には出さない。受け手が返るまでプロセスは動かない
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class RestoreEventTest {
     @TempDir
     lateinit var dir: Path
@@ -302,13 +304,14 @@ class RestoreEventTest {
             val release = CountDownLatch(1)
             h.scheduler.hooks.beforeRestoreInstall = {
                 entered.countDown()
-                release.await(30, TimeUnit.SECONDS)
+                release.await()
             }
+            h.releaseOnClose { release.countDown() }
             val m = h.machine(fuelPerTick = 10_000_000, environment = env(ManualClock(realtime = 9_000_000_000L, world = 500)))
             val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
             val listener = RestoreListener { _, outcome, _ -> outcomes += outcome }
             assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.id, saved.generation), bootConfig(), listener)))
-            assertTrue(entered.await(60, TimeUnit.SECONDS), "後段の手前まで来ない")
+            entered.awaitOrFail("後段の手前まで来ない")
             m.stop()
             release.countDown()
             eventually(60_000, "取り消しの知らせが来ない") {

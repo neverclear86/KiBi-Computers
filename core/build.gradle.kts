@@ -63,8 +63,11 @@ dependencies {
 // - :core:test は、直列の組（serialTestClasses）を除いたクラスを、`maxParallelForks`（-Pkibi.test.forks。既定は CPU 数から決める）本の
 //   JVM で並列に回す。直列の組は :core:testSerial（JVM 1 本）が、:core:test の後に単独で回す（test の finalizedBy。check にも入れる）。
 //   `./gradlew :core:test` の意味は「core の全テスト」のまま。
-// - `--tests` を付けた起動では、:core:test は直列の組も含めて絞り込みどおりに回し、:core:testSerial は回さない
-//   （`:core:test --tests '*StackExhaustionLockTest*'` も見つかる）。
+// - `--tests` はタスクごとに見る（#996。そのタスク自身に付いたものだけ。ほかのタスクに付いた `--tests` では変わらない）。
+//   - `:core:test --tests X`: :core:test が直列の組も含めて X どおりに回し、:core:testSerial は回さない
+//     （`:core:test --tests '*StackExhaustionLockTest*'` も見つかる）。
+//   - `:core:testSerial --tests X`: :core:testSerial が直列の組の中だけを X で絞って回す（直列の組でないクラスは見つからずに落ちる）。
+//   - 両方に付けたときは、両方がそれぞれの絞り込みで回る（:core:test の絞り込みに当たった直列の組のクラスは、並列の fork でも回る）。
 // - `-Pkibi.test.shard=k/N` で、両方のタスクを N 組の k 組目のクラスだけに絞る（CI の matrix。build.yml）。どのクラスもちょうど 1 組に入る:
 //   時間のかかるクラス（heavyTestClassSeconds）は測った時間で組に配り（LPT）、残りはトップレベルの FQCN の String.hashCode で配る。
 
@@ -153,8 +156,12 @@ fun inThisShard(element: FileTreeElement): Boolean {
 }
 fun isSerialClass(element: FileTreeElement): Boolean = !element.isDirectory && topLevelClassName(element) in serialTestClasses
 
-// `--tests` で絞り込んだ起動か（そのときは直列の組を :core:test から除かず、:core:testSerial を回さない）
-val testFilterGiven = gradle.startParameter.taskRequests.any { request -> request.args.any { it == "--tests" || it.startsWith("--tests=") } }
+// このタスク自身に付いた `--tests` の値（#996）。コマンドラインのオプションはタスクを構成した後に入るので、構成の時点で読まず、
+// 実行の時点で評価される場所（include の Spec・onlyIf）で読む。
+// `--tests` の値は公開の TestFilter（includePatterns）には入らず、内部の DefaultTestFilter にしか読み口がない。Gradle を上げて
+// 消えたら、ここがコンパイルエラーになる（握りつぶして空に倒すと、直列の組が黙って並列で回る形に戻るので、そうしない）
+fun Test.cliTestPatterns(): Set<String> =
+    (filter as org.gradle.api.internal.tasks.testing.filter.DefaultTestFilter).commandLineIncludePatterns
 
 // ベンチマークの起動（ほかのクラスと CPU を取り合うと測定が歪むので、fork を 1 にする）
 val benchmarkOn = listOf("kibi.overdraftBenchmark", "kibi.asyncifyBenchmark", "kibi.asyncifyFuelBenchmark").any { providers.gradleProperty(it).orNull == "true" } ||
@@ -176,11 +183,19 @@ fun Test.coreTestDefaults(classFilter: (FileTreeElement) -> Boolean = { true }) 
         events(org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED)
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
-    // 負荷の下で 10 秒を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で始まる行を標準出力に出す）は、
-    // 通った回もコンソールと CI のログに写す（#868。標準出力のすべては写さない）
+    // 止まったときの保険（#916）。実スレッドの完了は期限なしで待つ（eventually・awaitOrFail など。TestDrivers.kt）ので、止まったテストを
+    // 1 本 10 分で落とす（合否の基準ではない）。既定は src/test/resources/junit-platform.properties にあり、IDE の JUnit ランナーで
+    // 直に回すときにも効く。ここでは、長くかかる起動（ベンチマーク。下の kibi.*Benchmark・kibi.luaReplMachines）でだけ延ばす
+    // （`-Pkibi.test.timeoutDefault=<JUnit の書式。例: 30 m>` で、どの起動でも変えられる）
+    val benchmarkOn = listOf("kibi.overdraftBenchmark", "kibi.asyncifyBenchmark", "kibi.asyncifyFuelBenchmark").any { providers.gradleProperty(it).orNull == "true" } ||
+        providers.gradleProperty("kibi.luaReplMachines").orNull != null
+    (providers.gradleProperty("kibi.test.timeoutDefault").orNull ?: if (benchmarkOn) "2 h" else null)
+        ?.let { systemProperty("junit.jupiter.execution.timeout.default", it) }
+    // 負荷の下で閾値を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で、TestDrivers.kt の eventually が「#916 遅れ」で
+    // 始まる行を標準出力に出す）は、通った回もコンソールと CI のログに写す（#868・#916。標準出力のすべては写さない）
     val testLogger = logger
     addTestOutputListener { descriptor, event ->
-        if (event.message.startsWith("#868 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
+        if (event.message.startsWith("#868 遅れ") || event.message.startsWith("#916 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
     }
     // システムコール仕様書（#79）が実装と WIT からずれていないことを確かめる SyscallDocTest が読むファイル。
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
@@ -224,12 +239,17 @@ val testSerial = tasks.register<Test>("testSerial") {
     coreTestDefaults { isSerialClass(it) }
     maxParallelForks = 1
     shouldRunAfter(tasks.test)
-    // `--tests` の起動では、絞り込みは :core:test が受け持つ（直列の組も含めて回す）
-    onlyIf("--tests を付けた起動では :core:test が直列の組も回す") { !testFilterGiven }
+    // :core:test にだけ `--tests` が付いた起動では、絞り込みは :core:test が受け持つ（直列の組も含めて回す）。
+    // 自分に `--tests` が付いていれば、自分の絞り込みで回る
+    val testTask = tasks.test.get()
+    onlyIf(":core:testSerial に --tests がなく、:core:test に --tests があるときは :core:test が直列の組も回す") {
+        cliTestPatterns().isNotEmpty() || testTask.cliTestPatterns().isEmpty()
+    }
 }
 
 tasks.test {
-    coreTestDefaults { testFilterGiven || !isSerialClass(it) }
+    val testTask = this
+    coreTestDefaults { testTask.cliTestPatterns().isNotEmpty() || !isSerialClass(it) }
     maxParallelForks = testForks
     finalizedBy(testSerial)
 }
@@ -261,6 +281,8 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         roundsScale?.let { systemProperty("kibi.stackHeadroom.roundsScale", it) }
         testLogging.showStandardStreams = true
         outputs.upToDateWhen { false }
+        // 保険の既定のタイムアウト（junit-platform.properties の 10 分）は、インタプリタの 1 本には短いので延ばす（#916）
+        systemProperty("junit.jupiter.execution.timeout.default", providers.gradleProperty("kibi.test.timeoutDefault").orNull ?: "3 h")
     }
     registerHeadroomTest(
         "stackHeadroomColdTest",

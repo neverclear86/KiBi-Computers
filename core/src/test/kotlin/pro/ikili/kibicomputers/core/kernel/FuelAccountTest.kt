@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -42,6 +43,7 @@ private class ReferenceFuel(val perTick: Long) {
     }
 }
 
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class FuelAccountTest {
     private val perTick = 100L
 
@@ -359,7 +361,7 @@ class FuelAccountTest {
                     }
                 }),
             )
-            assertTrue(inHost.await(5, TimeUnit.SECONDS))
+            inHost.awaitOrFail()
             m.lock.withLockValue {
                 assertEquals(0, m.kernel.fuel)
                 assertEquals(t, m.fuelAccount.lastRefillTick)

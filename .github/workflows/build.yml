@@ -144,13 +144,23 @@ jobs:
         timeout-minutes: 60
         run: ./gradlew :core:test -Pkibi.test.shard=${{ matrix.shard }}/${{ strategy.job-total }} -Pkibi.test.forks=1 --console=plain
 
-      # 組のテストの数を出す。0 件なら落とす（組の振り分けの誤りで、テストが黙って走らなくなるのを防ぐ）
+      # 組のテストの数を出す。0 件なら落とす（組の振り分けの誤りで、テストが黙って走らなくなるのを防ぐ）。
+      # 組に直列の組（または並列の組）のクラスが 1 つもないと、そのタスクは NO-SOURCE で結果のディレクトリができない（#996）。
+      # nullglob で、ないディレクトリは 0 件として数える（空の配列で cat を呼ぶと標準入力を読むので、cat を呼ばない）
       - name: Count tests
         run: |
           set -euo pipefail
-          count=$(cat core/build/test-results/test/*.xml core/build/test-results/testSerial/*.xml 2>/dev/null \
-            | grep -o '<testsuite [^>]*' | sed -n 's/.* tests="\([0-9]*\)".*/\1/p' | awk '{s+=$1} END {print s+0}')
-          echo "core のテスト（組 ${{ matrix.shard }}/${{ strategy.job-total }}）: ${count} 件" | tee -a "$GITHUB_STEP_SUMMARY"
+          shopt -s nullglob
+          count_dir() {
+            local files=("$1"/*.xml)
+            if [ ${#files[@]} -eq 0 ]; then echo 0; return; fi
+            cat "${files[@]}" | { grep -o '<testsuite [^>]*' || true; } \
+              | sed -n 's/.* tests="\([0-9]*\)".*/\1/p' | awk '{s+=$1} END {print s+0}'
+          }
+          parallel=$(count_dir core/build/test-results/test)
+          serial=$(count_dir core/build/test-results/testSerial)
+          count=$((parallel + serial))
+          echo "core のテスト（組 ${{ matrix.shard }}/${{ strategy.job-total }}）: ${count} 件（test ${parallel}・testSerial ${serial}）" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$count" -gt 0
 
       - name: Mark the root of test reports

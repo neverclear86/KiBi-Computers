@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.api.device.Device
@@ -52,11 +53,17 @@ import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 起動シーケンス（/sbin/init）と停止・再起動（#49） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class BootTest {
     private val limit = Duration.ofSeconds(30)
 
     private companion object {
-        /** ロックなしの読み手が終わるのを待つ上限。普通はすぐ終わるので、混んだ CI でも足りる長さにする */
+        /**
+         * ロックなしの読み手が終わるのを待つ上限。普通はすぐ終わるので、混んだ CI でも足りる長さにする。
+         *
+         * これは期限なしにしない（#916）。待ちの上限が合否そのもの（読み手がカーネルロックを待っていたら、終わらない＝落ちる）で、
+         * しかもテストのスレッドがそのロックを持ったまま待つ箇所がある。期限なしにすると、落ちるべきときに保険のタイムアウトまで固まる
+         */
         const val READER_WAIT_MILLIS = 10_000L
     }
 
@@ -366,12 +373,13 @@ class BootTest {
     fun `プログラムだけの起動の途中のstopではinitを作らず、マウントを残さない`() = env {
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
         }
         assertTrue(m.boot(BootConfig.builder().firmwareProgram(exe(foreverInit())).build()))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         m.stop()
         release.countDown()
         eventually { !m.isBooting }
@@ -542,7 +550,7 @@ class BootTest {
             assertTrue(m.reboot())
             assertFalse(m.isRunningOrBooting, "isRunningOrBooting は再起動の途中を含まない")
             assertTrue(m.isRunningBootingOrRebooting, "reboot を受け付けた直後")
-            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            atGate.awaitOrFail("init のスレッドが登録を外す前に来ない")
             h.scheduler.hooks.beforeUnregister = null
             tickFor(50)
             assertEquals(MachineState.STOPPED, m.state)
@@ -756,12 +764,13 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertTrue(m.isBooting)
         assertFalse(m.boot(bootDisks("d")), "起動の途中は受け付けない")
         m.stop()
@@ -780,13 +789,14 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             h.scheduler.hooks.beforeInitExec = null
             reached.countDown()
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertTrue(m.reboot())
         release.countDown()
         tickUntil { host.reboots.get() == 1 && host.states().isNotEmpty() }
@@ -801,13 +811,14 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             h.scheduler.hooks.beforeInitExec = null
             reached.countDown()
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertTrue(m.isBooting)
         assertTrue(m.reboot())
         assertTrue(m.isBooting, "起動の手順はまだ終わっていない")
@@ -1138,6 +1149,7 @@ class BootTest {
         val real = BootVolumeOpener.forDisks({ id -> if (id == "d1") ResolvedDisk(diskDir, 1L shl 20, 1024) else null }, m.hostFiles)
         val aEntered = CountDownLatch(1)
         val aRelease = CountDownLatch(1)
+        h.releaseOnClose { aRelease.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         val calls = AtomicInteger()
         h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
             override fun open(diskId: String): BootVolume? = open(diskId) { false }
@@ -1151,7 +1163,7 @@ class BootTest {
             }
         }
         assertTrue(m.boot(bootDisks("d1")))
-        assertTrue(aEntered.await(5, TimeUnit.SECONDS))
+        aEntered.awaitOrFail()
         m.stop()
         val bHost = Recorder()
         val b = h.machine(host = bHost)
@@ -1173,7 +1185,7 @@ class BootTest {
         } finally {
             aRelease.countDown()
             b.stop()
-            assertTrue(b.awaitTermination(5_000))
+            assertTrue(awaitInCleanup({ "マシン b が止まらない" }, 5_000) { b.awaitTermination(it) })
         }
         tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
     }
@@ -1188,6 +1200,7 @@ class BootTest {
         val real = BootVolumeOpener.forDisks({ id -> if (id == "h") ResolvedDisk(homeDir, 1L shl 20, 1024) else null }, m.hostFiles)
         val aEntered = CountDownLatch(1)
         val aRelease = CountDownLatch(1)
+        h.releaseOnClose { aRelease.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         val homeCalls = AtomicInteger()
         h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
             override fun open(diskId: String): BootVolume? = open(diskId) { false }
@@ -1202,7 +1215,7 @@ class BootTest {
             }
         }
         assertTrue(m.boot(withHome("h", "ro")))
-        assertTrue(aEntered.await(5, TimeUnit.SECONDS))
+        aEntered.awaitOrFail()
         m.stop()
         val bHost = Recorder()
         val b = h.machine(host = bHost)
@@ -1221,7 +1234,7 @@ class BootTest {
         } finally {
             aRelease.countDown()
             b.stop()
-            assertTrue(b.awaitTermination(5_000))
+            assertTrue(awaitInCleanup({ "マシン b が止まらない" }, 5_000) { b.awaitTermination(it) })
         }
         tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
     }
@@ -1257,12 +1270,13 @@ class BootTest {
         assertEquals(0, initPid())
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         // プロセスは0個で、マウントの途中だが、待機点ではない
         assertEquals(emptyList<Int>(), pids())
         assertFalse(m.isAtWaitPoint, "起動の途中は待機点にしない")
@@ -1282,12 +1296,13 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertEquals(pro.ikili.kibicomputers.core.persist.SaveReadiness.TRANSIENT, m.saveReadiness())
         assertNull(m.captureSnapshot(pro.ikili.kibicomputers.core.persist.CapturePolicy.SKIP_IF_TRANSIENT))
         val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
@@ -1383,7 +1398,7 @@ class BootTest {
         }
         try {
             assertTrue(m.reboot())
-            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            atGate.awaitOrFail("init のスレッドが登録を外す前に来ない")
             h.scheduler.hooks.beforeUnregister = null
             tickFor(50)
             m.lock.withLockValue {

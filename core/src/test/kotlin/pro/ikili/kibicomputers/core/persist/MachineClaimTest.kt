@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.nio.file.Files
@@ -313,8 +314,8 @@ class MachineClaimTest {
         } finally {
             // 途中で落ちても、止めた先読みのスレッドを放し、書き込み・先読みのスレッドが終わるのを待つ（@TempDir の掃除と重ならないように）
             release.countDown()
-            writer?.join()
-            prefetch?.join()
+            writer?.joinOrFail()
+            prefetch?.joinOrFail()
         }
         assertEquals(listOf(first), opened.toList(), "触った ID は先読みが開かない")
         assertFalse(fresh.isUnusable(first))

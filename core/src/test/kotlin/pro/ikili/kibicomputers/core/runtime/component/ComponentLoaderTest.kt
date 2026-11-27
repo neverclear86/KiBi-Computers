@@ -6,9 +6,12 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.assertTimeoutPreemptively
+import pro.ikili.kibicomputers.core.kernel.getOrFail
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
@@ -27,6 +30,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /** コンポーネントのバイナリの読み込みと検証（#262） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ComponentLoaderTest {
     private fun wat(text: String): ByteArray = WitTool.wat(text)
 
@@ -1403,8 +1407,8 @@ class ComponentLoaderTest {
         Thread.sleep(500)
         val clock = System.nanoTime()
         t.interrupt()
-        t.join(10_000)
-        assertTrue(!t.isAlive) { "割り込んでも止まらない" }
+        t.joinOrFail("割り込んでも止まらない")
+        // 割り込みに応える速さは、意図して時間で確かめる（#916 の対象外）
         assertTrue(System.nanoTime() - clock < 5_000_000_000L)
         val e = failure
         assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.INTERRUPTED) { "$e" }
@@ -1447,7 +1451,7 @@ class ComponentLoaderTest {
                         val next = runCatching { ComponentLoader.load(full) }.exceptionOrNull()
                         listOf(e, took, flag, next)
                     },
-                ).get(60, TimeUnit.SECONDS)
+                ).getOrFail()
                 val e = result[0] as Throwable?
                 assertTrue(e is WasmLoadException) { "$name: $e" }
                 assertMessage(e as Exception, "時間の上限（$limitMillis ms）を超えた（コンポーネントの検証、")
@@ -1516,8 +1520,7 @@ class ComponentLoaderTest {
         t.start()
         Thread.sleep(300)
         t.interrupt()
-        t.join(10_000)
-        assertTrue(!t.isAlive)
+        t.joinOrFail("割り込んでも止まらない")
         val e = failure
         assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.INTERRUPTED) { "$e" }
         assertTrue(flag)
@@ -1895,7 +1898,7 @@ class ComponentLoaderTest {
                     }
                 }
             }
-            val results = pool.invokeAll(tasks).map { it.get(60, TimeUnit.SECONDS) }
+            val results = pool.invokeAll(tasks).map { it.getOrFail() }
             for ((i, r) in results.withIndex()) assertEquals(if (i % 2 == 0) "2" else "ok", r)
         } finally {
             pool.shutdownNow()

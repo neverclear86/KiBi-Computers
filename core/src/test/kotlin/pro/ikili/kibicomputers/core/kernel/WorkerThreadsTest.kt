@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -24,6 +25,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 許可を待つ間はスレッドを持たない（#350）。同時に動ける台が許可の数より多くても、ワーカーのスレッドは許可の数＋定数に収まる。
  * ワーカーは仕事がなくても [Harness] の既定（30 秒）まで残るので、プールの大きさはそれまでの最大の本数になる。
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class WorkerThreadsTest {
     private val permits = 2
 
@@ -147,13 +149,13 @@ class WorkerThreadsTest {
             pool.submit("removed") { order += "removed" }
             assertTrue(pool.remove("removed"))
             pool.release()
-            assertTrue(done.await(5, TimeUnit.SECONDS))
+            done.awaitOrFail()
             waiter.join()
             assertEquals(listOf("a", "thread"), order)
             assertEquals(1, pool.availablePermits())
         } finally {
             workers.shutdown()
-            workers.awaitTermination(5_000)
+            awaitInCleanup({ "ワーカーが終わらない" }, 5_000) { workers.awaitTermination(it) }
         }
     }
 }

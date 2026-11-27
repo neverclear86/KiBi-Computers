@@ -498,8 +498,8 @@ class StackExhaustionLockTest {
             awaitLockReleased(ticker, "マシンのロックが放される", m.lock) { "${m.lock}、${stopping()}" }
         } finally {
             stopWaker.set(true)
-            waker?.join(5_000)
-            contenderThread?.join(5_000)
+            waker?.let { t -> awaitInCleanup({ "起こし役が終わらない" }, 5_000) { t.join(it); !t.isAlive } }
+            contenderThread?.let { t -> awaitInCleanup({ "取り合い役が終わらない" }, 5_000) { t.join(it); !t.isAlive } }
             ticker.close()
             println("#858 $kind $body $patterns: ${tally.describe()}、本体を呼んだ回数 ${bodyCalls.get()}、ディスクの操作 ${diskOps.get()} 回")
             h.close()
@@ -845,20 +845,26 @@ class StackExhaustionLockTest {
             h.scheduler.hooks.afterUnregister = { mm, _ ->
                 if (mm === m && firstWorker.compareAndSet(null, Thread.currentThread())) {
                     atFirst.countDown()
-                    releaseFirst.await(20, TimeUnit.SECONDS)
+                    releaseFirst.await()
                 }
             }
             h.scheduler.hooks.afterFinish = { mm, _ ->
                 if (mm === m) {
                     atFinish.countDown()
-                    releaseFinish.await(20, TimeUnit.SECONDS)
+                    releaseFinish.await()
                 }
             }
+            // 期限なしの門（#916）。落ちたときは、close の前に開けてワーカーを残さない
+            h.releaseOnClose {
+                releaseFirst.countDown()
+                releaseFinish.countDown()
+            }
             val rt = m.spawnRt(h.program(emptyModule()), driver)
-            assertTrue(atFirst.await(10, TimeUnit.SECONDS), "最初の step が終わらない")
+            // 期限なしで待つ（#916。止まったときは、外側の assertTimeoutPreemptively の 30 秒で落ちる）
+            atFirst.awaitOrFail("最初の step が終わらない")
             // 起こすと、次の step が別のワーカーで始まり、終わって（EXITED）CPU を返す前で止まる
             m.lock.withLockValue { stream.write(ByteArray(1), 0, 1, m.wakeSink) }
-            assertTrue(atFinish.await(10, TimeUnit.SECONDS), "次の step が終わらない")
+            atFinish.awaitOrFail("次の step が終わらない")
             assertEquals(ProcessState.EXITED, rt.process.state)
             assertTrue(m.cpu.currentOwner === rt, "終わったプロセスが CPU の持ち主のはず")
             // 前の step のワーカーが安全網を通る

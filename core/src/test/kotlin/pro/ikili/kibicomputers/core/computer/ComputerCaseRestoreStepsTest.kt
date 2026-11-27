@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.api.device.Device
@@ -26,6 +27,7 @@ import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.eventually
+import pro.ikili.kibicomputers.core.kernel.failOnInterrupt
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -33,6 +35,7 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -52,6 +55,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.logging.Handler
 import java.util.logging.Level
@@ -64,6 +68,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * [ComputerCase.startRestore] の [RestoreReady]（接続層のデバイスのつなぎ）が投げても、後の手順（配り直し・冷えた起動・`finished`・
  * 同期の起動）が走り、例外は [Machine] が「復元の受け手」として1回だけログに出すこと（#677）
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ComputerCaseRestoreStepsTest {
     @TempDir
     lateinit var dir: Path
@@ -112,13 +117,11 @@ class ComputerCaseRestoreStepsTest {
         }
     }
 
-    /** [manager] を tick して [condition] を待つ */
+    /** [manager] を tick して [condition] を待つ（期限なし。止まったときはクラスの @Timeout が割り込む。#916） */
     private fun tickUntil(manager: MachineManager<String>, message: String, condition: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 10_000
         while (!condition()) {
-            if (System.currentTimeMillis() > deadline) throw AssertionError(message)
             manager.tick()
-            Thread.sleep(1)
+            failOnInterrupt({ message }) { Thread.sleep(1) }
         }
     }
 
@@ -187,7 +190,7 @@ class ComputerCaseRestoreStepsTest {
                 case.turnOff()
             }
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -216,7 +219,7 @@ class ComputerCaseRestoreStepsTest {
                 case.turnOff()
             }
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -233,15 +236,13 @@ class ComputerCaseRestoreStepsTest {
             )
             // tickUntil は条件が偽のたびに囲まずに tick するので、ここでは使わない（知らせがその tick から出ると catch を抜ける）
             var thrown: Throwable? = null
-            val deadline = System.currentTimeMillis() + 10_000
             while (thrown == null) {
-                if (System.currentTimeMillis() > deadline) throw AssertionError("致命的なエラーが tick の外へ届かない")
                 try {
                     manager.tick()
                 } catch (e: OutOfMemoryError) {
                     thrown = e
                 }
-                Thread.sleep(1)
+                failOnInterrupt({ "致命的なエラーが tick の外へ届かない" }) { Thread.sleep(1) }
             }
             assertEquals("つなぎ", thrown.message)
             assertTrue(finished.isEmpty(), "finished は呼ばない")
@@ -249,7 +250,7 @@ class ComputerCaseRestoreStepsTest {
             assertFalse(machine.isRestoring, "復元の印は Machine が閉じる")
             case.turnOff()
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -274,7 +275,7 @@ class ComputerCaseRestoreStepsTest {
             assertFalse(case.isRestorePending)
             case.turnOff()
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -428,7 +429,7 @@ class ComputerCaseRestoreStepsTest {
                 assertTrue(logs.restoreListenerWarnings(machine).isEmpty(), "投げていないので出さない")
             }
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 }

@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
+import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -45,7 +46,7 @@ class ScreenDeviceOwnerTest {
         try {
             block(Env(manager))
         } finally {
-            assertTrue(manager.shutdown(10_000))
+            assertTrue(manager.shutdownInCleanup())
         }
     }
 

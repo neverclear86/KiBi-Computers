@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.device
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
@@ -10,7 +11,10 @@ import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
+import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
@@ -22,6 +26,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * TTY の印を、書く先のロックが取れずに飛ばしたときや、印とメッセージの間にほかの通知が挟まったときも同じ。
  * マシンは起動しない（TTY の出力はキー入力のエコー、カーネルのメッセージは writeConsoleLine で出す）
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ScreenDeviceConsoleOrderTest {
     private val limit = Duration.ofSeconds(60)
 
@@ -48,7 +53,7 @@ class ScreenDeviceConsoleOrderTest {
             block(Env(manager, machine, screen, console))
             case.turnOff()
         } finally {
-            assertTrue(manager.shutdown(10_000))
+            assertTrue(manager.shutdownInCleanup())
         }
     }
 
@@ -56,8 +61,9 @@ class ScreenDeviceConsoleOrderTest {
     private fun Env.settle() = repeat(5) { manager.tick() }
 
     /**
-     * 別のスレッドで表示デバイスのロックを持つ（書き手が書いている最中を作る）。[releaseWhen] が true になったら放す。
-     * 失敗したときも必ず放す
+     * 別のスレッドで表示デバイスのロックを持つ（書き手が書いている最中を作る）。[releaseWhen] が true になるか、割り込まれたら放す。
+     * 期限では放さない（#916。負荷の高い CI で、相手が待ち始める前に放すと、確かめたい順が作れない）。失敗したときは、後始末で
+     * 割り込んで放させる
      */
     private fun holdDisplay(console: ScreenDevice, releaseWhen: () -> Boolean): Thread {
         val holding = CountDownLatch(1)
@@ -66,15 +72,14 @@ class ScreenDeviceConsoleOrderTest {
             lock.lock()
             try {
                 holding.countDown()
-                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
-                while (!releaseWhen() && System.nanoTime() < deadline) Thread.onSpinWait()
+                while (!releaseWhen() && !Thread.currentThread().isInterrupted) Thread.onSpinWait()
             } finally {
                 lock.unlock()
             }
         }
         holder.isDaemon = true
         holder.start()
-        assertTrue(holding.await(10, TimeUnit.SECONDS), "ロックを持てない")
+        holding.awaitOrFail("ロックを持てない")
         return holder
     }
 
@@ -89,7 +94,9 @@ class ScreenDeviceConsoleOrderTest {
                 e.machine.writeConsoleLine("K1")
                 e.manager.tick()
             } finally {
-                holder.join(10_000)
+                // 通った回は、tick がロックを取れた時点で放している。落ちた回（待ち始める前に落ちた）は、割り込んで放させる
+                holder.interrupt()
+                holder.joinOrFail("表示デバイスのロックを放さない")
             }
             e.settle()
             assertEquals(listOf("E1", "K1"), shown(e.screen))
@@ -106,13 +113,13 @@ class ScreenDeviceConsoleOrderTest {
                 // 通知の中（メインスレッド）でロックを空けるので、「印を飛ばす → ほかの通知 → カーネルのメッセージ」の順が決まる
                 e.machine.postHostCallback {
                     release.countDown()
-                    holder.join(10_000)
+                    holder.joinOrFail("表示デバイスのロックを放さない")
                 }
                 e.machine.writeConsoleLine("K1")
                 e.manager.tick()
             } finally {
                 release.countDown()
-                holder.join(10_000)
+                holder.joinOrFail("表示デバイスのロックを放さない")
             }
             e.settle()
             assertEquals(listOf("E1", "K1"), shown(e.screen))

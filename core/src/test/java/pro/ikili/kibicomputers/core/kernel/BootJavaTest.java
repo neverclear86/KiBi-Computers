@@ -1,10 +1,12 @@
 package pro.ikili.kibicomputers.core.kernel;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -14,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 起動と再起動（#49）が Java から自然に使えることを確かめる。 */
+@Timeout(value = 10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class BootJavaTest {
     /** 起動の失敗と再起動の求めを上書きするクラス */
     static final class BootHost implements MachineHost {
@@ -93,9 +96,8 @@ class BootJavaTest {
     }
 
     private static void tickUntil(MachineScheduler scheduler, java.util.function.BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 10_000;
+        // 期限なしで待つ（#916）。止まったときは、クラスの @Timeout が割り込む
         while (!condition.getAsBoolean()) {
-            assertTrue(System.currentTimeMillis() < deadline, "条件がそろわない");
             scheduler.tick();
             Thread.sleep(1);
         }

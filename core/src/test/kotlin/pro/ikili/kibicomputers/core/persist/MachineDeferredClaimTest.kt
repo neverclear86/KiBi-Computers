@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Collections
@@ -88,7 +89,7 @@ class MachineDeferredClaimTest {
         } finally {
             // 途中で落ちても、止めた先読みのスレッドを放し、終わるのを待つ（@TempDir の掃除と重ならないように）
             release.countDown()
-            thread?.join()
+            thread?.joinOrFail()
         }
         assertEquals(urgent, opened[2], "待っている ID を順番より先に読む")
         // 先読みのスレッドが終わったので、待ちの ID の結果はすべて入っている（1 回の poll で決まる）
