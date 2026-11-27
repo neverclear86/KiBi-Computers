@@ -40,6 +40,25 @@ internal object FuelCosts {
     const val ASYNC_VALUE: Long = 2
 
     /**
+     * GC のオブジェクトを作る命令（`struct.new*`・`array.new*`）1 つの、命令そのものの 1 に足す分（#939）。
+     * 作る前に RAM に数えるホストの関数（`kibi.gc_alloc`）を呼ぶので、その呼び出しの重さを見込む。`struct.new` はさらにフィールドの数、
+     * `array.new_fixed` は要素の数を足す
+     */
+    const val GC_ALLOCATION: Long = 4
+
+    /**
+     * `array.new`・`array.new_default`・`array.new_data`・`array.fill`・`array.copy`・`array.init_data`: 要素の数を右にこれだけずらした分（1 要素で 1。#939）。
+     * Endive は要素を `long`（8 バイト）で持つので、`memory.fill` の 8 バイトで 1 と合う
+     */
+    const val ARRAY_ELEMENTS_SHIFT: Int = 0
+
+    /**
+     * `array.new_elem`・`array.init_elem`: 要素の数を左にこれだけずらした分（1 要素で 4。#939）。Endive は要素ごとに要素セグメントの式を
+     * 評価し直す（スタックと結果のオブジェクトを作る）ので、ほかの配列の命令より重くする
+     */
+    const val ARRAY_ELEM_ITEMS_SHIFT: Int = -2
+
+    /**
      * 待機点への変換（#329）が足したコードの見込み（#389。ADR 0329 の「#389: 変換が足すコードの見込み」）。
      * 変換は、止まりうる関数（変換した関数）のセグメントの課金を、[ASYNCIFY_NUMERATOR] / [ASYNCIFY_DENOMINATOR] 倍（切り上げ）にする。
      * 変換したモジュールは、同じ燃料でも CPU 時間が長い（足したコードと、JVM のコンパイルの効きの差）ので、燃料で tick あたりの CPU を抑える前提をそろえる。
@@ -109,11 +128,16 @@ internal class AsyncifyFuelWeight(val numerator: Long, val denominator: Long) {
  * 呼び出しから戻った後にグローバルから読み直す。ホストの関数（システムコール）は、呼ばれている間にグローバルを読み書きして燃料を課せる。
  * ただし `try_table` を含む関数は、ローカルに写さずグローバルを直接読み書きする（理由は ADR 0028）。
  *
- * import の関数を1つ足すので、定義済みの関数の番号が1つずれる。`call`・`return_call`・`ref.func`、
+ * GC のオブジェクト（struct・array）を作る命令（と、オブジェクトを作る式の要素セグメントを使う `table.init`・`array.init_elem`）があれば、
+ * import の関数 [WasmFuel.IMPORT_MODULE].[WasmFuel.GC_ALLOC_NAME]（型は燃料と同じ）も足し、作る命令の前にそのバイト数（[GcPlan]）で呼ぶ。
+ * ホストはそこで RAM に数え、数えられなければトラップで止める（#939。ADR 0048 の「GC のオブジェクト」）。
+ *
+ * import の関数を1つ（GC の確保の import も足すなら2つ）足すので、定義済みの関数の番号がその数だけずれる。`call`・`return_call`・`ref.func`、
  * export、start、要素セグメント、グローバルの初期値の番号を付け替える。名前のカスタムセクションは捨てる。
  *
  * 断るもの（[WasmLoadException]）: WASM として読めない、すでに [WasmFuel] の名前を import・export している
- * （プレイヤーが燃料を自分で書き換えられてしまう）、グローバルを import している、初期値の式を持つテーブル。
+ * （プレイヤーが燃料・RAM の勘定を自分で書き換えられてしまう）、グローバルを import している、初期値の式を持つテーブル、
+ * 作る GC のオブジェクトの大きさを読み込みのときに決められない定数式（[GcCosts.estimate]）。
  */
 internal object FuelInjector {
     /**
@@ -128,8 +152,9 @@ internal object FuelInjector {
      * @property sizesBefore 定義済みの関数ごとの、挿入の前の本体の大きさ（バイト）
      * @property sizesAfter 同じく挿入の後
      * @property fuelFunc 足した [WasmFuel.IMPORT_NAME] の import の関数の番号（元の関数の import の数）。
-     *   これ以上の番号の定義済みの関数は、元のモジュールより1つ大きい
+     *   これ以上の番号の定義済みの関数は、元のモジュールより [addedFuncs] だけ大きい
      * @property sites 挿入した課金の位置（#389。待機点への変換に渡す）
+     * @property gcFunc 足した [WasmFuel.GC_ALLOC_NAME] の import の関数の番号（[fuelFunc] + 1。#939）。GC のオブジェクトを作る命令がなく、足さなかったら -1
      */
     class Result(
         val bytes: ByteArray,
@@ -140,12 +165,16 @@ internal object FuelInjector {
         val sizesAfter: IntArray,
         val fuelFunc: Int,
         val sites: FuelSites,
+        val gcFunc: Int = -1,
     ) {
+        /** 足した import の関数の数（燃料の 1 つと、あれば GC の確保の 1 つ） */
+        val addedFuncs: Int get() = if (gcFunc >= 0) 2 else 1
+
         /** 挿入した後の関数の番号 [index] を、元のモジュールの番号に戻す（足した import そのものは -1） */
         fun originalFunc(index: Int): Int = when {
             index < fuelFunc -> index
-            index == fuelFunc -> -1
-            else -> index - 1
+            index < fuelFunc + addedFuncs -> -1
+            else -> index - addedFuncs
         }
     }
 
@@ -182,6 +211,9 @@ internal object FuelInjector {
             if (imp.module() == WasmFuel.IMPORT_MODULE && imp.name() == WasmFuel.IMPORT_GLOBAL) {
                 throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.IMPORT_GLOBAL} は予約された import")
             }
+            if (imp.module() == WasmFuel.IMPORT_MODULE && imp.name() == WasmFuel.GC_ALLOC_NAME) {
+                throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.GC_ALLOC_NAME} は予約された import")
+            }
         }
         val exportSection = module.exportSection()
         for (i in 0 until exportSection.exportCount()) {
@@ -195,9 +227,13 @@ internal object FuelInjector {
         val definedGlobals = module.globalSection().globalCount()
         val newTypeIdx = module.typeSection().subTypeCount()
         val fuelFunc = importedFuncs
+        // GC のオブジェクトを作る命令（と、オブジェクトを作る式の要素セグメントを使う命令）があれば、作る前に RAM に数える import を足す（#939）
+        val gc = GcPlan(module)
+        val gcFunc = if (gc.needed) fuelFunc + 1 else -1
+        val addedFuncs = if (gc.needed) 2L else 1L
         // 共有するなら、グローバルの import の最後に足す（定義済みのグローバルが1つずれる）。しないなら、定義済みの最後に足す
         val fuelGlobal = if (shared) importedGlobals else importedGlobals + definedGlobals
-        val remap = { idx: Long -> if (idx >= fuelFunc) idx + 1 else idx }
+        val remap = { idx: Long -> if (idx >= fuelFunc) idx + addedFuncs else idx }
         val globalRemap = if (shared) { idx: Long -> if (idx >= importedGlobals) idx + 1 else idx } else { idx: Long -> idx }
 
         var checks = 0
@@ -226,11 +262,12 @@ internal object FuelInjector {
                 // 共有するなら、残りのグローバルは import するので、グローバルのセクションは作らない
                 if (missing == SEC_GLOBAL && shared) continue
                 val body = Sink()
-                body.leb(if (missing == SEC_IMPORT && shared) 2 else 1)
+                body.leb(if (missing == SEC_IMPORT) 1L + (if (gc.needed) 1 else 0) + (if (shared) 1 else 0) else 1L)
                 when (missing) {
                     SEC_TYPE -> body.fuelType()
                     SEC_IMPORT -> {
                         body.fuelImport(newTypeIdx)
+                        if (gc.needed) body.gcImport(newTypeIdx)
                         if (shared) body.fuelGlobalImport()
                     }
                     SEC_GLOBAL -> body.fuelGlobal()
@@ -259,9 +296,10 @@ internal object FuelInjector {
                 SEC_IMPORT -> {
                     val n = r.leb()
                     val body = Sink()
-                    body.leb(n + if (shared) 2 else 1)
+                    body.leb(n + 1 + (if (gc.needed) 1 else 0) + (if (shared) 1 else 0))
                     body.bytes(wasm, r.pos, s.end - r.pos)
                     body.fuelImport(newTypeIdx)
+                    if (gc.needed) body.gcImport(newTypeIdx)
                     if (shared) body.fuelGlobalImport()
                     emit(s.id, body)
                 }
@@ -323,7 +361,7 @@ internal object FuelInjector {
                         val bodyEnd = bodyStart + size
                         val fb = module.codeSection().getFunctionBody(i)
                         val params = module.functionSection().getFunctionType(i, module.typeSection()).params().size
-                        val ctx = BodyContext(fuelFunc, fuelGlobal, remap, params + fb.localTypes().size, if (shared) globalRemap else null)
+                        val ctx = BodyContext(fuelFunc, fuelGlobal, remap, params + fb.localTypes().size, if (shared) globalRemap else null, gcFunc, gc)
                         val fn = Sink()
                         val stats = rewriteBody(wasm, bodyStart, bodyEnd, fb.instructions(), ctx, fn)
                         checks += stats.checks
@@ -343,7 +381,7 @@ internal object FuelInjector {
             }
         }
         insertMissingBefore(Int.MAX_VALUE)
-        return Result(out.toByteArray(), checks, charges, maxUnchecked, sizesBefore, sizesAfter, fuelFunc, FuelSites(chargeSites))
+        return Result(out.toByteArray(), checks, charges, maxUnchecked, sizesBefore, sizesAfter, fuelFunc, FuelSites(chargeSites), gcFunc)
     }
 
     private class BodyStats(val checks: Int, val charges: Int, val maxUnchecked: Long, val chargeSites: IntArray)
@@ -367,7 +405,8 @@ internal object FuelInjector {
 
     /**
      * 長さに比例する命令と、長さを燃料にする変換（正なら右シフト、負なら左シフトの量）。
-     * どれもスタックの一番上が長さ（i32）で、命令の前に引く。Endive は memory64・table64 に対応していないので、i32 だけを扱う
+     * どれもスタックの一番上が長さ（i32）で、命令の前に引く。Endive は memory64・table64 に対応していないので、i32 だけを扱う。
+     * GC の配列の命令（#939）も、どれもスタックの一番上が長さ（`array.new*` は要素の数、`array.fill`・`array.copy`・`array.init_*` は書く要素の数）
      */
     private val BULK: Map<OpCode, Int> = mapOf(
         OpCode.MEMORY_COPY to FuelCosts.MEMORY_BYTES_SHIFT,
@@ -376,6 +415,15 @@ internal object FuelInjector {
         OpCode.TABLE_COPY to FuelCosts.TABLE_ELEMENTS_SHIFT,
         OpCode.TABLE_FILL to FuelCosts.TABLE_ELEMENTS_SHIFT,
         OpCode.TABLE_INIT to FuelCosts.TABLE_ELEMENTS_SHIFT,
+        // GC の配列（#939）。Endive は要素の数だけ回る
+        OpCode.ARRAY_NEW to FuelCosts.ARRAY_ELEMENTS_SHIFT,
+        OpCode.ARRAY_NEW_DEFAULT to FuelCosts.ARRAY_ELEMENTS_SHIFT,
+        OpCode.ARRAY_NEW_DATA to FuelCosts.ARRAY_ELEMENTS_SHIFT,
+        OpCode.ARRAY_FILL to FuelCosts.ARRAY_ELEMENTS_SHIFT,
+        OpCode.ARRAY_COPY to FuelCosts.ARRAY_ELEMENTS_SHIFT,
+        OpCode.ARRAY_INIT_DATA to FuelCosts.ARRAY_ELEMENTS_SHIFT,
+        OpCode.ARRAY_NEW_ELEM to FuelCosts.ARRAY_ELEM_ITEMS_SHIFT,
+        OpCode.ARRAY_INIT_ELEM to FuelCosts.ARRAY_ELEM_ITEMS_SHIFT,
     )
 
     /**
@@ -395,6 +443,10 @@ internal object FuelInjector {
         val firstNewLocal: Int,
         /** グローバルの番号の付け替え（燃料を共有するとき。#263）。付け替えないなら `null` */
         val globalRemap: ((Long) -> Long)?,
+        /** 足した [WasmFuel.GC_ALLOC_NAME] の import の関数の番号（#939）。足さなかったら -1 */
+        val gcFunc: Int,
+        /** GC のオブジェクトの見積もり（#939） */
+        val gc: GcPlan,
     ) {
         /** 残りをローカルに写すか（`try_table` を含まない関数） */
         var cached: Boolean = false
@@ -456,7 +508,7 @@ internal object FuelInjector {
                 var j = i
                 var cost = 0L
                 while (true) {
-                    cost += FuelCosts.INSTRUCTION
+                    cost += FuelCosts.INSTRUCTION + ctx.gc.staticFuel(instructions[j])
                     if (j == n - 1 || segStart[j + 1]) break
                     j++
                 }
@@ -471,7 +523,13 @@ internal object FuelInjector {
                 maxUnchecked = maxOf(maxUnchecked, sinceCheck)
             }
 
-            BULK[op]?.let { shift -> out.chargeLength(ctx, shift) }
+            BULK[op]?.let { shift ->
+                // 長さを控えてから、GC のオブジェクトの RAM（#939）→ 燃料 → 元の命令の順。RAM で断ったら燃料は引かない
+                out.saveLength(ctx)
+                ctx.gc.dynamicBytes(ins)?.let { (perElement, fixed) -> out.gcAllocDynamic(ctx, perElement, fixed) }
+                out.chargeSaved(ctx, shift)
+            }
+            ctx.gc.staticBytes(ins)?.let { bytes -> out.gcAllocStatic(ctx, bytes) }
             if (op in GROW) out.saveSize(ctx, op, ins.operand(0))
 
             val leaves = when (op) {
@@ -716,11 +774,52 @@ internal object FuelInjector {
         return at
     }
 
-    /** スタックの一番上の長さ（i32。そのまま残す）を [shift] で燃料にして引く（[chargeSaved]） */
-    private fun Sink.chargeLength(ctx: BodyContext, shift: Int) {
+    /** スタックの一番上の長さ（i32。そのまま残す）を、長さのローカルに控える（[chargeSaved]・[gcAllocDynamic] が読む） */
+    private fun Sink.saveLength(ctx: BodyContext) {
         u8(0x22) // local.tee
         leb(ctx.lengthLocal.toLong())
-        chargeSaved(ctx, shift)
+    }
+
+    /**
+     * 控えた長さ `len`（i32、符号なし）の GC のオブジェクトを、作る前に RAM に数える（#939）: `kibi.gc_alloc(u64(len) * perElement + fixed)`。
+     * [perElement] は [GcPlan.MAX_PER_ELEMENT] 以下なので、i64 で桁あふれしない。数えられなければ、ホストがトラップで止める
+     */
+    private fun Sink.gcAllocDynamic(ctx: BodyContext, perElement: Long, fixed: Long) {
+        u8(0x20) // local.get
+        leb(ctx.lengthLocal.toLong())
+        u8(0xAD) // i64.extend_i32_u
+        u8(0x42)
+        sleb(perElement)
+        u8(0x7E) // i64.mul
+        if (fixed != 0L) {
+            u8(0x42)
+            sleb(fixed)
+            u8(0x7C) // i64.add
+        }
+        gcCall(ctx)
+    }
+
+    /** 大きさが命令だけで決まる GC のオブジェクト（[bytes] バイト）を、作る前に RAM に数える（#939） */
+    private fun Sink.gcAllocStatic(ctx: BodyContext, bytes: Long) {
+        u8(0x42)
+        sleb(bytes)
+        gcCall(ctx)
+    }
+
+    /** スタックの一番上のバイト数（i64）で `kibi.gc_alloc` を呼び、戻り値を捨てる。燃料の残りは読み書きしないホストの関数なので、書き戻さない */
+    private fun Sink.gcCall(ctx: BodyContext) {
+        check(ctx.gcFunc >= 0) { "GC の確保の import を足していない" }
+        u8(0x10) // call
+        leb(ctx.gcFunc.toLong())
+        u8(0x1A) // drop
+    }
+
+    /** `(import "kibi" "gc_alloc" (func (type fuel)))`（#939） */
+    private fun Sink.gcImport(typeIdx: Int) {
+        name(WasmFuel.IMPORT_MODULE)
+        name(WasmFuel.GC_ALLOC_NAME)
+        u8(0x00)
+        leb(typeIdx.toLong())
     }
 
     /** `memory.size`・`table.size` で、[op] が増やすメモリ・テーブル [index] の今の大きさを積む */

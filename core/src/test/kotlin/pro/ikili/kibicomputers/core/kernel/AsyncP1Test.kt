@@ -549,6 +549,45 @@ class AsyncP1Test {
         killedOnlyInCopy(gcGlobalCommand)
     }
 
+    @Test
+    fun `RAMの上限を超えるGCの配列を作るコマンドは、作る前にout_of_memoryで止まる`() = timeout(limit) {
+        // #939: exec の経路（挿入 → 変換 → コンパイルあり）で、array.new_default の長さを RAM に数える
+        val command = pro.ikili.kibicomputers.core.wasi.kibi.WitTool.wat(
+            """
+            (module
+              (type ${'$'}a (array (mut i8)))
+              (import "wasi_snapshot_preview1" "proc_exit" (func ${'$'}exit (param i32)))
+              (memory (export "memory") 1)
+              (func (export "_start")
+                (call ${'$'}exit (array.len (array.new_default ${'$'}a (i32.const 0x7fffffff))))))
+            """.trimIndent(),
+        )
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val console = StringBuffer()
+            val host = object : MachineHost {
+                override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {}
+
+                override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
+                    console.append(String(bytes, Charsets.UTF_8))
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000, host = host)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            val f = m.vfs.open(VfsPath.parse("/cmd"), OpenOptions(read = true, write = true, create = true, truncate = true))
+            m.vfs.write(f, command, 0, command.size)
+            val pid = m.exec("/cmd", KernelDrivers.DEFAULT, SpawnOptions())
+            eventually(30_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            assertEquals(ProcessState.CRASHED, m.stateOf(pid))
+            eventually(30_000, "コンソールに理由が出ない") {
+                h.scheduler.tick()
+                console.toString().contains("crashed: out of memory (RAM limit")
+            }
+        }
+    }
+
     /** [command] を `exec` で待機点型として動かし、入力を待つ間の保存の写しの中でだけ殺され、元のプロセスは 7 で終わること */
     private fun killedOnlyInCopy(command: ByteArray) {
         val program = Program.loadMetered(EndiveRuntime(), command, null, WasiP1.WAIT_IMPORTS)

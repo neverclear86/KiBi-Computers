@@ -54,7 +54,7 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
      */
     internal val maxTableElements: Int = builder.maxTableElements
 
-    /** テーブルの確保を数える相手（#361）。`null` なら数えない */
+    /** テーブルの確保を数える相手（#361）。GC のオブジェクト（struct・array）の確保もここで数える（#939）。`null` なら数えない */
     internal val tableBudget: WasmTableBudget? = builder.tableBudget
 
     /**

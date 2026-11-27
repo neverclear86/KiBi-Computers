@@ -15,7 +15,7 @@
 
 | 段 | 持ち主 | 上限 | 数えるもの |
 | --- | --- | --- | --- |
-| プロセス | `ProcessMemory`（プロセスのすべてのインスタンスで共有） | `MachineConfig.maxProcessMemoryBytes`（既定は RAM と同じ） | 線形メモリ（初めて書き込んだ 4 KiB の区画。#407）、テーブルの要素（#361） |
+| プロセス | `ProcessMemory`（プロセスのすべてのインスタンスで共有） | `MachineConfig.maxProcessMemoryBytes`（既定は RAM と同じ） | 線形メモリ（初めて書き込んだ 4 KiB の区画。#407）、テーブルの要素（#361）、GC のオブジェクト（struct・array。#939。下の「GC のオブジェクト」） |
 | マシン（RAM） | `Machine.memoryAccount`（`MemoryAccount`） | `MachineConfig.memoryBytes`（RAM のパーツの合計。仮の値。#251） | マシンのすべてのプロセスの分と、`/tmp` の中身（ADR 0053） |
 | サーバー全体 | `MachineScheduler.memoryAccount`（`MemoryAccount`） | `SchedulerConfig.totalMemoryBytes`（既定はヒープの最大値の半分。仮。#251） | すべてのマシンの分 |
 
@@ -31,8 +31,9 @@
 | `memory.grow` | -1（増やした範囲の端の区画を数えられないとき） | その後に異常終了したら `(memory.grow was refused: out of memory, RAM limit 128 KiB)` を添える |
 | `kibi:memory` の `commit` | false | 同上（`kibi:memory commit was refused`） |
 | `table.grow` | -1 | 添えない（下の「決めないこと」） |
+| GC のオブジェクトを作る命令（`struct.new*`・`array.new*`。#939） | 作る前にトラップ（`OUT_OF_MEMORY`） | `crashed: out of memory (RAM limit 128 KiB)` |
 | `/tmp` への書き込み | `NOSPC`（書けた分があれば短い書き込み） | なし |
-| プロセスの生成（最初のインスタンス。テーブルの最初の要素など） | 子が `CRASHED` | `crashed: cannot instantiate module (out of memory, RAM limit 128 KiB)` |
+| プロセスの生成（最初のインスタンス。テーブルの最初の要素、定数式が作る GC のオブジェクトなど） | 子が `CRASHED` | `crashed: cannot instantiate module (out of memory, RAM limit 128 KiB)` |
 | 実行中に作る 2 つ目以降のインスタンス（`ProcessContext.instantiate`） | `WasmLinkException`（ABI 層が扱える） | そのまま異常終了したら、生成と同じ文 |
 
 - `RAM limit` に書くのは、プロセスが数えられる上限（プロセスの上限とマシンの RAM のうち小さい方）
@@ -42,6 +43,21 @@
   - `memory.grow`・`commit` の注記は、異常終了したときに後から書くので、`lastRefusal` を読むと後の別の確保（注記を付けない `table.grow` など）で上書きされた段になる。そこで、grow・commit を断った直後に、そのときの `lastRefusal` を `ProcessRuntime.memoryGrowRefusal`・`memoryCommitRefusal` に写し、注記はそれぞれの段で書く
   - grow と commit を違う段で断ったときは、別々に書く（例: `memory.grow was refused: out of memory, server memory limit reached; kibi:memory commit was refused: out of memory, RAM limit 128 KiB`）。同じ段なら、これまでどおり 1 つにまとめる
 - `kibi:memory` の `remaining` は、プロセスの上限とマシンの RAM のうち小さい方の残りで、サーバー全体は入れない（#408 のまま）。`commit` の `keep` もサーバー全体にはかけない
+
+## GC のオブジェクト（#939）
+
+GC の提案の struct・array（#891 で p1 の製品の経路で動くようになった）は、Endive が JVM のヒープに `long[]`（参照の値ならさらに `Object[]`）で作り、線形メモリ・テーブルの包みを通らない。そこで、作る前にバイト数を見積もってプロセスの勘定（`ProcessMemory`。テーブルと同じ `WasmInstanceConfig.tableBudget`）に数え、断られたら Endive に作らせずにトラップで止める（失敗した確保は数えない。#335 と同じ）。
+
+- **数える口**: 燃料の計測コードの挿入（`FuelInjector`。ADR 0028）が、オブジェクトを作る命令の前に、隠した import `kibi.gc_alloc(i64 バイト数)` の呼び出しを足す（作る命令を持つモジュールにだけ足す。型は燃料の `kibi.fuel` と同じ `(i64) -> (i64)` で、戻り値は捨てる）。ホスト（`EndiveRuntime` の `GcAllocations`）が `ProcessMemory.tryReserveBytes` で数える（入口のスタックの確かめもそこで通る）。数えられなければ `WasmTrapKind.OUT_OF_MEMORY` のトラップで、コンソールの文は線形メモリへの書き込みと同じ。プレイヤーのプログラムは `kibi.gc_alloc` を import できない（挿入が予約名として断る）ので、負の値で勘定を減らすことはできない（ホストも負の値を断る）
+- **見積もり（`GcCosts`。仮の値で、確定は #251）**: JVM の大きさで数える（WASM の大きさで数えると、i8 の配列を 8 倍少なく数える）。オブジェクト 1 つに 64 バイト（包みと配列 2 本のヘッダー）、関数の本体で作る配列の要素は参照なら 16、ほかは 8、struct のフィールドは 16、定数式で作る配列の要素は 16（Endive が両方の配列を作る）。長さは i32 を符号なしで読む（2^31 以上は必ず上限を超えるので、Endive に負の長さが届かない）
+  - 長さで決まるもの（`array.new`・`array.new_default`・`array.new_data`・`array.new_elem`）は「要素 1 つ × 長さ + 64」を実行時に計算して渡し、命令だけで決まるもの（`struct.new`・`struct.new_default`・`array.new_fixed`）は定数を渡す
+  - 要素セグメントの式が作るオブジェクト（パッシブの要素は、`table.init`・`array.new_elem`・`array.init_elem` で使うたびに評価し直される）は、セグメントごとの項目 1 つの最大 × 使う数を、その命令の前に数える
+  - インスタンスを作るときに評価する定数式（グローバルの初期値、アクティブの要素の式）の分は、読み込みのときに合計を出し（`ProgramCache` が共有する）、Endive にインスタンスを作らせる前に数える。断られたら `cannot instantiate module (out of memory, ...)`（作りかけの分は返す）。配列の長さを読み込みのときに決められない定数式（import したグローバルから読むなど）は、読み込みで断る
+- **返すのは、インスタンスを閉じたとき**（作るのに失敗したときも）。オブジェクトが GC で要らなくなっても返さない（上の「解放しても減らさない（最高値）」と同じ）。GC のオブジェクトは状態の保存をまたがない（#891。`captureState` が断る）ので、作り直したインスタンスは 0 から数え直しても正しい
+  - **制約**: 一時的なオブジェクトを作り続けるプログラム（GC のある言語の多く）は、生きている量が小さくても、累計で RAM の上限に届いて止まる。生きている量で数え直す方式は別の Issue（#1002）にした
+  - `Cleaner`・`PhantomReference` でオブジェクトの解放を追う形は採らなかった。参照の処理が全台の GC の停止に乗って TPS に響き、勘定もサーバーの GC の時機で変わって決まらなくなるため
+- **1,000 台規模の負荷**: 確保のたびに 3 段の CAS を回さないよう、インスタンスごとにホストの側で 64 KiB ずつ前借りし（`WasmTableBudget.tryPrefetchBytes`。断られても `lastRefusal` を書かない）、前借りできなければ要る分だけを数える。前借りの残りはプロセスの勘定に入る（`kibi:memory` の `remaining` から見ると、インスタンスごとに最大 64 KiB 早く減る）。WASM のグローバルには置かない（状態の保存が可変のグローバルを写すので、戻したときに勘定と食い違う）。tick ごとの処理と、待っているだけの台のコストは増えない
+- 閉じた後の確保は数えない（kill などで `close()` と確保が別のスレッドで重なっても、二度と返らない分を作らない。`BudgetedTable` と同じ）
 
 ## プロセスの生成が RAM で失敗したとき
 
