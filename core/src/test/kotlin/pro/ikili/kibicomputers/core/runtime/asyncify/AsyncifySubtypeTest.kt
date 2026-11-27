@@ -233,4 +233,99 @@ class AsyncifySubtypeTest {
         )
         assertEquals(emptySet<String>(), exports(numeric, emptySet(), untyped))
     }
+
+    /**
+     * 外の型の照合を引く、`export "t"` の表への `call_indirect` を 1 つだけ持つモジュール。型 0 は struct、型 1 が呼び出しの型。
+     * [params]・[results] は呼び出しの型の `param`・`result` の節、[args] は呼ぶ前に積む値
+     */
+    private fun callerModule(params: String, results: String, args: String): ByteArray = WitTool.wat(
+        """
+        (module
+          (type (struct))
+          (type (func $params $results))
+          (table (export "t") 1 funcref)
+          (func (export "run") $results
+            $args
+            (call_indirect (type 1) (i32.const 0))))
+        """.trimIndent(),
+    )
+
+    private fun sigs(params: List<Int>, results: List<Int>) = setOf(Asyncify.Signature(params, results))
+
+    /**
+     * 呼び出し側の型が追えない参照型（型付きの参照 `(ref null $t)`・`(ref $t)`。内部では `BOT`）を含むときは、外の型のどの参照の位置にも
+     * 合いうるとみなす。数値の位置と、引数・結果の数は、追えない側でも合わせる
+     */
+    @Test
+    fun `呼び出し側の型が追えない参照型を含むとき、外の型は参照の位置にだけ合いうる`() {
+        val nullable = callerModule("(param (ref null 0))", "(result i32)", "(ref.null 0)")
+        val nonNull = callerModule("(param (ref 0))", "(result i32)", "(struct.new 0)")
+        for ((name, wasm) in listOf("nullable" to nullable, "nonNull" to nonNull)) {
+            // 外の型の参照の位置は、どの階層でも合いうる
+            for (ref in listOf(0x6E, 0x6D, 0x70, 0x6F, 0x69)) {
+                assertEquals(setOf("run"), exports(wasm, emptySet(), sigs(listOf(ref), listOf(0x7F))), "$name $ref")
+            }
+            // 外の型の側が追えない参照型でも合う
+            assertEquals(setOf("run"), exports(wasm, emptySet(), sigs(listOf(-1), listOf(0x7F))), "$name wild")
+            // 数値の位置には合わない（引数も結果も）。結果の位置の参照は、呼び出しの結果（i32）に合わない
+            assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x7F), listOf(0x7F))), "$name numeric param")
+            assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E), listOf(0x7E))), "$name numeric result")
+            assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E), listOf(0x6E))), "$name ref result")
+            // 数の違う外の型には合わない
+            assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E, 0x6E), listOf(0x7F))), "$name more params")
+            assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(emptyList(), listOf(0x7F))), "$name fewer params")
+            assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E), emptyList())), "$name fewer results")
+            assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E), listOf(0x7F, 0x7F))), "$name more results")
+        }
+        // 結果の位置の追えない参照型も、参照の位置にだけ合う
+        val wildResult = callerModule("(param i32)", "(result (ref null 0))", "(i32.const 1)")
+        assertEquals(setOf("run"), exports(wildResult, emptySet(), sigs(listOf(0x7F), listOf(0x70))))
+        assertEquals(emptySet<String>(), exports(wildResult, emptySet(), sigs(listOf(0x7F), listOf(0x7F))))
+        // 追えない位置のほかで、数値の位置が違えば合わない
+        val mixed = callerModule("(param i32 (ref null 0))", "(result i32)", "(i32.const 1) (ref.null 0)")
+        assertEquals(setOf("run"), exports(mixed, emptySet(), sigs(listOf(0x7F, 0x6F), listOf(0x7F))))
+        assertEquals(emptySet<String>(), exports(mixed, emptySet(), sigs(listOf(0x7E, 0x6F), listOf(0x7F))))
+    }
+
+    /** 結果の位置も、引数と同じように階層で照合する（引数だけを見ていない）。exn の階層（exn・noexn）も同じ */
+    @Test
+    fun `外の型は、結果と exn の階層も階層で照合する`() {
+        fun result(type: String) = WitTool.wat(
+            """
+            (module
+              (type (func (result $type)))
+              (table (export "t") 1 funcref)
+              (func (export "run") (result $type)
+                (call_indirect (type 0) (i32.const 0))))
+            """.trimIndent(),
+        )
+        fun matches(wasm: ByteArray, r: Int) = exports(wasm, emptySet(), sigs(emptyList(), listOf(r)))
+        // 呼び出しの結果が anyref。外の結果が any の階層（any・eq・i31・none）なら合い、ほかの階層・数値なら合わない
+        val anyResult = result("anyref")
+        for (r in listOf(0x6E, 0x6D, 0x6C, 0x71)) assertEquals(setOf("run"), matches(anyResult, r), "any $r")
+        for (r in listOf(0x70, 0x6F, 0x69, 0x7F)) assertEquals(emptySet<String>(), matches(anyResult, r), "any $r")
+        // exn の階層は exn・noexn の 2 つで、ほかの階層には合わない
+        val exnResult = result("exnref")
+        for (r in listOf(0x69, 0x74)) assertEquals(setOf("run"), matches(exnResult, r), "exn $r")
+        for (r in listOf(0x6E, 0x70, 0x6F, 0x7F)) assertEquals(emptySet<String>(), matches(exnResult, r), "exn $r")
+        // extern・func の階層（noextern・nofunc を含む）
+        for (r in listOf(0x6F, 0x72)) assertEquals(setOf("run"), matches(result("externref"), r), "extern $r")
+        for (r in listOf(0x70, 0x73)) assertEquals(setOf("run"), matches(result("funcref"), r), "func $r")
+        // 引数の位置の exn の階層
+        val exnParam = callerModule("(param exnref)", "(result i32)", "(ref.null exn)")
+        assertEquals(setOf("run"), exports(exnParam, emptySet(), sigs(listOf(0x74), listOf(0x7F))))
+        assertEquals(emptySet<String>(), exports(exnParam, emptySet(), sigs(listOf(0x6E), listOf(0x7F))))
+    }
+
+    /** 外の型と引数・結果の数が違えば、追える型でも合わない */
+    @Test
+    fun `外の型は、引数や結果の数や数値の位置が違えば合わない`() {
+        val wasm = callerModule("(param anyref)", "(result i32)", "(ref.null any)")
+        assertEquals(setOf("run"), exports(wasm, emptySet(), sigs(listOf(0x6E), listOf(0x7F))))
+        assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E, 0x6E), listOf(0x7F))))
+        assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(emptyList(), listOf(0x7F))))
+        assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E), emptyList())))
+        assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E), listOf(0x7F, 0x7F))))
+        assertEquals(emptySet<String>(), exports(wasm, emptySet(), sigs(listOf(0x6E), listOf(0x7E))))
+    }
 }
