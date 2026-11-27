@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
+import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.Collections
@@ -106,7 +107,7 @@ class TestComputerTest {
             assertEquals(0, keyboard.input(KeyboardEvent.Text("x")))
             case.turnOff()
         } finally {
-            assertTrue(manager.shutdown(10_000))
+            assertTrue(manager.shutdownInCleanup())
         }
     }
 
@@ -128,7 +129,7 @@ class TestComputerTest {
                 assertEquals(listOf(BootFailure.NO_BOOT_DISK), failures.toList(), disk)
             }
         } finally {
-            assertTrue(manager.shutdown(10_000))
+            assertTrue(manager.shutdownInCleanup())
         }
     }
 }

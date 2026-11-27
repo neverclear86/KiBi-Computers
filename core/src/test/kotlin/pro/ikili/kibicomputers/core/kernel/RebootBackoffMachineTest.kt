@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 再起動を繰り返すマシンの、起動し直すまでの待ち（#635、ADR 0635）。tick は手で進める */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class RebootBackoffMachineTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -64,7 +66,7 @@ class RebootBackoffMachineTest {
                 posted.countDown()
             }
             assertTrue(m.reboot())
-            assertTrue(posted.await(10, TimeUnit.SECONDS), "再起動の求めを積まない")
+            posted.awaitOrFail("再起動の求めを積まない")
         }
 
         /** [Machine.reboot] を求め、待ちに入るまで進める。待ちの期限の tick を返す */
@@ -174,11 +176,12 @@ class RebootBackoffMachineTest {
         h.scheduler.hooks.beforeInitExec = { _ ->
             h.scheduler.hooks.beforeInitExec = null
             reached.countDown()
-            release.await(10, TimeUnit.SECONDS)
+            release.await()
         }
+        h.releaseOnClose { release.countDown() }
         assertTrue(m.boot(config))
         try {
-            assertTrue(reached.await(5, TimeUnit.SECONDS), "起動の途中で止まらない")
+            reached.awaitOrFail("起動の途中で止まらない")
             assertTrue(m.isBooting)
             assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
             assertTrue(m.isSettlingForSave, "起動の途中は待てば解ける")
@@ -200,7 +203,7 @@ class RebootBackoffMachineTest {
         }
         try {
             assertTrue(m.reboot())
-            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            atGate.awaitOrFail("init のスレッドが登録を外す前に来ない")
             assertTrue(m.isRebootPending)
             assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
             assertTrue(m.isSettlingForSave, "止まり切る前は待てば解ける")
@@ -233,7 +236,7 @@ class RebootBackoffMachineTest {
         }
         try {
             assertTrue(m.reboot())
-            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            atGate.awaitOrFail("init のスレッドが登録を外す前に来ない")
             assertTrue(m.isSettlingForSave, "止まり切る前は待てば解ける")
             m.lock.withLockValue { m.inconsistencyLocked("テスト") }
             assertEquals(MachineState.CRASHED, m.state)
@@ -384,10 +387,11 @@ class RebootBackoffMachineTest {
         h.scheduler.hooks.beforeInitExec = { _ ->
             h.scheduler.hooks.beforeInitExec = null
             reached.countDown()
-            release.await(10, TimeUnit.SECONDS)
+            release.await()
         }
+        h.releaseOnClose { release.countDown() }
         assertTrue(m.boot(config))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         repeat(500) { h.scheduler.tick() }
         assertTrue(m.isBooting)
         assertEquals(-1L, m.initStartedTick)
@@ -398,7 +402,7 @@ class RebootBackoffMachineTest {
         }
         assertTrue(m.reboot())
         release.countDown()
-        assertTrue(posted.await(10, TimeUnit.SECONDS), "再起動の求めを積まない")
+        posted.awaitOrFail("再起動の求めを積まない")
         assertEquals(3 * backoff.decayTicks, m.rebootDebt, "動いた時間は 0: 借りは減らず、1回分増える")
         assertTrue(m.deferredRebootDueTick != 0L, "3 段目なので待つ")
     }

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
@@ -50,6 +51,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 保存と復元を別々のスケジューラ（別々の `ProgramCache`）で行い、復元する側ではモジュールを読み込み直させる。
  * 読み込み用のスレッド（1本）は、別の持ち主の読み込みをゲートで止めて塞ぐ
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class RestoreModuleWaitTest {
     @TempDir
     lateinit var dir: Path
@@ -156,7 +158,7 @@ class RestoreModuleWaitTest {
             gate.await()
             throw WasmLoadException("held")
         }
-        assertTrue(started.await(10, TimeUnit.SECONDS), "読み込み用のスレッドを塞げない")
+        started.awaitOrFail("読み込み用のスレッドを塞げない")
     }
 
     /** 戻すマシンの根（`disk:root`）を新しいディスクで開き、`d` は [init] を置いたディスクにする */
@@ -252,7 +254,7 @@ class RestoreModuleWaitTest {
                         throw WasmLoadException("held")
                     }
                 }
-                assertTrue(started.await(10, TimeUnit.SECONDS))
+                started.awaitOrFail()
                 assertEquals(max, programs.pendingOf(m.id))
 
                 val finished = Finished()
@@ -301,7 +303,7 @@ class RestoreModuleWaitTest {
                     gate.await()
                     throw WasmLoadException("held")
                 }
-                assertTrue(started.await(10, TimeUnit.SECONDS), "読み込み用のスレッドを塞げない")
+                started.awaitOrFail("読み込み用のスレッドを塞げない")
                 assertEquals(1, programs.pendingOfGroup(group))
 
                 val m = h.machine(fuelPerTick = 10_000_000, environment = MachineEnvironment.builder().fairnessKey(ownerId).build())
@@ -503,7 +505,7 @@ class RestoreModuleWaitTest {
                         throw WasmLoadException("held")
                     }
                 }
-                assertTrue(started.await(10, TimeUnit.SECONDS))
+                started.awaitOrFail()
 
                 val finished = Finished()
                 assertTrue(m.restore(request(saved, store, finished)))
@@ -523,7 +525,7 @@ class RestoreModuleWaitTest {
                     blocker.await()
                 }
                 try {
-                    assertTrue(blockerStarted.await(10, TimeUnit.SECONDS))
+                    blockerStarted.awaitOrFail()
                     eventually(10_000, "やり直しの続きが待ち行列に溜まらない") { h.scheduler.bootExecutor.queue.isNotEmpty() }
                     m.stop()
                     val getsAfterCancel = modules.gets.get()

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
@@ -52,6 +53,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 戻した表では子が KILLED・`SIGKILL` のゾンビで、親に `CHILD_EXITED` が数えてあり、コンソールには受け手（画面をつなぐ）の後に
  * 1行ずつ知らせが出る。init を殺した写しは冷えた起動の前に1行出す
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class KilledOnSaveNoticeTest {
     @TempDir
     lateinit var dir: Path
@@ -282,13 +284,14 @@ class KilledOnSaveNoticeTest {
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(fs, readOnly = false) else null }
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
         }
         val m = h.machine()
         assertTrue(m.boot(BootConfig.builder().addBootDisk("d").build()))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         if (reboot) assertTrue(m.reboot())
         val source = requireNotNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT, null, FullSaveRule(1.0))) { "写しが取れない" }
         val identity = store.write(store.assignNewId(owner)!!, owner, source).identity

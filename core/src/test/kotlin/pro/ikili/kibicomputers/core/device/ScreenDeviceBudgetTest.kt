@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.device
 
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
@@ -14,7 +15,10 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
+import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
@@ -24,6 +28,7 @@ import java.util.concurrent.locks.LockSupport
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 1台・1 tick の、メインスレッドでの端末の処理量（#357・#355）。同梱イメージ testboot（Lua の REPL）で、実際の出力を流す */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ScreenDeviceBudgetTest {
     private val limit = Duration.ofSeconds(90)
     private val testBootDisk = BootConfig.IMAGE_DISK_PREFIX + "testboot"
@@ -58,7 +63,7 @@ class ScreenDeviceBudgetTest {
             block(booted)
             case.turnOff()
         } finally {
-            assertTrue(manager.shutdown(10_000))
+            assertTrue(manager.shutdownInCleanup())
         }
     }
 
@@ -122,7 +127,7 @@ class ScreenDeviceBudgetTest {
             b.machine.scheduler.hooks.beforeConsoleFlush = { _, _ ->
                 if (armed.compareAndSet(true, false)) {
                     reached.countDown()
-                    go.await(30, TimeUnit.SECONDS)
+                    go.await()
                 }
             }
             b.keyboard.input(KeyboardEvent.Paste("while true do io.write((\"\\27[Sx\"):rep(5000)) end\n"))
@@ -162,14 +167,14 @@ class ScreenDeviceBudgetTest {
                 b.console.display.lock.lock()
                 try {
                     holding.countDown()
-                    release.await(30, TimeUnit.SECONDS)
+                    release.await()
                 } finally {
                     b.console.display.lock.unlock()
                 }
             }
             holder.start()
             try {
-                assertTrue(holding.await(10, TimeUnit.SECONDS))
+                holding.awaitOrFail("表示デバイスのロックを持てない")
                 // その間も、Lua は TTY に書き、TTY の印を積む（表示デバイスに書けずに待つ）
                 repeat(20) {
                     val start = System.nanoTime()
@@ -180,7 +185,7 @@ class ScreenDeviceBudgetTest {
                 }
             } finally {
                 release.countDown()
-                holder.join()
+                holder.joinOrFail("表示デバイスのロックを持つスレッドが終わらない") // 割り込まれた後も、期限つきで待って元の失敗を残す（#916）
             }
             // ロックが空けば、書き手が続きを書き、出力は止まらない
             val before = lines(screen)

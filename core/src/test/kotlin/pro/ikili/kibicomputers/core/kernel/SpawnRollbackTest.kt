@@ -290,7 +290,7 @@ internal class SpawnRollbackTest {
         } finally {
             executor.failure = null
             workers.shutdown()
-            workers.awaitTermination(5_000)
+            awaitInCleanup({ "ワーカーが終わらない" }, 5_000) { workers.awaitTermination(it) }
         }
     }
 }

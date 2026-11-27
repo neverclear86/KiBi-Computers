@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
@@ -18,6 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** マシン1台だけを止める口（`Machine.quiesce`）と、保存できるかの判定（`Machine.saveReadiness`）のテスト（#81） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class MachineQuiesceTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -89,12 +91,13 @@ class MachineQuiesceTest {
                 h.program(emptyModule()),
                 TestDriver(ProcessKind.WAIT_POINT, onResume = { _, _ -> StepResult.Exit(0) }) {
                     entered.countDown()
-                    release.await(10, TimeUnit.SECONDS)
+                    release.await()
                     StepResult.Wait(listOf(gate.key))
                 },
             )
+            h.releaseOnClose { release.countDown() }
             h.scheduler.tick()
-            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            entered.awaitOrFail()
             assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
             assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
             val copy = m.captureCopy(CapturePolicy.KILL_TRANSIENT)!!

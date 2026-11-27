@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
@@ -19,6 +20,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /** 実行ファイルの読み込みの待ち行列を、公平の組（持ち主）→ マシンの二段で回し、組ごとの上限をかける（#738） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ProgramCacheFairnessTest {
     private val runtime = EndiveRuntime()
     private val a = FairShareGroup.of(UUID(0, 1))
@@ -44,12 +46,12 @@ class ProgramCacheFairnessTest {
             // 持ち主 a の台 1 が読み込み始めて止まってから、a の台 2〜10 が 1 つずつ、後から b の台が 1 つ。
             // マシンの巡回だけなら b は最後になる
             val first = cache.load(1, a, 1, tracking(1))
-            assertTrue(started.await(10, TimeUnit.SECONDS))
+            started.awaitOrFail()
             val heavy = (2..10).map { cache.load(it.toLong(), a, it, tracking(it)) }
             val light = cache.load(100, b, 100, tracking(100))
             gate.countDown()
-            light.get(10, TimeUnit.SECONDS)
-            (heavy + first).forEach { it.get(10, TimeUnit.SECONDS) }
+            light.getOrFail()
+            (heavy + first).forEach { it.getOrFail() }
             // 組の巡回で、a の 1 件（先に並んだ）の次に b、その後に a の残り（台の順）
             assertEquals(listOf(1, 2, 100, 3, 4, 5, 6, 7, 8, 9, 10), order.toList())
 
@@ -81,7 +83,7 @@ class ProgramCacheFairnessTest {
             assertEquals(1, cache.pendingOfGroup(b))
             assertEquals(3, cache.pendingOfGroup(a))
             gate.countDown()
-            listOf(first, second, boot, other, shared).forEach { it.get(10, TimeUnit.SECONDS) }
+            listOf(first, second, boot, other, shared).forEach { it.getOrFail() }
             assertEquals(0, cache.pendingOfGroup(a))
             assertEquals(0, cache.pendingGroupCount)
         } finally {
@@ -109,8 +111,8 @@ class ProgramCacheFairnessTest {
             assertEquals(2, cache.pendingOfGroup(b))
             assertEquals(1, cache.pendingOf(2))
             gate.countDown()
-            running.get(10, TimeUnit.SECONDS)
-            sharedB.get(10, TimeUnit.SECONDS)
+            running.getOrFail()
+            sharedB.getOrFail()
             assertEquals(listOf(9, 1), started.toList())
             assertEquals(0, cache.pendingGroupCount)
         } finally {
@@ -135,8 +137,8 @@ class ProgramCacheFairnessTest {
             queuedOld.cancel(false)
             assertEquals(1, cache.pendingOfGroup(a))
             gate.countDown()
-            running.get(10, TimeUnit.SECONDS)
-            queuedNew.get(10, TimeUnit.SECONDS)
+            running.getOrFail()
+            queuedNew.getOrFail()
             assertEquals(0, cache.pendingOf(1))
             assertEquals(0, cache.pendingGroupCount)
             assertEquals(0, cache.loadingCount)

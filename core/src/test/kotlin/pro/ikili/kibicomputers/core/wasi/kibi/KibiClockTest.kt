@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.wasi.kibi
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.TestDriver
@@ -23,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 独自拡張 `kibi:computer/clock` の意味の部分（[KibiClock]。#426） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class KibiClockTest {
     private fun inProcess(environment: MachineEnvironment, body: (ProcessContext, Harness) -> Unit) = timeout(Duration.ofSeconds(30)) {
         Harness().use { h ->
@@ -54,7 +56,7 @@ class KibiClockTest {
                 val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
                     try {
                         first.set(KibiClock.uptimeTicks(ctx))
-                        ticked.await(10, TimeUnit.SECONDS)
+                        ticked.await()
                         val second = KibiClock.uptimeTicks(ctx)
                         assertTrue(first.get() >= 0)
                         assertTrue(second > first.get(), "$second > ${first.get()}")
@@ -63,6 +65,7 @@ class KibiClockTest {
                     }
                     StepResult.Exit(0)
                 }
+                h.releaseOnClose { ticked.countDown() }
                 val pid = m.spawnTest(h.program(emptyModule()), driver)
                 h.tickUntilTrue { first.get() >= 0 || m.stateOf(pid).isTerminal }
                 repeat(3) { h.scheduler.tick() }

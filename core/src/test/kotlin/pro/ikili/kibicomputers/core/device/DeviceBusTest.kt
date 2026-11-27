@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.api.device.DeviceContext
@@ -20,13 +21,16 @@ import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.withLock
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** マシンにつなぐデバイスの表（#65、ADR 0065） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class DeviceBusTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -144,7 +148,7 @@ class DeviceBusTest {
                 val seen = arrayOfNulls<List<DeviceInfo>>(1)
                 val t = Thread { seen[0] = m.devices.list() }
                 t.start()
-                t.join(5_000)
+                t.joinOrFail("カーネルロックを持たれている間に一覧を読めない")
                 assertEquals(listOf(DeviceInfo(a, "test:recording")), seen[0])
             }
         }

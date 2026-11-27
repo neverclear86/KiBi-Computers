@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.fd.FdIo
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.IoResult
@@ -16,9 +17,11 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 同じ開いたファイル（受け継いだ fd など）を、いくつものスレッドが同時に読み書きする（#431。ADR 0052） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class SharedOpenFileTest {
     private val limit = Duration.ofSeconds(60)
 
@@ -60,7 +63,7 @@ class SharedOpenFileTest {
             }.also { it.start() }
         }
         start.countDown()
-        for (t in ts) t.join(30_000)
+        for (t in ts) t.joinOrFail("書き手が終わらない")
         errors.firstOrNull()?.let { throw it }
     }
 

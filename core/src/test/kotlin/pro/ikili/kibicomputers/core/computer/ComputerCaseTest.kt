@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.BootConfig
@@ -20,6 +21,8 @@ import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
+import pro.ikili.kibicomputers.core.kernel.failOnInterrupt
 import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.kernel.awaitKeepingInterrupt
@@ -47,6 +50,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.withLock
 
 /** ケースのティアと電源・状態（#121） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ComputerCaseTest {
     /** マネージャーのエラーの出し先に出たもの（#698） */
     private val managerErrors: MutableList<Pair<String, Throwable>> = Collections.synchronizedList(ArrayList())
@@ -329,13 +333,11 @@ class ComputerCaseTest {
 
     private val boot = BootConfig.builder().addBootDisk("none").build()
 
-    /** [condition] がそろうまで manager を tick する */
+    /** [condition] がそろうまで manager を tick する（期限なし。止まったときはクラスの @Timeout が割り込む。#916） */
     private fun tickUntil(message: String, condition: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 10_000
         while (!condition()) {
-            if (System.currentTimeMillis() > deadline) throw AssertionError(message)
             manager.tick()
-            Thread.sleep(1)
+            failOnInterrupt({ message }) { Thread.sleep(1) }
         }
     }
 
@@ -874,7 +876,7 @@ class ComputerCaseTest {
         // 起動の手順（init を作る前）で止める。この間は STOPPED のまま、起動中の印が立っている
         manager.scheduler.hooks.beforeInitExec = {
             entered.countDown()
-            release.await(10, TimeUnit.SECONDS)
+            release.await()
         }
         val case = ComputerCase<String>(CaseTier.BASIC, States())
         val env = MachineEnvironment.builder().disks(snapshotOf("disk-a")).build()
@@ -905,11 +907,7 @@ class ComputerCaseTest {
         val machine = case.machine!!
         // 起動部品のない boot なので、起動に失敗して STOPPED のまま止まる。tick は回さない（知らせは配らない）
         assertTrue(machine.boot(boot))
-        val deadline = System.currentTimeMillis() + 10_000
-        while (machine.isBooting) {
-            if (System.currentTimeMillis() > deadline) throw AssertionError("起動の手順が終わらない")
-            Thread.sleep(1)
-        }
+        while (machine.isBooting) failOnInterrupt({ "起動の手順が終わらない" }) { Thread.sleep(1) }
         assertEquals(MachineState.STOPPED, machine.state)
         assertTrue(case.poweredOn, "知らせの前")
         assertTrue(case.settleStoppedMachine())
@@ -978,7 +976,7 @@ class ComputerCaseTest {
                 }
             }
             machine = bootedCase(case, withDisk(case.tier), "disk-a")
-            assertTrue(atGate.await(10, TimeUnit.SECONDS), "init がコンソールに書かない")
+            atGate.awaitOrFail("init がコンソールに書かない")
         }
 
         fun stop(stopper: () -> Unit) {

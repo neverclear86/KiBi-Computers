@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 import java.time.Duration
 import java.util.Collections
 import java.util.UUID
@@ -13,6 +15,7 @@ import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 書き込みのスレッド（`SaveWriter`。#84、ADR 0084） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class SaveWriterTest {
     private val limit = Duration.ofSeconds(30)
     private val id = UUID.randomUUID()
@@ -41,7 +44,7 @@ class SaveWriterTest {
             assertTrue(writer.execute(id) { throw IllegalStateException("わざと") })
             val done = CountDownLatch(1)
             assertTrue(writer.execute(id) { done.countDown() })
-            assertTrue(done.await(10, TimeUnit.SECONDS))
+            done.awaitOrFail()
             assertTrue(writer.flush(10_000))
         }
     }

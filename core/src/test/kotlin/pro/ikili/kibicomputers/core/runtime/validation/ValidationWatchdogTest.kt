@@ -5,6 +5,9 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Future
@@ -13,6 +16,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /** [ValidationWatchdog] の時計の分岐とタイマーのスレッド（#666）。時計を差し替えて、実時間を待たずに確かめる */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ValidationWatchdogTest {
     /** 手で動かすタイマー（予定を貯めるだけ） */
     private class ManualTimer : ValidationWatchdog.Timer {
@@ -151,14 +155,13 @@ class ValidationWatchdogTest {
             caller.priority = Thread.MIN_PRIORITY
             caller.start()
             caller.join()
-            assertTrue(ran.await(10, TimeUnit.SECONDS))
+            ran.awaitOrFail()
             val t = worker.get()
             assertEquals(ValidationWatchdog.THREAD_NAME, t.name)
             assertEquals(Thread.NORM_PRIORITY, t.priority)
             assertTrue(t.isDaemon)
             // 仕事がなければスレッドが終わる（ワールドを出入りしても溜まらない）
-            t.join(10_000)
-            assertFalse(t.isAlive) { "タイマーのスレッドが仕事の後に終わらない" }
+            t.joinOrFail("タイマーのスレッドが仕事の後に終わらない")
         } finally {
             executor.shutdownNow()
         }

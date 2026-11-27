@@ -8,6 +8,9 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import pro.ikili.kibicomputers.core.kernel.awaitTerminationOrFail
+import pro.ikili.kibicomputers.core.kernel.getOrFail
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -15,6 +18,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /** OS からの依頼（#110、ADR 0110）の形・枠・承認・表 */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class AccessRequestTest {
     private val alex = PlayerRef(UUID.fromString("00000000-0000-0000-0000-00000000000a"), "Alex")
     private val steve = PlayerRef(UUID.fromString("00000000-0000-0000-0000-00000000000b"), "Steve")
@@ -86,7 +90,7 @@ class AccessRequestTest {
             start.countDown()
         } finally {
             pool.shutdown()
-            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS))
+            pool.awaitTerminationOrFail()
         }
         assertEquals(4, accepted.get())
         assertEquals(4, limiter.size)
@@ -116,6 +120,8 @@ class AccessRequestTest {
                         limiter.release(request)
                         released.incrementAndGet()
                     } else {
+                        // 止まったときの保険で落ちたら、shutdownNow の割り込みで抜ける（回り続けて後のテストを遅らせない）
+                        if (Thread.interrupted()) throw InterruptedException()
                         Thread.onSpinWait()
                     }
                 }
@@ -134,15 +140,16 @@ class AccessRequestTest {
                                 waiting += request
                                 break
                             }
+                            if (Thread.interrupted()) throw InterruptedException()
                             Thread.onSpinWait()
                         }
                     }
                 }
             }
             start.countDown()
-            tasks.forEach { it.get(30, TimeUnit.SECONDS) }
+            tasks.forEach { it.getOrFail("ワーカーが受け付けを終えない") }
             workersDone.set(true)
-            release.get(30, TimeUnit.SECONDS)
+            release.getOrFail("承認のスレッドが終わらない")
         } finally {
             workers.shutdownNow()
             releaser.shutdownNow()

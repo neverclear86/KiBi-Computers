@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.api.device.Device
@@ -66,6 +67,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 保存データからの復元（#85、ADR 0085）: `prompt-wasi.wasm` が入力を待っているところを書き、新しいマシンに戻して続きを動かす。
  * 戻せないときの冷えた起動・取り消し・表に入れる途中の失敗・止めている間の振る舞いも確かめる
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class MachineRestoreTest {
     @TempDir
     lateinit var dir: Path
@@ -522,12 +524,13 @@ class MachineRestoreTest {
             val release = CountDownLatch(1)
             h.scheduler.hooks.beforeRestoreInstall = {
                 entered.countDown()
-                release.await(30, TimeUnit.SECONDS)
+                release.await()
             }
+            h.releaseOnClose { release.countDown() }
             val m = h.machine(fuelPerTick = 10_000_000)
             val finished = Finished()
             assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), finished.listener)))
-            assertTrue(entered.await(60, TimeUnit.SECONDS))
+            entered.awaitOrFail()
             // 戻す途中は、コンソールの入力・大きさを受け付けず、コンソールも作らない
             m.resizeConsole(10, 5)
             assertEquals(TtySize(80, 25), m.consoleSize)
@@ -792,12 +795,13 @@ class MachineRestoreTest {
             h.scheduler.hooks.beforeRestoreInstall = { m ->
                 beforeInstall = m.memoryAccount.usedBytes
                 entered.countDown()
-                release.await(30, TimeUnit.SECONDS)
+                release.await()
             }
+            h.releaseOnClose { release.countDown() }
             val m = h.machine(fuelPerTick = 10_000_000)
             val finished = Finished()
             assertTrue(m.restore(request(saved, store, finished)))
-            assertTrue(entered.await(60, TimeUnit.SECONDS))
+            entered.awaitOrFail()
             m.stop()
             // 古い前段はまだ後段の手前で止まっている: 受け付け直すと、古い prepared を表に入れてしまう
             assertFalse(m.restore(request(saved, store, finished)), "取り消したマシンの restore は断る")
