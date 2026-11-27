@@ -388,6 +388,120 @@ class AsyncifyLivenessTest {
     }
 
     @Test
+    fun `関数の参照を持ったまま待ってからreturn_call_refで呼ぶ形も、止まりうる型でなくても断る`() {
+        // i32.const 1; ref.func $id; 待ち点; return_call_ref $i_i。参照が funcref の一時ローカルを通るので、call_ref と同じく出力が検証に通らない
+        val module = { body: String ->
+            WitTool.wat(
+                """
+                (module
+                  (type ${'$'}v_i (func (result i32)))
+                  (type ${'$'}i_i (func (param i32) (result i32)))
+                  (import "w" "wait" (func ${'$'}wait (type ${'$'}v_i)))
+                  (elem declare func ${'$'}id)
+                  (func ${'$'}id (type ${'$'}i_i) (local.get 0))
+                  $body)
+                """.trimIndent(),
+            )
+        }
+        val crossing = module(
+            """
+            (func (export "run") (result i32)
+              (i32.const 1)
+              (ref.func ${'$'}id)
+              (drop (call ${'$'}wait))
+              (return_call_ref ${'$'}i_i))
+            """.trimIndent(),
+        )
+        EndiveRuntime().load(crossing)
+        assertRejected(crossing, "止まりうる関数 #2（export run） の中", "return_call_ref で呼ぶこと")
+        // 待ち点をまたがなければ、今までどおり変換する
+        val direct = module(
+            """
+            (func (export "run") (result i32)
+              (drop (call ${'$'}wait))
+              (i32.const 1)
+              (ref.func ${'$'}id)
+              (return_call_ref ${'$'}i_i))
+            """.trimIndent(),
+        )
+        for (debug in AsyncifyDebug.entries) assertEquals(1, Asyncify.transform(direct, setOf("w.wait"), debug = debug).instrumented, "$debug")
+    }
+
+    @Test
+    fun `到達できないところの止まりうるcall_refも、デバッグの切り替えやローカルの数によらず断る`() {
+        // return の後ろの call_ref。引数のある形・ない形（保存するローカルの数が 0 だと解析を飛ばす）と、すべての切り替えで同じ結果にする
+        for (params in listOf("", "(param i32)")) {
+            val wasm = callRefModule(
+                """
+                (func (export "run") $params (result i32)
+                  (call ${'$'}wait)
+                  (return)
+                  (call_ref ${'$'}v_i (ref.func ${'$'}wait)))
+                """.trimIndent(),
+            )
+            EndiveRuntime().load(wasm)
+            assertRejected(wasm, "止まりうる関数 #2（export run） の中", "止まりうる call_ref")
+        }
+        // 構造の中の unreachable の後ろも同じ
+        val inBlock = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (block (result i32)
+                (call ${'$'}wait)
+                (br 0)
+                (call_ref ${'$'}v_i (ref.func ${'$'}wait))))
+            """.trimIndent(),
+        )
+        EndiveRuntime().load(inBlock)
+        assertRejected(inBlock, "止まりうる call_ref")
+    }
+
+    @Test
+    fun `関数の参照を持ったまま待ってから型の番号の型付きselectに渡す形も、断る`() {
+        // ref.func ×2; 待ち点; select (result (ref null $v_l)); call_ref。参照が funcref の一時ローカルを通るので、select の入力が型の合わない出力になる
+        val crossing = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (ref.func ${'$'}seven)
+              (ref.func ${'$'}seven)
+              (call ${'$'}wait)
+              (select (result (ref null ${'$'}v_l)))
+              (call_ref ${'$'}v_l)
+              i32.wrap_i64)
+            """.trimIndent(),
+        )
+        EndiveRuntime().load(crossing)
+        assertRejected(crossing, "止まりうる関数 #2（export run） の中", "型付きの select")
+        // 待ち点をまたがなければ、今までどおり変換する
+        val direct = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (drop (call ${'$'}wait))
+              (ref.func ${'$'}seven)
+              (ref.func ${'$'}seven)
+              (i32.const 1)
+              (select (result (ref null ${'$'}v_l)))
+              (call_ref ${'$'}v_l)
+              i32.wrap_i64)
+            """.trimIndent(),
+        )
+        for (debug in AsyncifyDebug.entries) assertEquals(1, Asyncify.transform(direct, setOf("w.wait"), debug = debug).instrumented, "$debug")
+        // 結果が funcref の select は、funcref の一時ローカルのままで検証に通るので、今までどおり変換する
+        val funcrefSelect = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (ref.func ${'$'}seven)
+              (ref.func ${'$'}seven)
+              (call ${'$'}wait)
+              (select (result funcref))
+              (drop)
+              (i32.const 1))
+            """.trimIndent(),
+        )
+        assertTrue(EndiveRuntime().load(Asyncify.transform(funcrefSelect, setOf("w.wait")).bytes).isAsyncified)
+    }
+
+    @Test
     fun `待ち点をまたがない止まりうる型でないcall_refは、今までどおり変換して巻き戻せる`() {
         // wait() + i32.wrap(call_ref $v_l (ref.func $seven))。待ち点の後で ref.func を積むので、参照は一時ローカルを通らない
         val wasm = callRefModule(
