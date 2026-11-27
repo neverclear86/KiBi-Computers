@@ -46,6 +46,8 @@ import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.RestoreSource
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
+import pro.ikili.kibicomputers.core.runtime.InterpreterUse
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceState
@@ -269,6 +271,46 @@ class MachineRestoreTest {
                     return module.instantiateForRestore(b.build(), state)
                 }
             }
+        }
+    }
+
+    /** 読み込んだモジュールを、どれもインタプリタで動く関数を持つことにするランタイム（#931。数え口を確かめるだけで、動きは変えない） */
+    private class InterpretedRuntime(private val inner: WasmRuntime) : WasmRuntime by inner {
+        // 残りを渡す読み込みも、下の load を通す（`by inner` のままだと inner に直接行く）
+        override fun load(bytes: ByteArray, timeLeftNanos: Long): WasmModule = load(bytes)
+
+        override fun load(bytes: ByteArray): WasmModule {
+            val module = inner.load(bytes)
+            return object : WasmModule by module {
+                override val interpreterUse: InterpreterUse? = InterpreterUse.functions(InterpreterReason.TOO_LARGE_FUNCTIONS, 2)
+            }
+        }
+    }
+
+    @Test
+    fun `戻したプロセスも、インタプリタで動くコードを持つプログラムの数え口に数える`() = timeout(limit) {
+        // #931: サーバーを立て直した後（exec を通らず保存から戻した台）も、どの台かの手がかりが 0 にならない
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = InterpretedRuntime(EndiveRuntime()), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+            // 保存した台は exec で1回数えた
+            assertEquals(1L, h.scheduler.interpretedProcessCount(InterpreterReason.TOO_LARGE_FUNCTIONS))
+            val m = h.machine(fuelPerTick = 10_000_000)
+            assertEquals(0L, m.interpretedProcessCount)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "復元が終わらない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(RestoreOutcome.RESTORED, finished.outcomes.single().second)
+            assertEquals(1L, m.interpretedProcessCount)
+            assertEquals(setOf(InterpreterReason.TOO_LARGE_FUNCTIONS), m.interpretedReasons)
+            assertEquals(m.lock.withLockValue { m.runtime(saved.pid)!!.program.label }, m.lastInterpretedProgram)
+            assertEquals(2L, h.scheduler.interpretedProcessCount(InterpreterReason.TOO_LARGE_FUNCTIONS))
+            assertEquals(2L, h.scheduler.interpretedProcessTotal)
+            m.close()
         }
     }
 

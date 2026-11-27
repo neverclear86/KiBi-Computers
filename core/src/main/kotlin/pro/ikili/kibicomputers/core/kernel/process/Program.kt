@@ -4,6 +4,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.Instrumentation
+import pro.ikili.kibicomputers.core.runtime.InterpreterUse
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
@@ -125,7 +126,22 @@ internal class Program private constructor(
     /** 燃料を計測するか（コンポーネントなら、中の core モジュールに計測コードを挿入したか） */
     val isFuelMetered: Boolean get() = component?.metered ?: module.isFuelMetered
 
+    /**
+     * インタプリタで動くコードを持つなら、その理由と数（#931。[WasmModule.interpreterUse]）。コンポーネントなら中の core モジュールの和
+     * （[ComponentProgram.interpreterUse]）。読み込みのときに決めた値で、プロセスを作るたびに読む（O(1)）
+     */
+    val interpreterUse: InterpreterUse? = component?.interpreterUse ?: coreModule?.interpreterUse
+
+    /**
+     * 運用者に見せるプログラムの名前（#931）: [hash] の16進の先頭 16 桁。core モジュールなら、読み込みのログ（`EndiveRuntime.moduleLabel`。
+     * ランタイムに渡したバイト列の SHA-256）の先頭と同じ値になる。コンポーネントは元のバイト列の SHA-256（中の core モジュールのログの名前とは別）
+     */
+    val label: String get() = hash.toString().take(LABEL_HEX_DIGITS)
+
     companion object {
+        /** [label] の桁数（`EndiveRuntime.moduleLabel` と同じ） */
+        const val LABEL_HEX_DIGITS: Int = 16
+
         /**
          * 読み込んだコンポーネント [component] の Program（#263）。識別子は元のバイト列の SHA-256。
          * コンポーネントのプロセスは保存できない（`Machine` が保存できないものとして扱う。保存の形は #269）

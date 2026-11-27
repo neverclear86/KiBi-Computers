@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.SaveWriter
 import pro.ikili.kibicomputers.core.device.wiring.ExternalDeviceHolder
 import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.InterpreterCounts
 import pro.ikili.kibicomputers.core.kernel.MachineScheduler
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
@@ -490,6 +491,11 @@ internal data class PhaseResult(
     val maxProcessGrants: Long = -1,
     /** メインスレッドの予算の数え口（[LoadPhase.HOST_CALLS]・[LoadPhase.HOST_CALLS_UNBUDGETED] だけ。#356。ほかは `null`） */
     val hostCalls: HostCallStats? = null,
+    /**
+     * 段階の全体（入ってから終わりまで。起動の段階のコンパイルも入るよう、測る区間ではなく段階の全体）の、インタプリタに回した数え口の増分（#931）。
+     * コンパイルの回数は JVM 全体、プロセスの数はこのサーバーのもの
+     */
+    val interpreter: InterpreterCounts = InterpreterCounts.ZERO,
 )
 
 /**
@@ -535,6 +541,18 @@ internal class LongTick(
 
         fun formatWall(millis: Long): String = WALL.format(Instant.ofEpochMilli(millis))
     }
+}
+
+/**
+ * 負荷試験の出力の、インタプリタに回した数え口の節（#931。[LoadReport.toMarkdown]）。[entries] は段階の名前と、その段階の増分。
+ * どの段階も 0 なら1行だけ
+ */
+internal fun interpreterSection(entries: List<Pair<String, InterpreterCounts>>): String {
+    val interpreted = entries.filter { !it.second.isZero }
+    if (interpreted.isEmpty()) return "\nインタプリタに回した数え口（#931。段階ごとの増分）: どの段階も 0\n"
+    val sb = StringBuilder("\nインタプリタに回した数え口（#931。段階ごとの増分。コンパイルは JVM 全体、プロセスはサーバー全体）:\n\n")
+    for ((label, counts) in interpreted) sb.append("- ").append(label).append(": ").append(counts).append('\n')
+    return sb.toString()
 }
 
 /** 平均と最大（ミリ秒） */
@@ -1029,6 +1047,8 @@ internal class LoadReport(
                 }
             }
         }
+        // インタプリタに回した数え口（#931）。どの段階も 0 なら1行だけ
+        sb.append(interpreterSection(phases.map { it.phase.label to it.interpreter }))
         val withFuel = phases.filter { it.fuel != null }
         if (withFuel.isNotEmpty()) {
             sb.append("\n燃料切れの数え口（#821。測った区間の増分。サーバー全体）:\n\n")
@@ -1213,6 +1233,10 @@ internal class LoadRun(
 
     /** 段階に入ったときの燃料の数え口（[LoadOs.computeProcess] が起動しないときの失敗メッセージに、段階に入ってからの増分を出すため） */
     private var fuelAtPhase = FuelCounts.ZERO
+
+    /** 段階に入ったときと、段階の終わり（[next]）に読んだ、インタプリタに回した数え口（#931。[PhaseResult.interpreter]） */
+    private var interpreterAtPhase = InterpreterCounts.ZERO
+    private var endInterpreter = InterpreterCounts.ZERO
 
     /** 測りはじめたときの燃料の数え口（測っていなければ `null`） */
     private var fuelAtMeasure: FuelCounts? = null
@@ -1752,6 +1776,7 @@ internal class LoadRun(
         // CPU 時間と燃料は、検証（全台の describeProcesses）・スレッドの数え・強制 GC より前に読む（その分の CPU 時間を、測った区間に入れない）
         endFuel = FuelCounts.current()
         endCpu = osBean?.processCpuTime ?: -1
+        endInterpreter = InterpreterCounts.current(ServerMachines.current?.scheduler)
         readProcessGrants(p)
         readHostCalls(p)
         verify(p)
@@ -2705,6 +2730,7 @@ internal class LoadRun(
         threads.resetPeakThreadCount()
         baselineKernelThreads = kernelThreadInfos().mapTo(HashSet()) { it.threadId }
         fuelAtPhase = FuelCounts.current()
+        interpreterAtPhase = InterpreterCounts.current(ServerMachines.current?.scheduler)
         for (c in computers) c.unwindsAtPhase = c.case.computer.machine?.fuelUnwindCount ?: 0L
         fuelAtMeasure = null
         cpuAtMeasure = -1
@@ -2740,6 +2766,7 @@ internal class LoadRun(
             longTickCount = longTickCount,
             sectionMarks = sectionMarks.copyOf(),
             fuel = fuelAtMeasure?.let { endFuel - it },
+            interpreter = endInterpreter - interpreterAtPhase,
             peakFuelThreadWaits = if ((p == LoadPhase.COMPUTE || p == LoadPhase.COMPUTE_MULTI) && fuelAtMeasure != null) peakFuelThreadWaits else -1,
             cpuNanos = if (cpuAtMeasure >= 0 && fuelAtMeasure != null && endCpu >= 0) endCpu - cpuAtMeasure else -1,
             busyMachines = when (p) {

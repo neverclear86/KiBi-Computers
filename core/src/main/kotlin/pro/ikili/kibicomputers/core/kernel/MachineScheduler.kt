@@ -13,6 +13,8 @@ import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import pro.ikili.kibicomputers.core.kernel.time.ExecutorTimerService
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
+import pro.ikili.kibicomputers.core.runtime.InterpreterUse
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
@@ -31,6 +33,7 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.locks.ReentrantLock
 
 /**
@@ -296,6 +299,26 @@ public class MachineScheduler private constructor(
 
     /** [hostCallsRun] の今の値（接続層の負荷試験が読む。#356） */
     public val hostCallsRunTotal: Long get() = hostCallsRun.get()
+
+    /**
+     * インタプリタで動くコードを持つプログラムでプロセスを作った回数（#931。exec と復元。`Machine.noteProcessProgramLocked`）。
+     * 理由ごと（[InterpreterReason] の順）。コンポーネントで理由が複数あれば、それぞれに数える。累計で、reset しない
+     */
+    private val interpretedProcesses = AtomicLongArray(InterpreterReason.entries.size)
+
+    /** [interpretedProcesses] の、理由を問わない合計（1つのプロセスは1回） */
+    private val interpretedProcessesAll = AtomicLong()
+
+    internal fun countInterpretedProcess(use: InterpreterUse) {
+        interpretedProcessesAll.incrementAndGet()
+        for (r in InterpreterReason.entries) if (use.reasonBits and r.bit != 0) interpretedProcesses.incrementAndGet(r.ordinal)
+    }
+
+    /** [reason] でインタプリタに回したコードを持つプログラムで、プロセスを作った回数の累計（#931。運用者の口と負荷試験が読む。reset しない） */
+    public fun interpretedProcessCount(reason: InterpreterReason): Long = interpretedProcesses.get(reason.ordinal)
+
+    /** インタプリタで動くコードを持つプログラムで、プロセスを作った回数の累計（#931。理由を問わない） */
+    public val interpretedProcessTotal: Long get() = interpretedProcessesAll.get()
 
     /** [mainThreadBudgetOverrideNanos] の値。負なら差し替えていない */
     @Volatile

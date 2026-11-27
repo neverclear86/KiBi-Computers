@@ -2,10 +2,12 @@ package pro.ikili.kibicomputers.core.runtime.endive
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.Instrumentation
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
 import pro.ikili.kibicomputers.core.runtime.TestWasiP1
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
@@ -30,6 +32,9 @@ class EndiveCompilerTest {
         val interpreted = EndiveRuntime(compile = false).load(bytes)
         assertTrue(isCompiled(compiled))
         assertFalse(isCompiled(interpreted))
+        // 全部コンパイルしたもの・インタプリタだけの設定のものは、インタプリタに「回した」ものではない（#931）
+        assertNull(compiled.interpreterUse)
+        assertNull(interpreted.interpreterUse)
         val a = compiled.instantiate(WasmInstanceConfig.EMPTY).use { it.call("fib", 20)[0] }
         val b = interpreted.instantiate(WasmInstanceConfig.EMPTY).use { it.call("fib", 20)[0] }
         assertEquals(6765L, a)
@@ -67,6 +72,7 @@ class EndiveCompilerTest {
         val lua = resource("lua.wasm")
         val module = EndiveRuntime().load(FuelInjector.inject(Asyncify.transform(lua, WasiP1.WAIT_IMPORTS).bytes).bytes)
         assertFalse(isCompiled(module))
+        assertUse(module, setOf(InterpreterReason.WHOLE_MODULE), wholeModules = 1, functions = 0)
         assertTrue(module.isAsyncified && module.isFuelMetered)
     }
 
@@ -119,6 +125,7 @@ class EndiveCompilerTest {
         val module = EndiveRuntime().load(bytes)
         assertTrue(isCompiled(module))
         assertEquals(setOf(0), interpretedFunctions(module))
+        assertUse(module, setOf(InterpreterReason.SIMD_FUNCTIONS), wholeModules = 0, functions = 1)
         module.instantiate(WasmInstanceConfig.EMPTY).use {
             assertEquals(7L, it.call("seven")[0])
             assertEquals(8L, it.call("eight")[0])
@@ -133,6 +140,7 @@ class EndiveCompilerTest {
         val interpreted = interpretedFunctions(module)
         val simd = EndiveRuntime.simdFunctions(Parser.parse(bytes))!!
         assertEquals(simd, interpreted)
+        assertUse(module, setOf(InterpreterReason.SIMD_FUNCTIONS), wholeModules = 0, functions = simd.size)
         // sum・fill_seq・dot4 は SIMD を使い、fib は使わない
         assertTrue(simd.size >= 3, "$simd")
         assertFalse(exportIndex(bytes, "fib") in simd)
@@ -247,6 +255,32 @@ class EndiveCompilerTest {
     }
 
     @Test
+    fun `例外処理を使うモジュールの関数がSIMDを使うときは、モジュール全体をインタプリタで動かし、その理由を残す`() {
+        val bytes = WitTool.wat(
+            """
+            (module
+              (tag ${'$'}t)
+              (func (export "seven") (result i32) (local v128)
+                (i32.const 7)))
+            """.trimIndent(),
+        )
+        val before = EndiveRuntime.FALLBACK_LOG.count(InterpreterReason.SIMD_WITH_EXCEPTIONS)
+        val module = EndiveRuntime().load(bytes)
+        assertFalse(isCompiled(module))
+        assertUse(module, setOf(InterpreterReason.SIMD_WITH_EXCEPTIONS), wholeModules = 1, functions = 0)
+        assertEquals(before + 1, EndiveRuntime.FALLBACK_LOG.count(InterpreterReason.SIMD_WITH_EXCEPTIONS))
+        assertEquals(7L, module.instantiate(WasmInstanceConfig.EMPTY).use { it.call("seven")[0] })
+    }
+
+    /** [module] がインタプリタで動くコードを持ち、その理由と数が合う（#931） */
+    private fun assertUse(module: pro.ikili.kibicomputers.core.runtime.WasmModule, reasons: Set<InterpreterReason>, wholeModules: Int, functions: Int) {
+        val use = checkNotNull(module.interpreterUse) { "インタプリタで動くコードを持つはず" }
+        assertEquals(reasons, use.reasons)
+        assertEquals(wholeModules, use.wholeModules)
+        assertEquals(functions, use.functions)
+    }
+
+    @Test
     fun `関数の型にv128があるときは、モジュール全体をインタプリタで動かす`() {
         // (v128) -> i32 の関数は、呼び出しの橋渡しをコンパイルできない
         val bytes = WasmBinary().run {
@@ -259,6 +293,7 @@ class EndiveCompilerTest {
         assertEquals(null, EndiveRuntime.simdFunctions(Parser.parse(bytes)))
         val module = EndiveRuntime().load(bytes)
         assertFalse(isCompiled(module))
+        assertUse(module, setOf(InterpreterReason.V128_SIGNATURE), wholeModules = 1, functions = 0)
         assertEquals(9L, module.instantiate(WasmInstanceConfig.EMPTY).use { it.call("nine")[0] })
     }
 
@@ -298,6 +333,7 @@ class EndiveCompilerTest {
         val module = EndiveRuntime(true) { 0L }.load(bytes)
         assertTrue(isCompiled(module))
         assertEquals(setOf(0) + tooLarge, interpretedFunctions(module))
+        assertUse(module, setOf(InterpreterReason.TOO_LARGE_FUNCTIONS), wholeModules = 0, functions = 1 + tooLarge.size)
         val reference = EndiveRuntime(compile = false).load(bytes)
         val names = listOf("seven", "small", "nops0", "nops1") + (0 until 5).map { "big$it" }
         fun results(m: pro.ikili.kibicomputers.core.runtime.WasmModule) = m.instantiate(WasmInstanceConfig.EMPTY).use { i -> names.map { i.call(it)[0] } }
@@ -406,8 +442,8 @@ class EndiveCompilerTest {
     @Test
     fun `SIMDの関数だけを回したときと、大きすぎる関数を足したときは、別の理由で数える`() {
         // #680: 先に SIMD のモジュールが読まれても、大きすぎる関数の最初の1回が WARNING になるよう、理由を分ける
-        fun counts() = CompileFallbackLog.Reason.SIMD_FUNCTIONS.let(EndiveRuntime.FALLBACK_LOG::count) to
-            EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS)
+        fun counts() = InterpreterReason.SIMD_FUNCTIONS.let(EndiveRuntime.FALLBACK_LOG::count) to
+            EndiveRuntime.FALLBACK_LOG.count(InterpreterReason.TOO_LARGE_FUNCTIONS)
         val (simd0, large0) = counts()
         assertEquals("ok", EndiveRuntime.compileWithFallback(setOf(1), true, 1..20, { emptyList() }) { "ok" }!!.value)
         assertEquals(simd0 + 1 to large0, counts())
@@ -619,7 +655,7 @@ class EndiveCompilerTest {
             build()
         }
         val injected = FuelInjector.inject(original)
-        val before = EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS)
+        val before = EndiveRuntime.FALLBACK_LOG.count(InterpreterReason.TOO_LARGE_FUNCTIONS)
         // JUL の root の ConsoleHandler は、初めて使うときの System.err をつかむ。差し替えの前に作らせておかないと、このテストが JVM で最初の
         // 報告（WARNING）を出したとき、MOD 自身のログが差し替え先に書かれ、ConsoleHandler が捨てる先をつかんだままになる（単独実行で起きる）
         java.util.logging.Logger.getLogger("").handlers
@@ -635,8 +671,9 @@ class EndiveCompilerTest {
         assertEquals("", err.toString(Charsets.UTF_8))
         assertTrue(isCompiled(module))
         assertEquals(tooLarge.toSet(), interpretedFunctions(module).map(injected::originalFunc).toSet())
+        assertUse(module, setOf(InterpreterReason.TOO_LARGE_FUNCTIONS), wholeModules = 0, functions = interpretedFunctions(module).size)
         // 自分の言葉で1回報告した（WARNING か DEBUG かは、同じ JVM の前のテストしだい）
-        assertEquals(before + 1, EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS))
+        assertEquals(before + 1, EndiveRuntime.FALLBACK_LOG.count(InterpreterReason.TOO_LARGE_FUNCTIONS))
         val names = listOf("small", "big0", "big1")
         fun run(m: pro.ikili.kibicomputers.core.runtime.WasmModule): Pair<List<Long>, Long> {
             val config = WasmInstanceConfig.builder().fuel(1_000_000_000, null).build()
