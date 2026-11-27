@@ -345,8 +345,9 @@ public class MachineSaveStore @JvmOverloads constructor(
     // ---- 列の外の owner.bin の読み手（#877） ----
 
     /**
-     * 読み手の列（#960）: 頼んで、まだ要る読み（ID → [requestedReads] の番号）を、頼んだ順に持つ。ID ごとに 1 件で、頼み直すと番号だけを
-     * 置き換える（位置は保つ）。メインスレッドが頼むときに入れ、その ID の待ちがなくなったら外し（[forgetReads]。O(1)）、読み手のスレッドは
+     * 読み手の列（#960）: 頼んで、まだ要る読み（ID → [requestedReads] の番号）を、頼んだ順に持つ。ID ごとに 1 件（列に (id, 番号) がある間は
+     * [requestedReads] にも同じ番号があり、[ensureOwnerRead] は頼み済みの ID を頼み直さないので、列にある ID を列の中で頼み直すことはない。
+     * 取り消して頼み直した ID は、列の末尾に入り直す）。メインスレッドが頼むときに入れ、その ID の待ちがなくなったら外し（[forgetReads]。O(1)）、読み手のスレッドは
      * 先頭を取り出して外してから読む。取り消した読みは列から消えるので開かず（チャンクのアンロードで多数の待ちが消えても、ディスクの読みを
      * 無駄にしない）、列の長さは、読みを頼んでまだ読み手が取り出していない待ちの ID の数を超えない（先頭の読みがストレージの遅れで止まり、
      * その間に読み込みと解放を何度繰り返しても、読み込みの回数に比例して伸びない）。[sideQueueLock] の中で読み書きする
@@ -466,7 +467,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         return true
     }
 
-    /** 読み手に [id] の読みを頼む（番号 [seq]）。頼み済みなら番号だけを置き換える。列が空だったときだけ読み手を起こす（メインスレッド） */
+    /** 読み手に [id] の読みを頼む（番号 [seq]。[id] は列にない。頼み済みは [ensureOwnerRead] が弾く）。列が空だったときだけ読み手を起こす（メインスレッド） */
     private fun offerSideRead(id: UUID, seq: Long) {
         sideQueueLock.withLock {
             val wasEmpty = sideQueue.isEmpty()

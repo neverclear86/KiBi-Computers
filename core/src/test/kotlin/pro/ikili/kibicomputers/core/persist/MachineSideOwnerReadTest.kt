@@ -557,6 +557,69 @@ class MachineSideOwnerReadTest {
     }
 
     @Test
+    fun `読み手が死んだ直後の作り直しも失敗したら、取り出し済みの1件と列に残った頼みは書き込みの列で読み、元のUUIDで決まる`() {
+        val bad = UUID.randomUUID()
+        val queued = List(3) { UUID.randomUUID() }
+        writeOwner(bad, OwnerRecord(0, at(0)))
+        for (id in queued) writeOwner(id, OwnerRecord(0, at(1)))
+        val manual = ManualSaveExecutor()
+        val store = store(manual)
+        // 作り直しの試みは 1 回だけ失敗させ、その後は間（Long.MAX_VALUE）が過ぎないので書き込みの列に回す
+        store.sideReaderRetryNanos = Long.MAX_VALUE
+        val starter = store.sideReaderThreadStarter
+        var attempts = 0
+        store.sideReaderThreadStarter = { body ->
+            attempts++
+            if (attempts >= 2) throw OutOfMemoryError("unable to create native thread: test")
+            starter(body)
+        }
+        val opened = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val poisoned = java.util.concurrent.atomic.AtomicBoolean()
+        store.sideOwnerReader = { path ->
+            if (path.parent.fileName.toString() == bad.toString() && poisoned.compareAndSet(false, true)) {
+                opened.countDown()
+                release.await()
+                throw PoisonError()
+            }
+            OwnerRecord.read(path)
+        }
+        val badKey = Key("bad")
+        assertEquals(null, store.claimOrDefer(bad.toString(), 0, 0, at(0), badKey))
+        val queuedKeys = queued.map { Key(it.toString()) }
+        try {
+            opened.await()
+            for ((i, id) in queued.withIndex()) assertEquals(null, store.claimOrDefer(id.toString(), 0, 0, at(1), queuedKeys[i]))
+            assertEquals(queued.size, store.sideReadQueueLength)
+        } finally {
+            release.countDown()
+        }
+        waitFor { !store.sideReaderAlive }
+        assertEquals(1 + queued.size.toLong(), store.sideOwnerReadRequests)
+        assertEquals(0, store.writerOwnerReadRequests)
+        // 死んだのを見て頼みを外し、作り直しに失敗して、4 件とも書き込みの列に回す
+        assertEquals(emptyList<DeferredClaim>(), store.pollDeferredClaims())
+        assertEquals(1, store.sideReaderDeaths)
+        assertEquals(1, store.sideReaderStartFailures)
+        assertEquals(2, attempts)
+        assertFalse(store.sideReaderAlive)
+        assertEquals(0, store.sideReadQueueLength, "読み手のいない列に頼みを残さない")
+        assertEquals(1 + queued.size.toLong(), store.writerOwnerReadRequests)
+        assertEquals(1 + queued.size.toLong(), store.sideOwnerReadRequests, "読み手への頼みは増えていない")
+        assertEquals(1 + queued.size, manual.size)
+        manual.runAll()
+        val done = store.pollDeferredClaims()
+        assertEquals((listOf(badKey) + queuedKeys).toSet(), done.map { it.key }.toSet())
+        for (d in done) {
+            assertEquals(ClaimResult.KEPT, d.claim.result)
+            assertEquals(if (d.key === badKey) bad else UUID.fromString((d.key as Key).name), d.claim.identity!!.id)
+        }
+        assertEquals(2, attempts, "間が過ぎるまで試み直さない")
+        assertEquals(0, store.deferredClaimTimeouts)
+        assertTrue(store.close(NO_DEADLINE))
+    }
+
+    @Test
     fun `読み手が止める前の割り込みで抜けても、次の頼みで作り直して元のUUIDで決まる`() {
         val first = UUID.randomUUID()
         val second = UUID.randomUUID()
