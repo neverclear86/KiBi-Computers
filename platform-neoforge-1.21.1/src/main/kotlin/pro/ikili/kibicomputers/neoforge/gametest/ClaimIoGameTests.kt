@@ -181,10 +181,14 @@ object ClaimIoGameTests {
      * 呼ばないので、「口が呼ばれた」も終わりの印にできない。そこで、取り消した台の読みが列の外の読み手に回ったことを数え口
      * （`sideOwnerReadRequests`）で見てから、仕事のない別の ID（対照の台）の読みを同じ読み手に頼む。読み手は置き場に 1 本で、頼みも結果も
      * 来た順に流す（FIFO）ので、対照の台が確定した tick には、取り消した読みは読み手を過ぎていて、結果があれば同じかそれより前の
-     * `pollDeferredClaims` で捨てられている。その tick に「確定しない」を確かめる
+     * `pollDeferredClaims` で捨てられている。その tick に「確定しない」を確かめる。
+     *
+     * この論拠（取り消した読みと対照の読みが同じ 1 本の読み手を通る）を数え口で確かめるには、ほかのテストの読みが数え口に混ざらないことが
+     * 要る（数え口は置き場で共有）。そこで専用のバッチにして（同じバッチのテストは同時に走るが、別のバッチは直列）、増えた数を
+     * ちょうど 1（取り消す台）・2（対照の台を足した後）で見る。対照の読みが書き込みのスレッドの列に回ると数え口は増えないので落ちる
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = CLAIM_DECIDE_TIMEOUT_TICKS, batch = "kibicomputers_claim_io")
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = CLAIM_DECIDE_TIMEOUT_TICKS, batch = "claim_io_cancel")
     fun deferredClaimCaseIsInertAndUnloadCancelsIt(helper: GameTestHelper) {
         val store: MachineSaveStore = WorldMachineSaves.current ?: run {
             helper.fail("no machine save store")
@@ -203,9 +207,9 @@ object ClaimIoGameTests {
                 0 -> {
                     if (!be.isLoadedOnServer) return@onEachTick
                     helper.assertTrue(be.isClaimDeferred, "the claim should wait for owner.bin")
-                    // 仕事のない ID なので、読みは列の外の読み手に回る（数え口は置き場で共有なので、少なくとも 1 を見る）
+                    // 仕事のない ID なので、読みは列の外の読み手に回る（専用のバッチなので、数え口の増えはこの台の 1 件だけ）
                     helper.assertTrue(
-                        store.sideOwnerReadRequests - sideBefore >= 1L,
+                        store.sideOwnerReadRequests - sideBefore == 1L,
                         "the read should go to the side reader: ${store.sideOwnerReadRequests - sideBefore}",
                     )
                     helper.assertTrue(be.computer.isRestorePending, "a powered-on case shows the restore wait: ${be.computer}")
@@ -233,8 +237,8 @@ object ClaimIoGameTests {
                     if (!c.isLoadedOnServer) return@onEachTick
                     helper.assertTrue(c.isClaimDeferred, "the control claim should wait for owner.bin")
                     helper.assertTrue(
-                        store.sideOwnerReadRequests - sideBefore >= 2L,
-                        "both reads should go to the side reader: ${store.sideOwnerReadRequests - sideBefore}",
+                        store.sideOwnerReadRequests - sideBefore == 2L,
+                        "both reads (and only those) should go to the side reader:${store.sideOwnerReadRequests - sideBefore}",
                     )
                     wait = claimDecideWait()
                     phase = 2

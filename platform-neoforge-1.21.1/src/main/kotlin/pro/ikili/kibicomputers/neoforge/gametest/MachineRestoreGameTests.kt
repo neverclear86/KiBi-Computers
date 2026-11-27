@@ -232,15 +232,20 @@ object MachineRestoreGameTests {
     /**
      * claim が `owner.bin` の読みを待った台（#869。覚えていない ID。再起動の後と同じ）も、確定した後に復元の順番待ちに入り、
      * 保存した世代から戻る（ID のないまま順番が来て冷えた起動にならない。#653 と同じ不具合）。待つ間は FULL に戻った経路
-     * （`restorePromotedCase`）でも順番待ちに入らず、メインスレッドで `owner.bin` を読まない
+     * （`restorePromotedCase`）でも順番待ちに入らず、メインスレッドで `owner.bin` を読まない。
+     * 確定の待ちは壁時計で打ち切る（[claimDecideWait]。#912）ので、tick の上限には、起動の分（[BOOT_TIMEOUT_TICKS]）に確定の待ちの分
+     * （[CLAIM_DECIDE_TIMEOUT_TICKS]）を別に足す
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS + CLAIM_DECIDE_TIMEOUT_TICKS)
     fun restoresACaseWhoseClaimWaitedForARead(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
         var sawWaiting = false
         var reads = 0L
+        var wait: WallClockWait? = null
+        // 壁時計の上限で落ちたときの診断（thenWaitUntil の中の失敗は tick の上限まで握りつぶされるので、次の thenExecute で落とす）
+        var expired: String? = null
         helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
             val tag = saveAndTag(helper, first)
             val id = first.identity!!.id
@@ -258,12 +263,20 @@ object MachineRestoreGameTests {
                 helper.assertTrue(be.lastClaim == null && be.currentIdentity == null, "a waiting case has no id yet")
                 // FULL に戻った経路が来ても、ID のないまま順番待ちに入れない（入れると冷えた起動になり、下の確かめが落ちる）
                 ServerMachines.restorePromotedCase(be)
+                // 確定は壁時計で待つ（#912。待つ間は動いているマシンがなく tick が全速で進むので、tick の数では読みが終わる前に尽きうる）。
+                // 上限を過ぎたら、診断を覚えて待ちを終える（次の thenExecute が落とす）
+                val w = wait ?: claimDecideWait().also { wait = it }
+                if (!w.pace()) {
+                    expired = claimDecideDiagnostics(WorldMachineSaves.current!!, w, listOf(be), helper)
+                    return@thenWaitUntil
+                }
                 helper.fail("waiting for the claim")
             }
             assertRestored(helper, be)
         }.thenExecute {
+            expired?.let { helper.fail("the waiting claim should be decided: $it") }
             val be = copy!!
-            helper.assertTrue(sawWaiting, "the claim should have waited for owner.bin")
+            helper.assertTrue(sawWaiting,"the claim should have waited for owner.bin")
             helper.assertTrue(be.lastClaim == ClaimResult.KEPT, "the case should keep its id but was ${be.lastClaim}")
             helper.assertTrue(WorldMachineSaves.current!!.mainOwnerReads == reads, "claim should not read owner.bin on the main thread")
             helper.assertTrue(
