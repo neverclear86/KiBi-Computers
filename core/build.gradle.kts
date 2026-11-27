@@ -104,16 +104,14 @@ val serialTestClasses: Set<String> = (
 
 // 組の釣り合いのために、時間のかかるクラスの時間（秒。2026-11-27 の手元の :core:test・:core:testSerial の XML から。#991 で読み込んだ
 // WASM をテストの JVM の中で使い回すようにした後の値。並列の fork の回の値なので、直列の組のクラスと比べると少し大きめに出る。
-// 目安なので、ずれても組の漏れは起きない）
+// 目安なので、ずれても組の漏れは起きない）。ComponentProcessTest・LuaCoroutineRestoreTest は #993 でテストの中身を軽くした後の値で、
+// ShellLineEditTest は #993 の後に 6 秒ほどになったので外した
 val heavyTestClassSeconds = mapOf(
     "kernel.StackExhaustionLockTest" to 157,
     "kernel.vfs.DiskFileSystemStackExhaustionTest" to 92,
     "kernel.LuaKibiApiTest" to 84,
     "kernel.LuaShrinkReallocTest" to 59,
     "kernel.vfs.TmpFileSystemTreeStackExhaustionTest" to 49,
-    "kernel.LuaCoroutineRestoreTest" to 33,
-    "kernel.ComponentProcessTest" to 31,
-    "kernel.ShellLineEditTest" to 30,
     "kernel.AsyncFuelP2Test" to 22,
     "runtime.component.ComponentLoaderTest" to 19,
     "kernel.BasicCommandsTest" to 17,
@@ -124,8 +122,10 @@ val heavyTestClassSeconds = mapOf(
     "kernel.ComponentStackExhaustionLockTest" to 14,
     "kernel.LuaTermFsKeysTest" to 12,
     "kernel.ComponentExecTest" to 11,
+    "kernel.ComponentProcessTest" to 11,
     "kernel.InstantiateStackExhaustionKernelTest" to 10,
     "kernel.LuaKibiApiRestoreTest" to 9,
+    "kernel.LuaCoroutineRestoreTest" to 9,
 ).mapKeys { "pro.ikili.kibicomputers.core.${it.key}" }
 
 // -Pkibi.test.shard=k/N（1 ≤ k ≤ N）。書式の誤りは構成の段階で落とす（黙って全部や 0 件を回さない）
