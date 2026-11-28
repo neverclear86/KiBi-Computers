@@ -158,9 +158,10 @@ internal class Harness(
     /**
      * [close] が、スケジューラの終わりを 1 回目に待つ長さ（過ぎたら残った `KiBi-` スレッドに割り込んでもう 1 回待つ。#916）。
      * 期限なしにはしない（#980）: 止まった門のスレッドに割り込んで放すのは 1 回目の待ちが切れた後なので、期限なしだと漏れ 1 本が保険の
-     * タイムアウト（10 分）まで固まる。負荷の高い CI でも誤って落ちないよう、[assertNoKernelThreads] と同じ 30 秒にする
+     * タイムアウト（10 分）まで固まる。既定は [CLOSE_FIRST_WAIT_MILLIS]（負荷の高い CI でも誤って落ちない長さで、[assertNoKernelThreads] の
+     * 期限より短く、後に続くテストを巻き込まないための余裕を残す）
      */
-    private val firstCloseWaitMillis: Long = 30_000,
+    private val firstCloseWaitMillis: Long = CLOSE_FIRST_WAIT_MILLIS,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
@@ -507,7 +508,7 @@ internal fun MachineSaveStore.closeOrFail(message: String = "保存の置き場�
  * テストのスレッドがこのロックを取れるまで待ち、取れたらすぐ放す（#980。`assertTrue(lock.tryLock(5, SECONDS))` の短い期限で合否を決めない形）。
  *
  * 最大 [LOCK_PROBE_MILLIS] ずつ取りに行くのを繰り返す（待ち行列に残り続けない）。[reportAfterMillis] を過ぎたら、持ち主のスレッドを 1 回調べる:
- * 持ち主がもう生きていなければ（持ったまま死んだ。もう誰も放さない）、停止として [message] と持ち主を付けてその場で落とす。
+ * 持ち主がもう生きていなければ（持ったまま死んだ。もう誰も放さない。ただし放して終えた直後の競合を除くため、取り直して、持ち主を読み直してから判定する）、停止として [message] と持ち主を付けてその場で落とす。
  * 生きていれば、遅れとして [SLOW_WAIT_MARKER] の行で 1 回報告して（持ち主のスタックも付ける）、待ち続ける。
  * 持ち主は `ReentrantLock.toString()` の `Locked by thread <名前>` から読む（`getOwner` は protected で、java.base は反射に開いていない）。
  * 割り込まれたら [failOnInterrupt] の説明で落ちる。割り込みのフラグが立ったまま呼ばれたら、[cleanupWaitIfInterrupted] で期限つきで待って返す
@@ -521,12 +522,20 @@ internal fun ReentrantLock.awaitAcquirable(message: String = "ロックが取れ
     while (!failOnInterrupt(describe) { probe(LOCK_PROBE_MILLIS) }) {
         val elapsed = (System.nanoTime() - start) / 1_000_000
         if (checked || elapsed <= reportAfterMillis) continue
-        checked = true
-        val owner = lockOwnerName(this)
-        val ownerThreads = if (owner == null) emptyList() else Thread.getAllStackTraces().keys.filter { it.name == owner && it.isAlive }
+        var owner = lockOwnerName(this)
+        var ownerThreads = liveThreadsNamed(owner)
         if (owner != null && ownerThreads.isEmpty()) {
-            fail("停止: 持ち主のスレッド $owner が、ロックを持ったまま終わっている: ${describe()}")
+            // 持ち主がふつうにロックを放してスレッドを終えた直後かもしれない（名前を読んでからスレッドを調べるまでの間に起きうる）。
+            // もう 1 回取りに行き、取れたら終わり。取れず、ロックの持ち主を読み直しても生きたスレッドがいないときだけ、持ったまま死んだとみなす
+            if (failOnInterrupt(describe) { probe(LOCK_PROBE_MILLIS) }) return
+            owner = lockOwnerName(this)
+            if (owner == null) continue
+            ownerThreads = liveThreadsNamed(owner)
+            if (ownerThreads.isEmpty()) {
+                fail("停止: 持ち主のスレッド $owner が、ロックを持ったまま終わっている: ${describe()}")
+            }
         }
+        checked = true
         val stacks = ownerThreads.joinToString("\n") { t -> "  ${t.name}\n" + t.stackTrace.take(12).joinToString("\n") { "    at $it" } }
         reportSlowWait("$elapsed ms を超えた: ${describe()}" + if (stacks.isEmpty()) "" else "\n持ち主:\n$stacks")
     }
@@ -536,23 +545,36 @@ internal fun ReentrantLock.awaitAcquirable(message: String = "ロックが取れ
  * テストが作った [WorkerPool]（[executor] を差し替えたもの）を止めて、ワーカーのスレッドが終わるまで待つ（#980。`Fixture.close` が使う）。
  *
  * 期限なしにはしない（[Harness.close] と同じ。#916）: 止まった門のワーカーに割り込んで放すのは待ちが切れた後なので、期限なしだと
- * 漏れ 1 本が保険のタイムアウト（10 分）まで固まる。最大 [KERNEL_THREADS_EXIT_MILLIS] 待ち、終わらなければ残ったワーカーに割り込んで
+ * 漏れ 1 本が保険のタイムアウト（10 分）まで固まる。最大 [CLOSE_FIRST_WAIT_MILLIS] 待ち、終わらなければ残ったワーカーに割り込んで
  * （[ExecutorService.shutdownNow]）もう 1 回待ち、1 回目で終わらなかったことを失敗として残す（黙って抜けると、`KiBi-` のスレッドが残って、
  * 後に続くテストの [assertNoKernelThreads] を巻き込む）。割り込まれた後の後始末でも待てるよう、フラグを下ろしてから待つ
  */
 internal fun shutdownWorkersOrFail(workers: WorkerPool, executor: ExecutorService) = withInterruptCleared {
     workers.shutdown()
-    val ended = workers.awaitTermination(KERNEL_THREADS_EXIT_MILLIS)
+    val ended = workers.awaitTermination(CLOSE_FIRST_WAIT_MILLIS)
     if (!ended) {
-        reportSlowWait("ワーカーが $KERNEL_THREADS_EXIT_MILLIS ms で終わらない。残ったワーカーに割り込む: ${kernelThreadNames()}")
+        reportSlowWait("ワーカーが $CLOSE_FIRST_WAIT_MILLIS ms で終わらない。残ったワーカーに割り込む: ${kernelThreadNames()}")
         executor.shutdownNow()
         workers.awaitTermination(CLEANUP_WAIT_MILLIS)
     }
     assertTrue(ended, "ワーカーが終わらない: ${kernelThreadNames()}")
 }
 
+/**
+ * [Harness.close] と [shutdownWorkersOrFail] が、スレッドの終わりを 1 回目に待つ長さ（過ぎたら残ったスレッドに割り込む）。
+ *
+ * [KERNEL_THREADS_EXIT_MILLIS] より 10 秒短くする。本体を包む `assertTimeoutPreemptively` が切れて捨てられた本体の close は、次のテストと
+ * 並行に走り、次のテストの [assertNoKernelThreads]（JVM 全体の `KiBi-` を見る）は、その close の始まりのほぼ直後に始まる。同じ長さだと、
+ * 割り込みの数 ms 後に次のテストの期限が来て、割り込まれたスレッドが終わる前に関係のないテストが落ちる。差の 10 秒が、その余裕になる
+ */
+internal const val CLOSE_FIRST_WAIT_MILLIS = 20_000L
+
 /** [ReentrantLock.awaitAcquirable] が 1 回に取りに行く上限 */
 internal const val LOCK_PROBE_MILLIS = 200L
+
+/** 名前が [name] の、生きているスレッド（[name] が `null` なら空）。同じ名前のスレッドが別にいると、持ち主の死は見つけられない（外側の上限まで待つ） */
+private fun liveThreadsNamed(name: String?): List<Thread> =
+    if (name == null) emptyList() else Thread.getAllStackTraces().keys.filter { it.name == name && it.isAlive }
 
 /** [lock] の `toString()` の `Locked by thread <名前>` から、持ち主のスレッドの名前を読む（空いていれば `null`） */
 internal fun lockOwnerName(lock: ReentrantLock): String? =

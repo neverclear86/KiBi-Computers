@@ -857,7 +857,7 @@ class StackExhaustionLockTest {
                 releaseFinish.countDown()
             }
             val rt = m.spawnRt(h.program(emptyModule()), driver)
-            // 期限なしで待つ（#916。止まったときは、外側の assertTimeoutPreemptively の 30 秒で落ちる）
+            // 期限なしで待つ（#916。止まったときは、外側の本体の期限（`bodyTimeout`。下限 2 分）で落ちる）
             atFirst.awaitOrFail("最初の step が終わらない")
             // 起こすと、次の step が別のワーカーで始まり、終わって（EXITED）CPU を返す前で止まる
             m.lock.withLockValue { stream.write(ByteArray(1), 0, 1, m.wakeSink) }

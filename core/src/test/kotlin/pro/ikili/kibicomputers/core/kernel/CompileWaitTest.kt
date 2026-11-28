@@ -194,10 +194,10 @@ class CompileWaitTest {
         assertEquals(1, loading.size, "読み込むスレッドは 1 本")
         assertTrue(booting.all { it.isBooting })
 
-        val started = System.nanoTime()
+        // 読み込みは門で止めたまま（テストの finally まで開けない）なので、close が読み込みを待つなら停止は終わらず、保険のタイムアウトが落とす。
+        // 経過時間の上限で合否を決めない（#980）
         h.scheduler.close()
-        assertTrue(h.scheduler.awaitTermination(5_000), "読み込みを待つものが残っている")
-        assertTrue(Duration.ofNanos(System.nanoTime() - started) < Duration.ofSeconds(5))
+        h.scheduler.awaitTerminationOrFail("読み込みを待つものが残っている")
         eventually { booting.none { it.isBooting } }
         assertEquals(0, h.scheduler.programs.loadingCount)
         // 止めた起動は失敗を知らせない。プロセスは止められて終わる

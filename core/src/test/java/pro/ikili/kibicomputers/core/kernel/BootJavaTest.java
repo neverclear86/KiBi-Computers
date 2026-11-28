@@ -91,7 +91,7 @@ class BootJavaTest {
             assertTrue(states.isEmpty());
         } finally {
             scheduler.close();
-            assertTrue(scheduler.awaitTermination(5000));
+            assertTrue(scheduler.awaitTermination(60_000));
         }
     }
 

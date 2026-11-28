@@ -56,12 +56,15 @@ class UnboundedWaitTest {
      * 標準出力に出た行（[block] の間）。[failOnInterrupt]・[Harness.close] の報告（[SLOW_WAIT_MARKER] の行）をわざと出すテストは、
      * これで捕まえる（通った回にも core の `test` タスクがその行をコンソールに写し、本当の遅れ・止まりの印を埋もれさせるため）
      */
-    private fun capturedLines(block: () -> Unit): List<String> {
+    private fun capturedLines(block: () -> Unit): List<String> = capturedLinesWith { block() }
+
+    /** [capturedLines] で、[block] が捕まえている出力そのもの（途中の行を読む別スレッドの同期に使う）も受け取る */
+    private fun capturedLinesWith(block: (ByteArrayOutputStream) -> Unit): List<String> {
         val out = ByteArrayOutputStream()
         val old = System.out
         System.setOut(PrintStream(out, true, "UTF-8"))
         try {
-            block()
+            block(out)
         } finally {
             System.setOut(old)
         }
@@ -361,13 +364,13 @@ class UnboundedWaitTest {
 
     @Test
     fun `awaitRepeatedlyは、閾値を過ぎても落ちずに1回だけ報告して、終わるまで繰り返す`() {
-        val start = System.nanoTime()
+        // 終わる条件は回数で決める（経過時間の上限だと、テストのスレッドが止まったときに 1 回目で終わって、繰り返しも報告も見えなくなる）
         var calls = 0
         val lines = capturedLines {
             awaitRepeatedly({ "まだ終わらない相手" }, reportAfterMillis = 1) { millis ->
                 calls++
                 Thread.sleep(minOf(millis, 10))
-                System.nanoTime() - start > 100_000_000L
+                calls >= 3
             }
         }
         assertTrue(calls > 1, "繰り返す: $calls")
@@ -409,12 +412,13 @@ class UnboundedWaitTest {
     @Test
     fun `awaitRepeatedlyは、待たずにfalseを返すAPIでもCPUを回し続けない`() {
         // 閉じていない MachineScheduler.awaitTermination のように、その場で false を返す相手。各回の後に寝るので、呼ぶ回数は時間で抑えられる
-        val start = System.nanoTime()
+        // 時間は最初の呼び出しから測る（呼び出しの前にテストのスレッドが止まっても、1 回目で終わらない）
+        var first = 0L
         var calls = 0
         capturedLines {
             awaitRepeatedly({ "その場で返る相手" }) {
-                calls++
-                System.nanoTime() - start > 100_000_000L
+                if (++calls == 1) first = System.nanoTime()
+                System.nanoTime() - first > 100_000_000L
             }
         }
         assertTrue(calls in 2..1_000, "呼んだ回数: $calls")
@@ -475,13 +479,20 @@ class UnboundedWaitTest {
         try {
             held.awaitOrFail()
             assertEquals("UnboundedWaitTest-owner", lockOwnerName(lock))
-            val releaser = Thread {
-                Thread.sleep(LOCK_PROBE_MILLIS * 2)
-                release.countDown()
+            // 放す役は、遅れの報告が出てから放す（時間で決めると、テストのスレッドが止まったときに、報告の前に放して取れてしまう）
+            val lines = capturedLinesWith { out ->
+                val releaser = Thread {
+                    while (!out.toString("UTF-8").contains(SLOW_WAIT_MARKER)) Thread.sleep(5)
+                    release.countDown()
+                }
+                releaser.start()
+                try {
+                    lock.awaitAcquirable("持ち主が放さない", reportAfterMillis = 1)
+                } finally {
+                    release.countDown()
+                    releaser.joinOrFail()
+                }
             }
-            releaser.start()
-            val lines = capturedLines { lock.awaitAcquirable("持ち主が放さない", reportAfterMillis = 1) }
-            releaser.joinOrFail()
             assertFalse(lock.isLocked, "取れたらすぐ放す")
             assertTrue(lines.isNotEmpty() && lines.all { it.startsWith("$SLOW_WAIT_MARKER: ") }, lines.toString())
             assertTrue(lines[0].contains("持ち主が放さない"), lines[0])
