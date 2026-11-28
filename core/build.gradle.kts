@@ -197,8 +197,10 @@ fun Test.coreTestDefaults(classFilter: (FileTreeElement) -> Boolean = { true }) 
     // 負荷の下で閾値を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で、TestDrivers.kt の eventually が「#916 遅れ」で
     // 始まる行を標準出力に出す）は、通った回もコンソールと CI のログに写す（#868・#916。標準出力のすべては写さない）
     // 止まったテストのスレッドダンプの要約（ThreadDumpOnTimeout が「#927 ダンプ」で始まる行を出す）も写す（#927）
+    // ComponentStackExhaustionLockTest の rewindSweep が毎回出す、巻き戻さずに終わった回・回し直し・探し直しの数の行（「#983 回し直し」。
+    // 通った回でも CI のログで頻度が見える）も写す（#983）
     val testLogger = logger
-    val copiedPrefixes = listOf("#868 遅れ", "#916 遅れ", "#927 ダンプ")
+    val copiedPrefixes = listOf("#868 遅れ", "#916 遅れ", "#927 ダンプ", "#983 回し直し")
     addTestOutputListener { descriptor, event ->
         if (copiedPrefixes.any { event.message.startsWith(it) }) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
     }
