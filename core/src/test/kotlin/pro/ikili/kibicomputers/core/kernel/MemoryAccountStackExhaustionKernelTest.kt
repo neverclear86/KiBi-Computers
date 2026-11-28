@@ -169,8 +169,10 @@ class MemoryAccountStackExhaustionKernelTest {
                         rt.process.state.isTerminal || m.state == MachineState.CRASHED
                     }
                     // 終わりの片付け（finishLocked。インスタンスを閉じて数えた分を返す）はマシンのロックの中で、状態を CRASHED にしてから
-                    // 進む（#1031）。ほかのスレッドからマシンのロックを取って（取れることも確かめる）、片付けが終わってから勘定を読む
-                    assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$r 回目、$op）: ${m.lock}")
+                    // 進む（#1031）。ほかのスレッドからマシンのロックを取って（取れることも確かめる）、片付けが終わってから勘定を読む。
+                    // ロックが取れなくても（スタックが尽きた後にロックが残る形）、その回の診断の行と、ほかの失敗の原因を先に出すため、
+                    // 取れたかどうかの確かめは勘定を比べる直前に置く（取れなかったときの値はロックの外で読んだもの）
+                    val locked = m.lock.tryLock(5, TimeUnit.SECONDS)
                     val processAfter: Long
                     val machineAfter: Long
                     val serverAfter: Long
@@ -179,11 +181,12 @@ class MemoryAccountStackExhaustionKernelTest {
                         machineAfter = m.memoryAccount.usedBytes
                         serverAfter = h.scheduler.memoryAccount.usedBytes
                     } finally {
-                        m.lock.unlock()
+                        if (locked) m.lock.unlock()
                     }
                     println(
                         "#856 $kind $op（$r 回目）: 深さ ${round.next}、通った ${round.completed.get()}、断られた ${round.refused.get()}、" +
-                            "プロセス $processAfter、マシン $machineBefore → $machineAfter、サーバー $serverBefore → $serverAfter",
+                            "プロセス $processAfter、マシン $machineBefore → $machineAfter、サーバー $serverBefore → $serverAfter" +
+                            if (locked) "" else "、マシンのロックが取れない（勘定はロックの外で読んだ）: ${m.lock}",
                     )
                     round.unexpected?.let { throw AssertionError("$op: スタックが尽きた以外の失敗", it) }
                     assertEquals(MachineState.RUNNING, m.state, "マシンが壊れた（$r 回目、$op）: ${rt.lastError}")
@@ -191,6 +194,8 @@ class MemoryAccountStackExhaustionKernelTest {
                     assertEquals("call stack exhausted", crashReason(rt.lastError!!), "${rt.lastError}")
                     assertTrue(round.completed.get() > 0, "$op: 底の近くで確保が通った深さがない（試験の窓が底から遠い）")
                     assertTrue(round.refused.get() > 0, "$op: 確保がスタック不足で断られた深さがない（試験の窓が底まで届かない）")
+                    // ほかのスレッドから、マシンのロックが取れる（取れないと、上の勘定は片付けの途中の値かもしれないので、比べる前に確かめる）
+                    assertTrue(locked, "マシンのロックが取れない（$r 回目、$op）: ${m.lock}")
                     // プロセスの終わりで数えた分をまとめて返したので、マシン・サーバー全体の勘定は元に戻る（ずれていない）
                     assertEquals(0L, processAfter, "$op: プロセスの勘定が残った")
                     assertEquals(machineBefore, machineAfter, "$op: マシンの勘定がずれた")
