@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime.component.link
 
 import pro.ikili.kibicomputers.core.runtime.Instrumentation
+import pro.ikili.kibicomputers.core.runtime.InterpreterUse
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
@@ -43,6 +44,12 @@ internal class ComponentProgram private constructor(
 
     /** 中の core モジュールの数（同じ中身は 1 つと数える） */
     val moduleCount: Int get() = plan.modules.size
+
+    /**
+     * 中の core モジュールのうち、インタプリタで動くコードを持つものの和（#931。[WasmModule.interpreterUse]）。作るときに1回だけ集める
+     * （中の core モジュールは最大 1,000 個あるので、プロセスを作るたびには集めない）。どれも持たなければ `null`
+     */
+    val interpreterUse: InterpreterUse? = InterpreterUse.combine(plan.modules.map { it.interpreterUse })
 
     companion object {
         /**

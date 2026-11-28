@@ -18,8 +18,8 @@ import run.endive.wasm.Parser
  * 待機点への変換の速さを測る（#338。ADR 0329 の「#338 での改善」）。ふつうの `:core:test` では動かさない
  * （`-Pkibi.asyncifyBenchmark=true` のときだけ）。
  *
- * lua.wasm を、燃料の計測コードの挿入だけ・挿入と変換（すべてを退避する今までの形 [AsyncifyDebug.SAVE_ALL]）・挿入と変換（生きているものだけ）の
- * 3 つで読み、待たない計算（Lua の数値のループ・`table.sort`・文字列の処理）の時間を、インタプリタとランタイムコンパイラで比べる。
+ * lua.wasm を、燃料の計測コードの挿入だけ・挿入と変換（`call_indirect` を型だけで絞る前の解析 `typeOnlyIndirect`）・
+ * 挿入と変換（本番の形）の 3 つで読み（すべてを退避する形 [AsyncifyDebug.SAVE_ALL] との比べは #922 で ADR 0329 に書いた）、待たない計算（Lua の数値のループ・`table.sort`・文字列の処理）の時間を、インタプリタとランタイムコンパイラで比べる。
  * 変換の大きさ（退避するローカル、コード、いちばん大きい関数の命令の数）と、変換・読み込みの時間も出す
  */
 @EnabledIfSystemProperty(named = "kibi.asyncifyBenchmark", matches = "true")
@@ -78,18 +78,25 @@ class AsyncifyBenchmarkTest {
         val rounds = Integer.getInteger("kibi.asyncifyBenchmark.rounds", 5)
         // 変換の時間（温めてから）
         val metered = FuelInjector.inject(lua)
-        fun transform(debug: AsyncifyDebug) =
-            Asyncify.transform(metered.bytes, WasiP1.WAIT_IMPORTS, Instrumentation.YIELD_IMPORT, metered::originalFunc, debug = debug)
+        // 本番の形（Instrumentation）と同じく、課金の位置を渡す（#389）
+        fun transform(debug: AsyncifyDebug, typeOnly: Boolean) = Asyncify.transform(
+            metered.bytes, WasiP1.WAIT_IMPORTS, Instrumentation.YIELD_IMPORT, metered::originalFunc,
+            debug = debug, fuelSites = metered.sites, typeOnlyIndirect = typeOnly,
+        )
         val variants = linkedMapOf<String, ByteArray>("挿入だけ" to metered.bytes)
-        for (debug in listOf(AsyncifyDebug.SAVE_ALL, AsyncifyDebug.NONE)) {
-            repeat(3) { transform(debug) }
+        val forms = linkedMapOf(
+            "型だけで絞る（#338 の解析の前）" to (AsyncifyDebug.NONE to true),
+            "参照で絞る（本番）" to (AsyncifyDebug.NONE to false),
+        )
+        for ((label, form) in forms) {
+            val (debug, typeOnly) = form
+            repeat(3) { transform(debug, typeOnly) }
             val times = (1..rounds).map {
                 val t0 = System.nanoTime()
-                transform(debug)
+                transform(debug, typeOnly)
                 System.nanoTime() - t0
             }
-            val r = transform(debug)
-            val label = if (debug == AsyncifyDebug.SAVE_ALL) "すべて退避（前）" else "生きているものだけ（後）"
+            val r = transform(debug, typeOnly)
             variants[label] = r.bytes
             println(
                 "#338 $label: 変換 ${r.instrumented} / ${r.functions} 関数、止まりうる呼び出し ${r.sites}（燃料切れ ${r.yieldSites}）、" +
@@ -119,6 +126,52 @@ class AsyncifyBenchmarkTest {
                 )
             }
         }
+    }
+
+    /**
+     * 同梱の標準 OS（`os.zip`）のコマンドと、テスト用の p1 の WASM について、`call_indirect` を参照で絞る解析（#338）で、
+     * 変換する関数とコードがどれだけ減るかを出す（時間は測らない）
+     */
+    @Test
+    fun `標準OSのコマンドで、参照で絞る解析の効果を数える`() {
+        val modules = linkedMapOf<String, ByteArray>()
+        val zip = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/images/os.zip")) { "os.zip がリソースにない" }
+        java.util.zip.ZipInputStream(zip).use { z ->
+            while (true) {
+                val e = z.nextEntry ?: break
+                val bytes = z.readBytes()
+                if (!e.isDirectory && bytes.size >= 4 && bytes[0] == 0.toByte() && bytes[1] == 'a'.code.toByte()) modules["os:${e.name}"] = bytes
+            }
+        }
+        java.io.File(requireNotNull(javaClass.getResource("/kibicomputers/wasm/prompt-wasi.wasm")).toURI()).parentFile
+            .listFiles { it -> it.name.endsWith(".wasm") }!!.sortedBy { it.name }.forEach { modules["test:${it.name}"] = it.readBytes() }
+        var before = 0
+        var after = 0
+        var codeBefore = 0L
+        var codeAfter = 0L
+        for ((name, wasm) in modules) {
+            val metered = try {
+                FuelInjector.inject(wasm)
+            } catch (e: Exception) {
+                println("#338 参照 $name: 挿入できない（${e.message}）")
+                continue
+            }
+            fun transform(typeOnly: Boolean) = try {
+                Asyncify.transform(metered.bytes, WasiP1.WAIT_IMPORTS, Instrumentation.YIELD_IMPORT, metered::originalFunc, fuelSites = metered.sites, typeOnlyIndirect = typeOnly)
+            } catch (e: AsyncifyUnsupported) {
+                null
+            }
+            val a = transform(true) ?: continue
+            val b = transform(false) ?: continue
+            before += a.instrumented
+            after += b.instrumented
+            codeBefore += a.codeAfter
+            codeAfter += b.codeAfter
+            if (a.instrumented != b.instrumented) {
+                println("#338 参照 $name: 変換 ${a.instrumented} → ${b.instrumented} / ${a.functions} 関数、コード ${a.codeAfter} → ${b.codeAfter} バイト（変換前 ${a.codeBefore}）")
+            }
+        }
+        println("#338 参照 合計（${modules.size} モジュール）: 変換 $before → $after 関数、コード $codeBefore → $codeAfter バイト")
     }
 
     private fun variantName(variants: Map<String, ByteArray>, bytes: ByteArray) = variants.entries.first { it.value === bytes }.key

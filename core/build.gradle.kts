@@ -56,7 +56,8 @@ dependencies {
     testImplementation(libs.zerofs)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
-    testRuntimeOnly(libs.junit.platform.launcher)
+    // ThreadDumpOnTimeoutTest が、入れ子の JUnit をこの Launcher で回す（#927）
+    testImplementation(libs.junit.platform.launcher)
 }
 
 // ---- core のテストの分け方（#984） ----
@@ -99,31 +100,35 @@ val serialTestClasses: Set<String> = (
         "pro.ikili.kibicomputers.core.kernel.LuaParallelScaleTest",
         // 2^31 回の計算が stop より先に終わると落ちる（並列の 4 本で 1 回落ちた。#984 の測定。直すのは #994）
         "pro.ikili.kibicomputers.core.kernel.RealWasmSchedulerTest",
+        // 入れ子の JUnit の @Timeout(300 ms) の中で、持ち主のロックを待つスレッドが park してからダンプを撮るのを確かめる（#927）
+        "pro.ikili.kibicomputers.core.testing.ThreadDumpOnTimeoutTest",
     )
     ).toSet()
 
-// 組の釣り合いのために、時間のかかるクラスの時間（秒。2026-11-27 の手元の直列の回の XML から。目安なので、ずれても組の漏れは起きない）
+// 組の釣り合いのために、時間のかかるクラスの時間（秒。2026-11-27 の手元の :core:test・:core:testSerial の XML から。#991 で読み込んだ
+// WASM をテストの JVM の中で使い回すようにした後の値。並列の fork の回の値なので、直列の組のクラスと比べると少し大きめに出る。
+// 目安なので、ずれても組の漏れは起きない）。ComponentProcessTest・LuaCoroutineRestoreTest は #993 でテストの中身を軽くした後の値で、
+// ShellLineEditTest は #993 の後に 2〜6 秒になったので外した
 val heavyTestClassSeconds = mapOf(
-    "kernel.LuaKibiApiTest" to 169,
-    "kernel.StackExhaustionLockTest" to 127,
-    "kernel.LuaShrinkReallocTest" to 122,
-    "kernel.ShellTest" to 100,
-    "kernel.vfs.DiskFileSystemStackExhaustionTest" to 79,
-    "kernel.LuaMemoryLimitTest" to 74,
-    "kernel.LuaTermFsKeysTest" to 59,
-    "kernel.vfs.TmpFileSystemTreeStackExhaustionTest" to 47,
-    "kernel.ComponentProcessTest" to 44,
-    "kernel.ShellLineEditTest" to 41,
-    "kernel.LuaCoroutineRestoreTest" to 38,
-    "kernel.AsyncFuelP2Test" to 26,
-    "kernel.BasicCommandsTest" to 23,
-    "wasi.p2.WasiP2StreamTest" to 20,
+    "kernel.StackExhaustionLockTest" to 157,
+    "kernel.vfs.DiskFileSystemStackExhaustionTest" to 92,
+    "kernel.LuaKibiApiTest" to 84,
+    "kernel.LuaShrinkReallocTest" to 59,
+    "kernel.vfs.TmpFileSystemTreeStackExhaustionTest" to 49,
+    "kernel.AsyncFuelP2Test" to 22,
     "runtime.component.ComponentLoaderTest" to 19,
-    "kernel.AsyncP2Test" to 17,
-    "kernel.AsyncFuelTest" to 17,
-    "kernel.ComponentStackExhaustionLockTest" to 16,
-    "wasi.p2.KibiP2BehaviourTest" to 16,
-    "kernel.LuaKibiApiRestoreTest" to 16,
+    "kernel.BasicCommandsTest" to 17,
+    "kernel.ShellTest" to 17,
+    "kernel.AsyncFuelTest" to 16,
+    "device.ScreenDeviceBudgetTest" to 16,
+    "runtime.asyncify.AsyncifyLivenessTest" to 15,
+    "kernel.ComponentStackExhaustionLockTest" to 14,
+    "kernel.LuaTermFsKeysTest" to 12,
+    "kernel.ComponentExecTest" to 11,
+    "kernel.ComponentProcessTest" to 11,
+    "kernel.InstantiateStackExhaustionKernelTest" to 10,
+    "kernel.LuaKibiApiRestoreTest" to 9,
+    "kernel.LuaCoroutineRestoreTest" to 9,
 ).mapKeys { "pro.ikili.kibicomputers.core.${it.key}" }
 
 // -Pkibi.test.shard=k/N（1 ≤ k ≤ N）。書式の誤りは構成の段階で落とす（黙って全部や 0 件を回さない）
@@ -193,14 +198,26 @@ fun Test.coreTestDefaults(classFilter: (FileTreeElement) -> Boolean = { true }) 
         ?.let { systemProperty("junit.jupiter.execution.timeout.default", it) }
     // 負荷の下で閾値を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で、TestDrivers.kt の eventually が「#916 遅れ」で
     // 始まる行を標準出力に出す）は、通った回もコンソールと CI のログに写す（#868・#916。標準出力のすべては写さない）
+    // 止まったテストのスレッドダンプの要約（ThreadDumpOnTimeout が「#927 ダンプ」で始まる行を出す）も写す（#927）
     val testLogger = logger
+    val copiedPrefixes = listOf("#868 遅れ", "#916 遅れ", "#927 ダンプ")
     addTestOutputListener { descriptor, event ->
-        if (event.message.startsWith("#868 遅れ") || event.message.startsWith("#916 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
+        if (copiedPrefixes.any { event.message.startsWith(it) }) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
     }
+    // スレッドダンプの全文の置き場所（#927。ThreadDumpOnTimeout）。作業ディレクトリ（core/）からの相対で渡す（絶対パスはタスクの入力になり、
+    // worktree・CI ごとにキャッシュのキーが変わるため）。CI の組どうしで名前が重ならないよう、組をディレクトリに入れる。
+    // CI は core/build/thread-dumps/** を artifact に載せる。前の起動のダンプが残らないよう、走る前に消す（出力には宣言しない）
+    val threadDumpDir = "build/thread-dumps/$name" + (testShard?.let { "-shard-${it.first}of${it.second}" } ?: "")
+    systemProperty("kibi.test.threadDumpDir", threadDumpDir)
+    val threadDumpDirFile = layout.projectDirectory.dir(threadDumpDir).asFile
+    doFirst { threadDumpDirFile.deleteRecursively() }
     // システムコール仕様書（#79）が実装と WIT からずれていないことを確かめる SyscallDocTest が読むファイル。
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // ThreadDumpWatchdogScriptTest が回す CI の見張りのスクリプト（#927）。同じ理由で入力に宣言する（スクリプトだけの変更でもテストが走るように）
+    inputs.file(rootProject.layout.projectDirectory.file(".github/scripts/with-thread-dump-watchdog.sh"))
+        .withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("threadDumpWatchdogScript")
     // 組の絞り込み（#984）。クラスファイルの集合も入力になるが、キャッシュのキーをはっきり分けるために値も入力にする
     inputs.property("kibi.test.shard", testShardSpec ?: "all")
     inputs.property("kibi.test.serialClasses", serialTestClasses.sorted())

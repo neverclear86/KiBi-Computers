@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.eventually
@@ -22,7 +23,6 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.rt
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.withLockValue
-import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -36,8 +36,8 @@ class WasiP1KibiIoTest {
     /** 待ち方: 待機点型（巻き戻し）とブロッキング型 */
     enum class Mode { UNWIND, BLOCK }
 
-    private val asyncProgram: Program by lazy { Program.loadMetered(EndiveRuntime(), bytes, null, WasiP1.WAIT_IMPORTS) }
-    private val plainProgram: Program by lazy { Program.load(EndiveRuntime(), bytes) }
+    private val asyncProgram: Program by lazy { SharedPrograms.loadMetered(bytes, WasiP1.WAIT_IMPORTS) }
+    private val plainProgram: Program by lazy { SharedPrograms.load(bytes) }
 
     private inner class Run(val h: Harness, val m: Machine, mode: Mode, args: List<String>) {
         private val output: Int = m.lock.withLockValue { m.kernel.objects.add(ByteStream(64 * 1024)) }

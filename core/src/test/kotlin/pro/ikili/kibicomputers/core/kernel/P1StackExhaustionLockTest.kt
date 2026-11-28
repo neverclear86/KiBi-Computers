@@ -57,7 +57,9 @@ class P1StackExhaustionLockTest {
     private fun sweep(kind: ProcessKind, rounds: Int) = timeout(stackHeadroomTestLimit()) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(2).maxBlockingProcesses(64).threadStackBytes(256L * 1024).build()
         val tally = SoePositions()
-        Harness(config, execRuntime = EndiveRuntime(), asyncify = kind == ProcessKind.WAIT_POINT).use { h ->
+        // スタックが尽きる位置は JIT のフレームの大きさで変わるので、前のテストで温まったコンパイル済みのクラスを
+        // JVM の中の共有の表（#991）から受け取らない
+        Harness(config, execRuntime = EndiveRuntime(), asyncify = kind == ProcessKind.WAIT_POINT, sharePrograms = false).use { h ->
             HeadroomTicker(h).use { ticker ->
                 val m = h.machine(fuelPerTick = 50_000_000, fuelSlice = 3_000)
                 val other = h.machine(fuelPerTick = 50_000_000, fuelSlice = 3_000)

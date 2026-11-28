@@ -63,6 +63,30 @@ var scratch_truncated = false;
 /// 直前のキーが Tab だった（2 回目の Tab で候補を並べる）
 var last_tab = false;
 
+/// 行の末尾の位置の覚え（#993）。プロンプトと line[0..tail_len] を、画面の幅 tail_cols で書いた後の位置が tail_pos。
+/// 行の末尾に 1 文字足すたびに行の頭から数え直すと、長い行の貼り付けの手間が長さの 2 乗になるため。
+/// line[0..tail_len] を変えたら（[touch]）、またはプロンプトを変えたら忘れる（tail_len = NO_TAIL）
+const NO_TAIL = ~@as(usize, 0);
+var tail_pos: Pos = .{};
+var tail_len: usize = NO_TAIL;
+var tail_cols: u32 = 0;
+
+/// line[from..] を変える前に呼ぶ。覚えた末尾より前を変えるなら、覚えを捨てる
+fn touch(from: usize) void {
+    if (from < tail_len) tail_len = NO_TAIL;
+}
+
+/// プロンプトと line[0..n] を書いた後の位置が [p] だと覚える。line[0..n] の後ろに何を足しても、行の頭から数えたときに
+/// n が文字の区切りのまま（n == 0 か、line[n - 1] が ASCII）か、[whole] のときだけ覚える
+/// （半端な UTF-8 の後ろに続きのバイトが足されると、頭から数え直したときの区切りが変わるため）
+fn rememberTail(p: Pos, n: usize, whole: bool) void {
+    if (whole or n == 0 or line[n - 1] < 0x80) {
+        tail_pos = p;
+        tail_len = n;
+        tail_cols = cols;
+    } else tail_len = NO_TAIL;
+}
+
 // ---- 出力（まとめて書く） ----
 
 var obuf: [8192]u8 = undefined;
@@ -282,6 +306,15 @@ fn updateSize() void {
     } else |_| cols = 80;
 }
 
+/// 画面の幅を読み直し、前に読んだとき（前に描き直したとき）から変わったら true。
+/// 描き直さずに書く処理（[typed] の末尾への追加・[backspaceAtEnd]）は、前に描いた幅のままの位置で書くので、
+/// 幅が変わったら描き直しに回す（#993。前は折り返しと Backspace が毎回描き直し、そこで幅を読み直していた）
+fn sizeChanged() bool {
+    const old = cols;
+    updateSize();
+    return cols != old;
+}
+
 /// 行の全体を描き直す
 fn refresh() void {
     updateSize();
@@ -292,6 +325,7 @@ fn refresh() void {
     emitLine(line[0..pos], &p);
     const target = p.visible();
     emitLine(line[pos..len], &p);
+    rememberTail(p, len, false);
     var phys = p;
     if (p.pending) {
         // 右端で終わった: 次の行に出ておく（カーソルを右端に残さない）
@@ -329,6 +363,9 @@ fn charLen(s: []const u8) usize {
 
 /// [from] の 1 文字前。描画（[emitLine]）が行の頭から [from] までを読むのと同じ区切りで数える
 fn prevChar(from: usize) usize {
+    // 前のバイトが ASCII なら、頭から数えてもそれだけで 1 文字（続きのバイトにはならない）。長い行で Backspace を
+    // 続けたときに、1 回ごとに行の頭から数え直さないように（#993）
+    if (from > 0 and line[from - 1] < 0x80) return from - 1;
     var i: usize = 0;
     var last: usize = 0;
     while (i < from) {
@@ -367,6 +404,7 @@ fn nextWord(from: usize) usize {
 /// [s] をカーソルの位置に入れる。入らなければ false
 fn insert(s: []const u8) bool {
     if (len + s.len > cap) return false;
+    touch(pos);
     var k = len;
     while (k > pos) : (k -= 1) line[k - 1 + s.len] = line[k - 1];
     @memcpy(line[pos..][0..s.len], s);
@@ -383,6 +421,7 @@ fn removesAll(a: usize, b: usize) bool {
 /// line[a..b] を消す。[save] なら Ctrl+Y で戻せるように残す
 fn remove(a: usize, b: usize, save: bool) void {
     if (b <= a) return;
+    touch(a);
     if (save) {
         @memcpy(kill_buf[0 .. b - a], line[a..b]);
         kill_len = b - a;
@@ -408,6 +447,7 @@ fn lost() void {
 /// 行を [s] に置き換える。入らなければ（続きの行で残りが少ないとき）false で、行はそのまま
 fn setLine(s: []const u8) bool {
     if (s.len > cap) return false;
+    touch(0);
     @memcpy(line[0..s.len], s);
     len = s.len;
     pos = s.len;
@@ -446,21 +486,76 @@ fn setLineFrom(index: usize, total: usize) bool {
     return true;
 }
 
-/// 普通の文字を入れたときの表示。行の末尾に足して折り返さないなら、その文字だけ書く
+/// 普通の文字を入れたときの表示。行の末尾に足して、カーソルのある画面の行に収まるなら、その文字だけ書く。
+/// 右端でちょうど折り返しの保留になったら、[refresh] と同じく改行を書いて次の行の頭に出ておく（#993）。
+/// 画面の幅が前に描いたときから変わっていれば、描き直す
 fn typed(s: []const u8) void {
-    if (pos == len) {
+    if (pos == len and !sizeChanged()) {
         var p: Pos = .{};
-        measurePrompt(&p, prompt);
-        measureLine(line[0 .. len - s.len], &p);
+        if (tail_len == len - s.len and tail_cols == cols) {
+            // 足す前の末尾の位置を覚えている（#993）
+            p = tail_pos;
+        } else {
+            measurePrompt(&p, prompt);
+            measureLine(line[0 .. len - s.len], &p);
+        }
         const g = glyph(s);
-        // 原文のまま送れる 1 文字だけ（不正なバイト・C1 は描き直して U+FFFD で見せる）
-        if (!p.pending and g.ok and g.n == s.len and s[0] >= 0x20 and p.col + g.w < cols) {
+        // カーソルは行の末尾の見える位置（保留なら次の行の頭。refresh とこの関数が改行を書いて出ている）にある
+        const at = p.visible();
+        var q = p;
+        q.advance(g.w);
+        // 原文のまま送れる 1 文字だけ（不正なバイト・C1 は描き直して U+FFFD で見せる）。
+        // 文字がカーソルの行に入るときだけ（全角が右端の 1 セルに入らず次の行へ送られるときと、幅 0 の文字が
+        // 保留の後ろに付くときは描き直す）
+        if (g.ok and g.n == s.len and s[0] >= 0x20 and cols >= 2 and q.row == at.row) {
             put(s);
+            if (q.pending) put("\n");
             flush();
+            cur_row = q.visible().row;
+            // s は丸ごとの 1 文字なので、後ろに何を足しても区切りは変わらない
+            rememberTail(q, len, true);
             return;
         }
     }
     refresh();
+}
+
+/// 印字できる ASCII（幅 1 で、`^X` にしない）
+fn isPrintableAscii(c: u8) bool {
+    return c >= 0x20 and c < 0x7f;
+}
+
+/// 行の末尾の ASCII の 1 文字を Backspace で消す。描き直さず、消す文字の位置へ戻って画面の行の残りを消す
+/// （#993。長い行で Backspace を続けたときに、1 回ごとに行の全体を書かないように）。できないときは false で、何もしない。
+/// 消した後の末尾の位置は、[Pos.advance] の規則から決まる:
+/// - 末尾が保留（カーソルは次の行の頭）: 消す文字は前の行の右端。消した後は右端の手前で、保留はない
+/// - 末尾の桁が 2 以上: 消す文字は同じ画面の行の 1 つ左。消した後はその桁
+/// - 末尾の桁が 1: 消す文字は画面の行の頭。その前が印字できる ASCII なら、その文字の後ろは前の行の右端の保留
+///   （プロンプトの改行の後ろなど、ほかの場合は描き直す）
+fn backspaceAtEnd() bool {
+    if (pos != len or len == 0 or tail_len != len or tail_cols != cols or cols < 2) return false;
+    if (!isPrintableAscii(line[len - 1])) return false;
+    // 幅が変わったら描き直す（呼び出し元が消して描き直す）
+    if (sizeChanged()) return false;
+    const p = tail_pos;
+    var q: Pos = undefined;
+    if (p.pending) {
+        q = .{ .row = p.row, .col = cols - 1 };
+        csi(1, 'A');
+        csi(cols - 1, 'C');
+        cur_row = p.row;
+    } else if (p.col >= 2) {
+        q = .{ .row = p.row, .col = p.col - 1 };
+        putByte(0x08);
+    } else if (p.col == 1 and p.row > 0 and len >= 2 and isPrintableAscii(line[len - 2])) {
+        q = .{ .row = p.row - 1, .col = cols - 1, .pending = true };
+        putByte(0x08);
+    } else return false;
+    put("\x1b[K");
+    flush();
+    remove(len - 1, len, false);
+    rememberTail(q, len, false);
+    return true;
 }
 
 // ---- 補完 ----
@@ -943,6 +1038,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
     defer closeRestored();
 
     prompt = p;
+    tail_len = NO_TAIL;
     len = 0;
     pos = 0;
     cap = @min(MAX_LINE, if (out.len > 0) out.len - 1 else 0);
@@ -1019,7 +1115,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
             14 => applyKey(.down), // Ctrl+N
             0x7f, 8 => {
                 // Backspace
-                if (pos > 0) {
+                if (pos > 0 and !backspaceAtEnd()) {
                     remove(prevChar(pos), pos, false);
                     refresh();
                 }
@@ -1057,6 +1153,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
                     const left = pos - a;
                     const right = b - pos;
                     if (left + right <= tmp.len) {
+                        touch(a);
                         @memcpy(tmp[0..right], line[pos..b]);
                         @memcpy(tmp[right..][0..left], line[a..pos]);
                         @memcpy(line[a..b], tmp[0 .. left + right]);

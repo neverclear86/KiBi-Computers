@@ -12,12 +12,12 @@ import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.time.Timer
 import pro.ikili.kibicomputers.core.kernel.withLockValue
-import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -26,13 +26,13 @@ class WasiP1PollProgramTest {
     private val program: Program by lazy {
         val bytes = javaClass.getResourceAsStream("/kibicomputers/wasm/poll-wasi.wasm")?.use { it.readBytes() }
         assertNotNull(bytes, "poll-wasi.wasm がリソースにない")
-        Program.load(EndiveRuntime(), bytes!!)
+        SharedPrograms.load(bytes!!)
     }
 
     /** 同じプログラムに待機点への変換（#329）をかけたもの。`WAIT_POINT` で動き、巻き戻して待つ */
     private val asyncProgram: Program by lazy {
         val bytes = javaClass.getResourceAsStream("/kibicomputers/wasm/poll-wasi.wasm")!!.use { it.readBytes() }
-        Program.loadMetered(EndiveRuntime(), bytes, null, WasiP1.WAIT_IMPORTS)
+        SharedPrograms.loadMetered(bytes, WasiP1.WAIT_IMPORTS)
     }
 
     @Test

@@ -2,6 +2,8 @@ package pro.ikili.kibicomputers.core.runtime.endive
 
 import org.jetbrains.annotations.ApiStatus
 import org.objectweb.asm.MethodTooLargeException
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
+import pro.ikili.kibicomputers.core.runtime.InterpreterUse
 import pro.ikili.kibicomputers.core.runtime.MemoryChunkCounts
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmAsync
@@ -106,7 +108,16 @@ public class EndiveRuntime internal constructor(
     private val clock: () -> Long = defaultCompileClock(),
 ) : WasmRuntime {
     /** ランタイムコンパイラで動かすランタイムを作る */
-    public constructor() : this(true)
+    public constructor() : this(true) {
+        defaultConfiguration = true
+    }
+
+    /**
+     * 引数なしのコンストラクターで作った（コンパイルし、時計も既定）。テストで、読み込んだ結果をランタイムのインスタンスをまたいで
+     * 使い回してよいかの判定に使う（#991。インタプリタだけのものや時計を差し替えたものとは共有しない）
+     */
+    internal var defaultConfiguration: Boolean = false
+        private set
 
     override val name: String get() = NAME
 
@@ -123,11 +134,12 @@ public class EndiveRuntime internal constructor(
         val interpreted = parseModule(bytes)
         if (!compile) return interpreted
         val budget = retryBudget(timeLeftNanos, clock() - start)
+        val compiled = compileModule(interpreted.module, budget, moduleLabel(bytes))
         // コンパイルできなければ、インタプリタで動かす（パースと検証は通っているので、動かせる WASM を断らない）
-        val compiled = compileOrNull(interpreted.module, budget, moduleLabel(bytes)) ?: return interpreted
+        val module = compiled.module ?: return interpreted.also { it.interpreterUse = compiled.use }
         // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュール（インタプリタで動かす関数の本体は残る）と
         // コンパイル結果だけ
-        return EndiveWasmModule(compiled.module.wasmModule(), compiled.module, compiled.interpreted)
+        return EndiveWasmModule(module.wasmModule(), module, compiled.interpreted).also { it.interpreterUse = compiled.use }
     }
 
     /** パースだけして、import と export を返す（#757。コンパイルしない） */
@@ -177,12 +189,19 @@ public class EndiveRuntime internal constructor(
     /**
      * コンパイルの結果。[interpreted] は、インタプリタで動かす関数の番号（import を含めた番号）。自分で決めて渡した関数か、
      * Endive が自動で回したとき（[InterpreterFallback.SILENT]）はコンパイル後のモジュールに本体が残った関数（[retainedFunctions]。
-     * 自動で回した関数と、そこから末尾呼び出しで届く関数なので、本当の集合より広いことがある）
+     * 自動で回した関数と、そこから末尾呼び出しで届く関数なので、本当の集合より広いことがある）。
+     * [module] が `null` なら、モジュール全体をインタプリタで動かす。[use] は、インタプリタで動くコードを持つことの数え口（#931。
+     * モジュールに持たせる。全部コンパイルできたら `null`）
      */
-    private class Compilation(val module: CompiledModule, val interpreted: Set<Int>)
+    private class Compilation(val module: CompiledModule?, val interpreted: Set<Int>, val use: InterpreterUse?) {
+        companion object {
+            /** モジュール全体をインタプリタで動かす（[reason] で） */
+            fun whole(reason: InterpreterReason): Compilation = Compilation(null, emptySet(), InterpreterUse.wholeModule(reason))
+        }
+    }
 
     /**
-     * [module] をコンパイルする。できなければ `null`（ログに出す）。
+     * [module] をコンパイルする。できなければ、モジュール全体をインタプリタで動かす結果（[Compilation.module] が `null`。ログに出す）。
      *
      * SIMD を使う関数は、初めからインタプリタに回す（[simdFunctions]。#424）。関数の型（引数・戻り値）に v128 があると、
      * 関数の呼び出しの橋渡しをコンパイルできないので、モジュール全体をインタプリタで動かす。
@@ -201,21 +220,21 @@ public class EndiveRuntime internal constructor(
      *
      * [label] は、ログでモジュールを見分ける名前（[moduleLabel]。出すときだけ作る）。
      */
-    private fun compileOrNull(module: EndiveModule, budgetNanos: Long, label: () -> String): Compilation? {
+    private fun compileModule(module: EndiveModule, budgetNanos: Long, label: () -> String): Compilation {
         val mixable = module.tagSection().map { it.tagCount() == 0 }.orElse(true) && module.importSection().count(ExternalType.TAG) == 0
         val simd = simdFunctions(module)
         val describe = { functions: Set<Int> -> describeFunctions(functions, functionNames(module)) }
         if (simd == null) {
-            FALLBACK_LOG.report(CompileFallbackLog.Reason.V128_SIGNATURE) {
+            FALLBACK_LOG.report(InterpreterReason.V128_SIGNATURE) {
                 "${label()} の型（関数の型、struct のフィールド、array の要素）に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
             }
-            return null
+            return Compilation.whole(InterpreterReason.V128_SIGNATURE)
         }
         if (simd.isNotEmpty() && !mixable) {
-            FALLBACK_LOG.report(CompileFallbackLog.Reason.SIMD_WITH_EXCEPTIONS) {
+            FALLBACK_LOG.report(InterpreterReason.SIMD_WITH_EXCEPTIONS) {
                 "例外処理を使う ${label()} の関数 ${describe(simd)} が SIMD を使っていてコンパイルできないので、モジュール全体をインタプリタで動かす"
             }
-            return null
+            return Compilation.whole(InterpreterReason.SIMD_WITH_EXCEPTIONS)
         }
         val imported = module.importSection().count(ExternalType.FUNCTION)
         val defined = imported until imported + module.codeSection().functionBodies().size
@@ -230,18 +249,18 @@ public class EndiveRuntime internal constructor(
                 else -> builder.withInterpreterFallback(InterpreterFallback.FAIL).withInterpretedFunctions(interpreted)
             }
             builder.compileModule()
-        } ?: return null
+        } ?: return Compilation.whole(InterpreterReason.WHOLE_MODULE)
         if (result.interpreted.isEmpty() && mixable) {
             // Endive が自動で回した関数（SILENT）。ここで自分の言葉で出す
             val auto = retainedFunctions(result.value.wasmModule())
             if (auto.isNotEmpty()) {
-                FALLBACK_LOG.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) {
+                FALLBACK_LOG.report(InterpreterReason.TOO_LARGE_FUNCTIONS) {
                     "${label()} の関数 ${describe(auto)} をインタプリタで動かす（JVM のメソッドの上限を超える関数と、そこから末尾呼び出しで届く関数）"
                 }
             }
-            return Compilation(result.value, auto)
+            return Compilation(result.value, auto, InterpreterUse.functions(InterpreterReason.TOO_LARGE_FUNCTIONS, auto.size))
         }
-        return Compilation(result.value, result.interpreted)
+        return Compilation(result.value, result.interpreted, result.reason?.let { InterpreterUse.functions(it, result.interpreted.size) })
     }
 
     public companion object {
@@ -358,10 +377,10 @@ public class EndiveRuntime internal constructor(
          * （特定できない分の枠は、特定できた分で減らない）。
          *
          * [defined] は定義した関数の番号の範囲（import を含めた番号）。[clock] はナノ秒の時刻（このスレッドで呼ぶ。既定は [defaultCompileClock]。
-         * テストで差し替える）。[label] と [describe] は、ログのモジュールの名前と関数の並び（[compileOrNull] が渡す）。
+         * テストで差し替える）。[label] と [describe] は、ログのモジュールの名前と関数の並び（[compileModule] が渡す）。
          *
-         * ログの理由は、SIMD を使う関数だけを回したなら [CompileFallbackLog.Reason.SIMD_FUNCTIONS]、やり直しで関数を足したなら
-         * [CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS]（SIMD のモジュールが先に読まれても、大きすぎる関数の最初の1回は WARNING になる）。
+         * ログの理由は、SIMD を使う関数だけを回したなら [InterpreterReason.SIMD_FUNCTIONS]、やり直しで関数を足したなら
+         * [InterpreterReason.TOO_LARGE_FUNCTIONS]（SIMD のモジュールが先に読まれても、大きすぎる関数の最初の1回は WARNING になる）。
          */
         internal fun <T : Any> compileWithFallback(
             simd: Set<Int>,
@@ -384,19 +403,22 @@ public class EndiveRuntime internal constructor(
                 val start = clock()
                 val failure = try {
                     val value = compile(interpreted.toSet())
+                    var reason: InterpreterReason? = null
                     if (interpreted.isNotEmpty()) {
                         if (identified + unidentified > 0) {
-                            FALLBACK_LOG.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) {
+                            reason = InterpreterReason.TOO_LARGE_FUNCTIONS
+                            FALLBACK_LOG.report(InterpreterReason.TOO_LARGE_FUNCTIONS) {
                                 "${label()} の関数 ${describe(interpreted)} をインタプリタで動かす（SIMD を使う関数と、コンパイルできない関数。" +
                                     "やり直し: 特定した関数で $identified 回、特定できずに $unidentified 回）"
                             }
                         } else {
-                            FALLBACK_LOG.report(CompileFallbackLog.Reason.SIMD_FUNCTIONS) {
+                            reason = InterpreterReason.SIMD_FUNCTIONS
+                            FALLBACK_LOG.report(InterpreterReason.SIMD_FUNCTIONS) {
                                 "${label()} の関数 ${describe(interpreted)} をインタプリタで動かす（SIMD を使う関数）"
                             }
                         }
                     }
-                    return Fallback(value, interpreted.toSet())
+                    return Fallback(value, interpreted.toSet(), reason)
                 } catch (e: RuntimeException) {
                     e
                 } catch (e: StackOverflowError) {
@@ -428,12 +450,15 @@ public class EndiveRuntime internal constructor(
         }
 
         private fun giveUp(failure: Throwable, reason: String): Nothing? {
-            FALLBACK_LOG.report(CompileFallbackLog.Reason.WHOLE_MODULE) { "WASM をコンパイルできないので、モジュール全体をインタプリタで動かす$reason: $failure" }
+            FALLBACK_LOG.report(InterpreterReason.WHOLE_MODULE) { "WASM をコンパイルできないので、モジュール全体をインタプリタで動かす$reason: $failure" }
             return null
         }
 
-        /** [compileWithFallback] の結果。[interpreted] は、インタプリタで動かすと決めて渡した関数の番号 */
-        internal class Fallback<T : Any>(val value: T, val interpreted: Set<Int>)
+        /**
+         * [compileWithFallback] の結果。[interpreted] は、インタプリタで動かすと決めて渡した関数の番号、[reason] はログに出した理由
+         * （[interpreted] が空なら `null`。#931）
+         */
+        internal class Fallback<T : Any>(val value: T, val interpreted: Set<Int>, val reason: InterpreterReason? = null)
 
         /** Endive が関数の本体をコンパイルしたメソッドの名前（既定の [MethodPrefixer]。`func_<番号>`） */
         private val FUNCTION_METHOD = Regex("^" + Regex.escape(MethodPrefixer.DEFAULT_PREFIX) + "_(\\d+)$")
@@ -917,7 +942,7 @@ private class BudgetedMemory(
 }
 
 /** インスタンスを閉じたとき（作るのに失敗したときも）に、数えた分を返すメモリ */
-private interface ReleasableMemory {
+internal interface ReleasableMemory {
     /** 数えた分をすべて返す。2回呼んでもよい */
     fun releaseAll()
 }
@@ -934,7 +959,7 @@ private class WrittenRelease(val memory: WrittenPagesMemory) : ReleasableMemory 
  * 断られたら Endive に渡さずに -1 を返す（失敗した grow は数えない。#335 と同じ）。
  * [reserved] は [budget] から確保したバイト数。インスタンスを閉じたときに [releaseAll] で返す。
  */
-private class BudgetedTable(
+internal class BudgetedTable(
     table: Table,
     initValue: Int,
     private val budget: WasmTableBudget?,
@@ -1052,7 +1077,7 @@ private fun tableElementBytes(table: Table): Long =
  * ほかのインスタンスに響かないように、インスタンスごとに [Table] を作り直し、そのときに上限を縮める。
  * 最初の要素数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
  */
-private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig, created: MutableList<BudgetedTable>): TableInstance {
+internal fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig, created: MutableList<BudgetedTable>): TableInstance {
     val limits = table.limits()
     val initial = limits.min()
     val max = minOf(limits.max(), config.maxTableElements.toLong())
@@ -1067,12 +1092,20 @@ private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig
         throw MemoryLimitFailure("テーブルの最初の $initial 要素を確保できない（RAM が足りない）")
     }
     val reserved = if (budget != null) initialBytes else 0L
-    return try {
+    val made = try {
         BudgetedTable(own, initValue, budget, elementBytes, reserved)
     } catch (t: Throwable) {
         if (budget != null && initialBytes > 0) budget.releaseBytes(initialBytes)
         throw t
-    }.also { created += it }
+    }
+    // 登録で落ちても、数えた分を返す（#946）
+    try {
+        created += made
+    } catch (t: Throwable) {
+        made.releaseAll()
+        throw t
+    }
+    return made
 }
 
 /**
@@ -1080,7 +1113,7 @@ private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig
  *
  * 最初のページ数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
  */
-private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<ReleasableMemory>): EndiveMemory {
+internal fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<ReleasableMemory>): EndiveMemory {
     val initial = limits.initialPages()
     val max = minOf(limits.maximumPages(), config.maxMemoryPages)
     if (initial > max) {
@@ -1091,11 +1124,18 @@ private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, creat
         if (limits.shared()) throw MemoryLimitFailure("共有メモリは使えない")
         // 区画の表の最初の分は作るときに数える（#753）。断られたら作らない（何も数えていない）
         val memory = try {
-            WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, config.onMemoryGrowRefused)
+            WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, onGrowRefused = config.onMemoryGrowRefused)
         } catch (e: PageTableRefused) {
             throw MemoryLimitFailure(e.message!!)
         }
-        return memory.also { created += WrittenRelease(it) }
+        // 作った後の登録（包みの確保・リストの伸び）で落ちても、数えた分を返す（#946。登録できないと instantiate の catch が返せない）
+        try {
+            created += WrittenRelease(memory)
+        } catch (t: Throwable) {
+            memory.releaseAll()
+            throw t
+        }
+        return memory
     }
     val budget = config.memoryBudget
     if (budget == null) return newMemory(MemoryLimits(initial, max, limits.shared()))
@@ -1108,7 +1148,19 @@ private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, creat
         if (initial > 0) budget.release(initial)
         throw t
     }
-    return BudgetedMemory(inner, budget, initial).also { created += it }
+    val memory = try {
+        BudgetedMemory(inner, budget, initial)
+    } catch (t: Throwable) {
+        if (initial > 0) budget.release(initial)
+        throw t
+    }
+    try {
+        created += memory
+    } catch (t: Throwable) {
+        memory.releaseAll()
+        throw t
+    }
+    return memory
 }
 
 /**
@@ -1261,6 +1313,12 @@ private class EndiveWasmModule(
 ) : WasmModule {
     /** コンパイルしたコードで動かすなら `true`（テスト用） */
     val isCompiled: Boolean get() = compiled != null
+
+    /**
+     * インタプリタで動くコードを持つこと（#931）。[EndiveRuntime.load] が返す前に1回だけ書く（その後は変わらない。モジュールを渡す側の
+     * `ProgramCache` の完了が、ほかのスレッドへの公開になる）。コンパイルしない設定のランタイムでは `null`
+     */
+    override var interpreterUse: InterpreterUse? = null
 
     /** import の関数の型（関数の番号の順） */
     private val importFunctionTypes: List<FunctionType>

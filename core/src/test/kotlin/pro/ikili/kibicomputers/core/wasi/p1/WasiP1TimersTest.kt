@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineClock
@@ -23,7 +24,6 @@ import pro.ikili.kibicomputers.core.kernel.rt
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
-import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -37,8 +37,8 @@ class WasiP1TimersTest {
             .use { it.readBytes() }
     }
 
-    private val asyncProgram: Program by lazy { Program.loadMetered(EndiveRuntime(), bytes, null, WasiP1.WAIT_IMPORTS) }
-    private val plainProgram: Program by lazy { Program.load(EndiveRuntime(), bytes) }
+    private val asyncProgram: Program by lazy { SharedPrograms.loadMetered(bytes, WasiP1.WAIT_IMPORTS) }
+    private val plainProgram: Program by lazy { SharedPrograms.load(bytes) }
 
     /** JVM の時計で、ゲーム内時間だけ決まった値を返す */
     private val clock = object : MachineClock {

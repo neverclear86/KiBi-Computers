@@ -41,6 +41,7 @@ import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -181,12 +182,23 @@ class LuaCoroutineRestoreTest {
         return r
     }
 
-    /** [script] を保存せずに [END] まで動かした出力（比べる元） */
-    private fun reference(h: Harness, script: String, input: List<String> = emptyList(), fuelPerTick: Long = FUEL, tmp: Boolean = false): String {
+    /**
+     * [script] を保存せずに [END] まで動かした出力（比べる元）。[unwinds] があれば、その台が燃料切れで巻き戻った回数
+     * （[Machine.fuelUnwindCount]）を入れる
+     */
+    private fun reference(
+        h: Harness,
+        script: String,
+        input: List<String> = emptyList(),
+        fuelPerTick: Long = FUEL,
+        tmp: Boolean = false,
+        unwinds: AtomicLong? = null,
+    ): String {
         val m = h.machine(fuelPerTick = fuelPerTick)
         val s = start(m, TestMemoryFileSystem(), script, AtomicInteger(), tmp)
         for (line in input) send(m, s.input, line)
         tickUntil(h, m, s, "保存しない実行が終わらない") { END in output(m, s.output) }
+        unwinds?.set(m.fuelUnwindCount)
         return output(m, s.output).also { m.close() }
     }
 
@@ -383,9 +395,9 @@ class LuaCoroutineRestoreTest {
         val script = """
             print('rea' .. 'dy'); io.stdout:flush()
             local acc, parts, words = 7, {}, {}
-            for i = 1, 1500000 do
+            for i = 1, 150000 do
                 acc = (acc * 31 + i) % 1000003
-                if i % 15000 == 0 then
+                if i % 1500 == 0 then
                     parts[#parts + 1] = tostring(acc)
                     words[#words + 1] = string.format('%05x', acc):rep(2)
                 end
@@ -399,7 +411,8 @@ class LuaCoroutineRestoreTest {
             print('E' .. 'ND')
         """.trimIndent() + "\n"
         harness().use { h ->
-            val expected = reference(h, script, fuelPerTick = SMALL_FUEL)
+            val referenceUnwinds = AtomicLong()
+            val expected = reference(h, script, fuelPerTick = SMALL_FUEL, unwinds = referenceUnwinds)
             assertTrue(expected.startsWith("ready\nacc\t"), expected)
 
             val fs = TestMemoryFileSystem()
@@ -432,6 +445,9 @@ class LuaCoroutineRestoreTest {
             // 燃料は借りのことがあるので、tick を回し続ける
             tickUntil(h, r, s, "戻したプロセスが終わらない") { END in output(r, s.output) }
             assertEquals(expected, output(r, s.output))
+            // 計算の途中で燃料が何度も尽きて巻き戻っている（#993。15 万回のループで、保存しない側・戻した側とも約 370 回）
+            assertTrue(referenceUnwinds.get() >= 50, "保存しない実行の巻き戻しが少ない: ${referenceUnwinds.get()}")
+            assertTrue(r.fuelUnwindCount >= 50, "戻した後の巻き戻しが少ない: ${r.fuelUnwindCount}")
             r.close()
         }
     }

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
 import org.junit.jupiter.params.provider.ValueSource
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.eventually
@@ -54,8 +55,8 @@ class WasiP1KibiProcessTest {
     /** 待ち方: 待機点型（巻き戻し）・ブロッキング型・待たない（`AGAIN`） */
     enum class Mode { UNWIND, BLOCK, NONE }
 
-    private val asyncProgram: Program by lazy { Program.loadMetered(EndiveRuntime(), bytes, null, WasiP1.WAIT_IMPORTS) }
-    private val plainProgram: Program by lazy { Program.load(EndiveRuntime(), bytes) }
+    private val asyncProgram: Program by lazy { SharedPrograms.loadMetered(bytes, WasiP1.WAIT_IMPORTS) }
+    private val plainProgram: Program by lazy { SharedPrograms.load(bytes) }
 
     /** 待たない設定（[P1Wait.NONE]）で p1 を登録するドライバー */
     private class NoWaitDriver(private val program: Program) : ProcessDriver {
