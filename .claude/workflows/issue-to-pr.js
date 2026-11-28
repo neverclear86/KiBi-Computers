@@ -78,7 +78,7 @@ const FIX_BASE_DIFF = '段階の始めに worktree で `git rev-parse HEAD` を�
 function unpushedReportStep(branch) {
   return `最後に（push しなかったときも）、\`git fetch origin\` してから \`git rev-list origin/${branch}..HEAD\` を見る。空でなければ（コミットしたが push できなかったものが残っている）、unpushedCommits=true・pushed=false で、summary に残ったコミットの hash と push できなかった理由を書く（reset・stash で消さない）。空なら unpushedCommits=false。`
 }
-const PLATFORM_COMPILE_BOTH ='`:platform-neoforge-1.21.1:compileKotlin :platform-neoforge-1.21.1:compileDevKotlin :platform-forge-1.20.1:compileKotlin :platform-forge-1.20.1:compileDevKotlin`（main と、`src/dev/` の dev のソースセット）'
+const PLATFORM_COMPILE_BOTH = '`:platform-neoforge-1.21.1:compileKotlin :platform-neoforge-1.21.1:compileDevKotlin :platform-forge-1.20.1:compileKotlin :platform-forge-1.20.1:compileDevKotlin`（main と、`src/dev/` の dev のソースセット）'
 const FIX_LOCAL_CHECKS = `手元の確認（#985。通しの \`./gradlew build\` と両バージョンの \`runGameTestServer\` は、ここでは回さない。push の後の CI が確かめる）:
 - 差分の取り方: ${FIX_BASE_DIFF}。
 - 触ったファイルに合わせて、次のタスクを 1 本の \`./gradlew\` にまとめて回す（下の Gradle の決まりに従う）:
@@ -1101,7 +1101,7 @@ function mergePushStep(pr, branch, srcRef) {
 // 例外の判定は件名（`Merge ` で始まる、など）でなく親で行う（件名は任意に書ける）。マージのコミットの中身（衝突の解消の手直し）は調べない
 // （detectStack の「取り込みのマージはコードの直しとして数えない」と同じ割り切り）
 function unpushedCheckStep(branch, srcRef) {
-  return `push していないローカルのコミットを確かめる（#1007。レビューは GitHub 上の差分しか読まないので、ローカルにしかないコミットはレビューを通っていない）: \`git rev-list HEAD ^origin/${branch} ^origin/${srcRef}\` の各コミット \`<c>\` について、\`git rev-list --parents -n 1 <c>\` で親がちょうど 2 つ（3 つ以上のマージは不可）で、かつ \`git merge-base --is-ancestor <c>^2 origin/${srcRef}\` が真（2 つ目の親が取り込み元から辿れる。取り込みの続きのマージ）かを見る。1 つでも外れたら（ふつうのコミット、取り込み元でないものとのマージ）、**push しない**。`
+  return `push していないローカルのコミットを確かめる（#1007。レビューは GitHub 上の差分しか読まないので、ローカルにしかないコミットはレビューを通っていない）: \`git rev-list HEAD ^origin/${branch} ^origin/${srcRef}\` の各コミット \`<c>\` について、\`git rev-list --parents -n 1 <c>\` で親がちょうど 2 つ（3 つ以上のマージは不可）で、かつ \`git merge-base --is-ancestor <c>^2 origin/${srcRef}\` か \`git merge-base --is-ancestor <c>^2 origin/${branch}\` のどちらかが真（2 つ目の親が取り込み元か、このブランチの push 済みの先頭から辿れる。取り込みの続きのマージ。後者は、push が断られて取り込み直したときの、origin/${branch} を合わせるマージ）かを見る。1 つでも外れたら（ふつうのコミット、取り込み元でないものとのマージ）、**push しない**。`
 }
 
 // note は CI の回し直しのあと（#961）の指示。ログの名前は使わない（Gradle を動かさないので）

@@ -1784,6 +1784,8 @@ test('#1007 プロンプト: stack-sync とマージの段階は、push の前�
   assert.match(topSync, new RegExp(`git rev-list HEAD \\^origin/${TOP.branch} \\^origin/${LOWER.branch}`))
   for (const p of [lowerSync, topSync]) {
     assert.match(p, /merge-base --is-ancestor <c>\^2/)
+    // 取り込み直した合わせるマージ（2 つ目の親が origin/<branch> の古い先頭）も通す
+    assert.match(p, /merge-base --is-ancestor <c>\^2 origin\/issue-/)
     assert.match(p, /rev-list --parents -n 1/)
     assert.match(p, /\*\*push しない\*\*/)
     assert.match(p, /unpushedCommits=true/)
