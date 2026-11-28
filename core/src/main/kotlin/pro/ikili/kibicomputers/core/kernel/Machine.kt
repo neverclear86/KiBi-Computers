@@ -2921,6 +2921,7 @@ public class Machine private constructor(
                 // （pendingSchedule）になり、列で後ろの待ち手に先を越される。この待ち手から後ろは列に残し、スレッドが外れたら続きを起こす
                 // （[fuelWaiterThreadDetachedLocked]）
                 fuelWakeBlockedBy = rt
+                fuelWakeBlocks++
                 break
             }
             fuelWaiters.remove(rt)
@@ -2947,6 +2948,21 @@ public class Machine private constructor(
      * #956）。実行時だけ（保存しない）。カーネルロックの中で読み書きする
      */
     private var fuelWakeBlockedBy: ProcessRuntime? = null
+
+    /** [wakeFuelWaitersLocked] が待ち手で止めた回数（#956。カーネルロックの中で足す。テスト用） */
+    private var fuelWakeBlocks = 0L
+
+    /**
+     * 燃料待ちを起こすのが待ち手で止まっているか（#956）。止まっている間、その待ち手から後ろはまだ CPU の待ち行列にいないので、
+     * スライスを使い切って譲ったスレッドを持つ待ち手は、燃料を取り直さずに燃料待ちの列の後ろに並ぶ（ProcessRunner の acquireCpu）。カーネルロックの中で呼ぶ
+     */
+    internal fun isFuelWakeBlockedLocked(): Boolean = fuelWakeBlockedBy != null
+
+    /** 燃料待ちを起こすのを止めている待ち手の pid（いなければ null。#956。テスト用） */
+    internal val fuelWakeBlockedPid: Int? get() = lock.withLockValue { fuelWakeBlockedBy?.pid }
+
+    /** [wakeFuelWaitersLocked] が待ち手で止めた回数（#956。テスト用） */
+    internal val fuelWakeBlockCount: Long get() = lock.withLockValue { fuelWakeBlocks }
 
     /**
      * step のスレッドが [rt] から外れた（`rt.thread = null` の直後。カーネルロックの中で呼ぶ）。[rt] で燃料待ちを起こすのを止めていたら、

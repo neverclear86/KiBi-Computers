@@ -29,7 +29,9 @@ import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -259,6 +261,83 @@ class AsyncFuelTest {
     }
 
     @Test
+    fun `起こすのを止めた待ち手がスレッドの外れる前に止められても、後ろの待ち手はそのtickのうちに起こされる`() = timeout(limit) {
+        // 燃料待ちを起こすのを止めた待ち手（#956）が、step のスレッドが外れる前に kill されたとき。スレッドが外れるとき
+        // （ProcessRunner.unregister）は、止められたプロセスを終えた後に続きを起こす（終わった待ち手は列から外して飛ばす）。
+        // ここが壊れると、後ろの待ち手は次の tick まで起こされない（tick は手で進めるので、進めない限り起こされない）
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val slice = 20_000L
+            val m = h.machine(fuelPerTick = slice * 4, fuelSlice = slice)
+            val runs = ConcurrentHashMap<Int, AtomicInteger>()
+            h.scheduler.hooks.beforeFuelUnwound = { _, pid -> runs.computeIfAbsent(pid) { AtomicInteger() }.incrementAndGet() }
+            val spins = List(3) { Spin(h, m, listOf("main", "1000000", "100"), install = it == 0) }
+            eventually(30_000, "3 本とも燃料待ちにならない") { m.fuelWaiterCount == 3 }
+            // 燃料が尽きてから最初にスレッドを外そうとした 1 本を、放すまでスレッドを付けたまま止める
+            // （止めるときの割り込みで投げないよう、sleep でなく回して待つ）
+            val armed = AtomicBoolean(false)
+            val release = AtomicBoolean(false)
+            val held = AtomicInteger(0)
+            val afterKill = AtomicReference<Pair<Int, Int?>>()
+            h.scheduler.hooks.beforeUnregister = { mm, pid ->
+                if (armed.get() && mm.lock.withLockValue { mm.kernel.fuel <= 0 } && held.compareAndSet(0, pid)) {
+                    while (!release.get()) Thread.onSpinWait()
+                }
+            }
+            h.scheduler.hooks.afterUnregister = { mm, pid ->
+                // 止めた側のスレッドが外れた直後の列（ディスパッチャーが割り込む前に読む）
+                if (release.get() && pid == held.get()) {
+                    afterKill.compareAndSet(null, mm.lock.withLockValue { mm.fuelWaiterCount to mm.fuelWakeBlockedPid })
+                }
+            }
+            try {
+                armed.set(true)
+                // tick 1: 燃料を使い切ったところで 1 本がスレッドを付けたまま止まる
+                h.scheduler.tick()
+                awaitTickUsedUp(h, m, 1, 3)
+                val victim = held.get()
+                assertTrue(victim != 0, "スレッドを付けたまま止まった待ち手がいない")
+                fun total() = spins.sumOf { runs[it.pid]?.get() ?: 0 }
+                // 次の tick で、止まった 1 本のところで起こすのが止まる。前にいた待ち手は起こされて 1 スライス動き、譲って止まった 1 本の
+                // 後ろに並ぶ（止まった 1 本が列にいるので、待つ者がいると見て譲る）。全員が列に戻り、止まった 1 本の後ろの 2 本が
+                // まだその tick の燃料を残していれば、その形で止める。燃料が残っていなければ、次の tick（止まった 1 本が先頭）で同じことをする
+                var k = 1
+                while (true) {
+                    k++
+                    assertTrue(k <= 4, "止まった待ち手の後ろに、燃料の残った待ち手が並ばない")
+                    val blocks0 = m.fuelWakeBlockCount
+                    h.scheduler.tick()
+                    eventually(30_000, "tick $k: 止まった待ち手で起こすのが止まらない") { m.fuelWakeBlockCount > blocks0 }
+                    eventually(30_000, "tick $k: 止まった待ち手の後ろに全員が並ばない") {
+                        m.lock.withLockValue { m.fuelWaiterCount == 3 && m.fuelWakeBlockedPid == victim }
+                    }
+                    if (m.lock.withLockValue { m.fuelAccount.estimate(h.scheduler.now) > 0 }) break
+                }
+                assertTrue(m.lock.withLockValue { m.rt(victim).thread != null }, "止まった待ち手のスレッドが外れている")
+                val before = total()
+                // スレッドが外れる前に止め、それから放す
+                m.lock.withLockValue { m.killLocked(victim, KillSignal.KILL) }
+                release.set(true)
+                eventually(30_000, "止めた待ち手が終わらない") { m.stateOf(victim).isTerminal }
+                assertEquals(ProcessState.KILLED, m.stateOf(victim))
+                // tick を進めずに、後ろの 2 本がこの tick の残りの燃料を使い切る
+                awaitTickUsedUp(h, m, k, 2)
+                assertTrue(total() > before, "tick $k の残りの燃料で、後ろの待ち手が動いていない")
+                // 起こしていなければ、止めた待ち手（終わったもの）と後ろの 2 本が列に残り、止めている待ち手もそのまま
+                assertNotNull(afterKill.get(), "止めた待ち手のスレッドが外れたところを見ていない")
+                val (waiting, blocked) = afterKill.get()
+                assertNull(blocked, "スレッドが外れたときに、止めている待ち手を外していない")
+                assertTrue(waiting < 3, "スレッドが外れたときに、後ろの待ち手を起こしていない（燃料待ち $waiting）")
+            } finally {
+                // 落ちたときも、止めたスレッドを放す（放さないと、ほかのテストにスレッドが残る）
+                release.set(true)
+            }
+            h.scheduler.hooks.beforeUnregister = null
+            h.scheduler.hooks.afterUnregister = null
+            for (s in spins) m.lock.withLockValue { m.killLocked(s.pid, KillSignal.KILL) }
+        }
+    }
+
+    @Test
     fun `スライスがfuelPerTickと同じでも、計算し続ける2本が交互に動く`() = timeout(limit) {
         // 1 tick に 1 スライス。使い切った側が毎 tick 先頭で起こされると、もう 1 本が動けない
         assertRoundRobin(processes = 2, slicesPerTick = 1, ticks = 10)
@@ -319,6 +398,19 @@ class AsyncFuelTest {
     }
 
     @Test
+    fun `tickの境目で燃料待ちのスレッドが外れていなくても、待機点型2本とスレッドを持って待つ型1本の取り分は偏らない`() = timeout(limit) {
+        // 起こすのがスレッドを持たない待ち手で止まり（#956）、スレッドが外れたワーカーが続きを起こすとき、後ろにいるスレッドを持つ待ち手も
+        // 列の順に CPU の位置を予約する（#742、#737）。燃料が尽きたときだけスレッドが外れるのを遅らせて、この道を毎 tick 通す
+        val ticks = 12
+        val (counts, perTick) = mixed(waitPoints = 2, slicesPerTick = 4, ticks = ticks, setUp = ::delayUnregisterWithoutFuel)
+        val blockingSlices = perTick.sum()
+        assertTrue(perTick.all { it >= 1 }, "スレッドを持って待つ側が動かなかった tick がある: $perTick（巻き戻す側 $counts）")
+        assertTrue(counts.all { it >= ticks }, "巻き戻す側が飢えた: $counts（スレッドを持つ側 $perTick）")
+        val all = counts + blockingSlices
+        assertTrue(all.all { it in 13..19 }, "取り分が偏っている: 巻き戻す側 $counts、スレッドを持つ側 $blockingSlices（$perTick）")
+    }
+
+    @Test
     fun `スレッドを持たない待ち手が1tickのスライスの数以上いても、スレッドを持って待つ側は飢えない`() = timeout(limit) {
         // 4 スライスで巻き戻す側 4 本 + スレッドを持つ 1 本。予約がないと、巻き戻す側が先に 4 スライスを使い切り、スレッドを持つ側は
         // 毎 tick 燃料のない CPU しか取れなかった（#737）
@@ -365,8 +457,14 @@ class AsyncFuelTest {
      * [slicesPerTick] スライスの台で [ticks] tick 動かす。巻き戻す側それぞれが動いたスライスの数と、スレッドを持つ側が tick ごとに動いた
      * スライスの数（全部のスライス - 巻き戻す側の数）を返す
      */
-    private fun mixed(waitPoints: Int, slicesPerTick: Int, ticks: Int): Pair<List<Int>, List<Int>> {
+    private fun mixed(
+        waitPoints: Int,
+        slicesPerTick: Int,
+        ticks: Int,
+        setUp: ((Harness) -> Unit)? = null,
+    ): Pair<List<Int>, List<Int>> {
         Harness(execRuntime = EndiveRuntime()).use { h ->
+            setUp?.invoke(h)
             val slice = 20_000L
             val m = h.machine(fuelPerTick = slice * slicesPerTick, fuelSlice = slice)
             val runs = ConcurrentHashMap<Int, AtomicInteger>()
@@ -389,6 +487,10 @@ class AsyncFuelTest {
             }
             val counts = spins.map { runs[it.pid]?.get() ?: 0 }
             assertEquals(ticks * slicesPerTick - counts.sum(), perTick.sum())
+            // 遅らせる口を入れたときは、tick の境目で起こすのが待ち手で止まり、スレッドが外れてから続きを起こす道（#956）を通った
+            if (setUp != null) assertTrue(m.fuelWakeBlockCount > 0, "起こすのが待ち手で止まらなかった")
+            // setUp で足した遅らせる口は、止める前に外す
+            h.scheduler.hooks.beforeUnregister = null
             for (pid in spins.map { it.pid } + blocking) m.lock.withLockValue { m.killLocked(pid, KillSignal.KILL) }
             return counts to perTick
         }
