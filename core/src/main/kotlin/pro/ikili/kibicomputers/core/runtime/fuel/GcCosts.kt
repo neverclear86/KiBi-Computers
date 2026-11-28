@@ -56,10 +56,36 @@ internal object GcCosts {
     /** 型 [type] のフィールド・要素 1 つのバイト数（[REF_ELEMENT_BYTES] と、i31ref を入れられるなら [I31_BYTES]） */
     private fun slotBytes(type: ValType?): Long = REF_ELEMENT_BYTES + if (mayHoldI31(type)) I31_BYTES else 0L
 
-    /** struct の型 [typeIdx] のオブジェクト 1 つのバイト数。struct の型でなければ [WasmLoadException] */
+    /**
+     * struct の型 [typeIdx] のオブジェクト 1 つのバイト数。struct の型でなければ [WasmLoadException]。
+     * フィールドの数に比例する手間がかかるので、命令ごとに引くときは [StructBytes] を使う（#1009）
+     */
     fun structBytes(types: TypeSection, typeIdx: Long): Long {
         val st = subType(types, typeIdx)?.compType()?.structType() ?: throw WasmLoadException("型 $typeIdx が struct でない")
         return st.fieldTypes().fold(OBJECT_BYTES) { sum, f -> sum + slotBytes(f.storageType().valType()) }
+    }
+
+    /**
+     * struct の型ごとの [structBytes] を、型ごとに最初の 1 回だけ計算して覚えるもの（#1009）。命令ごとに全フィールドを走査すると、
+     * 「フィールドの数 × 命令の数」の手間になる。1 つの読み込みの中だけで使う（スレッドをまたいで共有しない）
+     */
+    class StructBytes(private val types: TypeSection) {
+        /** 型の番号ごとの値。[UNKNOWN] はまだ計算していない */
+        private val cache = LongArray(types.subTypeCount()) { UNKNOWN }
+
+        /** [structBytes] と同じ値。struct の型でなければ（範囲の外も）、引くたびに [WasmLoadException] */
+        operator fun get(typeIdx: Long): Long {
+            if (typeIdx !in cache.indices) return structBytes(types, typeIdx)
+            val i = typeIdx.toInt()
+            val known = cache[i]
+            if (known != UNKNOWN) return known
+            return structBytes(types, typeIdx).also { cache[i] = it }
+        }
+
+        private companion object {
+            /** バイト数は [OBJECT_BYTES] 以上なので、負の値を「まだ計算していない」の印に使える */
+            const val UNKNOWN: Long = -1
+        }
     }
 
     /**
@@ -99,14 +125,14 @@ internal object GcCosts {
      * 定数式があれば、その場所（「グローバル 3」など）を理由にして [WasmLoadException]
      */
     @Throws(WasmLoadException::class)
-    fun estimate(module: EndiveModule): ModuleEstimate {
+    fun estimate(module: EndiveModule, structs: StructBytes = StructBytes(module.typeSection())): ModuleEstimate {
         val types = module.typeSection()
         // 定数式の global.get で読める i32・i64 の値（import したグローバルは分からない）
         val known = ArrayList<Long?>()
         repeat(module.importSection().count(ExternalType.GLOBAL)) { known += null }
         var total = 0L
         module.globalSection().globals().forEachIndexed { i, g ->
-            val r = evaluate(g.initInstructions(), types, known) ?: throw WasmLoadException("グローバル $i の初期値が作る GC のオブジェクトの大きさを、読み込みのときに決められない")
+            val r = evaluate(g.initInstructions(), types, structs, known) ?: throw WasmLoadException("グローバル $i の初期値が作る GC のオブジェクトの大きさを、読み込みのときに決められない")
             total = saturatedAdd(total, r.bytes)
             known += if (g.valueType() == ValType.I32 || g.valueType() == ValType.I64) r.value else null
         }
@@ -120,7 +146,7 @@ internal object GcCosts {
             var longest = 0L
             for (init in el.initializers()) {
                 longest = maxOf(longest, init.count { it.opcode() != OpCode.END }.toLong())
-                val r = evaluate(init, types, known) ?: throw WasmLoadException("要素セグメント $i の式が作る GC のオブジェクトの大きさを、読み込みのときに決められない")
+                val r = evaluate(init, types, structs, known) ?: throw WasmLoadException("要素セグメント $i の式が作る GC のオブジェクトの大きさを、読み込みのときに決められない")
                 max = maxOf(max, r.bytes)
                 sum = saturatedAdd(sum, r.bytes)
             }
@@ -137,7 +163,7 @@ internal object GcCosts {
      * 定数式 [expr] を評価して、作るオブジェクトのバイト数と、結果の整数の値（分かれば）を返す。配列の長さが分からなければ `null`。
      * 式そのものの正しさは Endive の検証と `invalidPassiveElementInitializer`（#893）が確かめるので、ここでは値の数と長さだけを追う
      */
-    private fun evaluate(expr: List<Instruction>, types: TypeSection, globals: List<Long?>): Evaluated? {
+    private fun evaluate(expr: List<Instruction>, types: TypeSection, structs: StructBytes, globals: List<Long?>): Evaluated? {
         if (expr.none { isConstAllocation(it.opcode()) || it.opcode() == OpCode.REF_I31 }) {
             // オブジェクトを作らない式は、整数の値だけを追う（ほかのグローバルの配列の長さに使われうる）
             return Evaluated(0, simpleValue(expr, globals))
@@ -169,11 +195,11 @@ internal object GcCosts {
                     }
                     OpCode.STRUCT_NEW -> {
                         repeat(structFields(types, ins.operand(0))) { pop() }
-                        bytes = saturatedAdd(bytes, structBytes(types, ins.operand(0)))
+                        bytes = saturatedAdd(bytes, structs[ins.operand(0)])
                         stack += null
                     }
                     OpCode.STRUCT_NEW_DEFAULT -> {
-                        bytes = saturatedAdd(bytes, structBytes(types, ins.operand(0)))
+                        bytes = saturatedAdd(bytes, structs[ins.operand(0)])
                         stack += null
                     }
                     OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_DEFAULT -> {
@@ -247,18 +273,23 @@ internal object GcCosts {
  *
  * [needed] は、モジュールにどちらかがあるか（あれば import を 1 つ足す）。
  */
-internal class GcPlan(module: EndiveModule) {
+internal class GcPlan(module: EndiveModule, checkpoint: () -> Unit = {}) {
     private val types: TypeSection = module.typeSection()
 
+    /** struct の型ごとのバイト数（型ごとに 1 回だけ計算する。#1009） */
+    private val structs = GcCosts.StructBytes(types)
+
     /** 要素セグメントごとの、項目 1 つの式が作るオブジェクトの最大（[GcCosts.ModuleEstimate.elementItemBytes]） */
-    private val estimate = GcCosts.estimate(module)
+    private val estimate = GcCosts.estimate(module, structs)
     private val itemBytes: LongArray = estimate.elementItemBytes
 
     /** 要素セグメントごとの、項目 1 つの式の命令数（`end` を除く）の最大 */
     private val itemLength: LongArray = estimate.elementItemLength
 
     /** GC のオブジェクトを数える命令があるか */
-    val needed: Boolean = module.codeSection().functionBodies().any { body ->
+    val needed: Boolean = module.codeSection().functionBodies().withIndex().any { (i, body) ->
+        // 検証の時間の上限（#40）。本体の数が多いモジュールでも、途中で止められるようにする
+        if (i and 0xff == 0xff) checkpoint()
         body.instructions().any { staticBytes(it) != null || dynamicBytes(it) != null }
     }
 
@@ -272,7 +303,7 @@ internal class GcPlan(module: EndiveModule) {
 
     /** 大きさが命令だけで決まるオブジェクトのバイト数。当たらない命令なら `null` */
     fun staticBytes(ins: Instruction): Long? = when (ins.opcode()) {
-        OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT -> GcCosts.structBytes(types, ins.operand(0))
+        OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT -> structs[ins.operand(0)]
         OpCode.ARRAY_NEW_FIXED -> GcCosts.saturatedAdd(GcCosts.OBJECT_BYTES, GcCosts.arrayElementBytes(types, ins.operand(0)) * ins.operand(1))
         else -> null
     }

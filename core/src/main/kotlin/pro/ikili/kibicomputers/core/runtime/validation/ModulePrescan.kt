@@ -1,6 +1,14 @@
 package pro.ikili.kibicomputers.core.runtime.validation
 
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import run.endive.wasm.Parser
+import run.endive.wasm.types.CodeSection
+import run.endive.wasm.types.ElementSection
+import run.endive.wasm.types.GlobalSection
+import run.endive.wasm.types.Instruction
+import run.endive.wasm.types.OpCode
+import run.endive.wasm.types.SectionId
+import java.io.ByteArrayInputStream
 
 /**
  * ランタイムに渡す前の、WASM のバイナリの軽い確認（#40）。
@@ -15,8 +23,11 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
  * - 各セクションの要素の数が上限以下で、残りのバイト数以下（要素は 1 バイト以上なので、それより多いのは壊れている）
  * - 関数の本体の大きさと、宣言するローカル変数の数
  * - テーブルの最初の要素数
+ * - 型の数（rec グループの中の型も 1 つずつ数える）と、struct の型のフィールドの数（型 1 つと、全部の合計。#1009）
+ * - GC の型（struct・array）があれば、ランタイムの検証の手間が型の大きさ・即値に比例する命令（`struct.new`・`struct.new_default`・
+ *   `array.new_fixed`）の手間の合計（#1009。[checkGcWork]）
  *
- * 命令の中身や型の正しさは確かめない（ランタイムの検証に任せる）。
+ * ほかの命令の中身や型の正しさは確かめない（ランタイムの検証に任せる）。
  */
 internal object ModulePrescan {
     private val HEADER = byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00)
@@ -44,6 +55,7 @@ internal object ModulePrescan {
         for (i in 0 until 4) if (bytes[i] != HEADER[i]) fail("WASM のヘッダーがない")
         for (i in 4 until 8) if (bytes[i] != HEADER[i]) fail("WASM のコアモジュール（version 1）ではない")
         val r = Reader(bytes, HEADER.size, bytes.size)
+        var structFields: IntArray? = null
         while (r.pos < r.end) {
             val id = r.u8()
             val size = r.u32()
@@ -52,7 +64,7 @@ internal object ModulePrescan {
             r.pos = s.end
             when (id) {
                 SEC_CUSTOM, SEC_START, SEC_DATA_COUNT -> Unit
-                SEC_TYPE -> s.count("型", limits.maxTypes)
+                SEC_TYPE -> structFields = checkTypes(s, limits)
                 SEC_IMPORT -> s.count("import", limits.maxImports)
                 SEC_FUNCTION -> s.count("関数", limits.maxFunctions)
                 SEC_TABLE -> checkTables(s, limits)
@@ -67,6 +79,136 @@ internal object ModulePrescan {
             }
         }
         deadline?.check("構造の確認")
+        if (structFields != null) {
+            checkGcWork(bytes, structFields, limits, deadline)
+            deadline?.check("構造の確認")
+        }
+    }
+
+    /**
+     * 型のセクションを読み、型の数とフィールドの数を確かめる。GC の型（struct か array）があれば、平らな型の番号（rec グループの中の型を
+     * 1 つずつ数えた番号）ごとの struct のフィールドの数（struct でない型は 0）を返す。GC の型がなければ `null`
+     *
+     * 読み方は Endive 1.2.0 の `Parser.parseRecType` と同じ: `0x4E` は subtype のベクター、`0x50`・`0x4F` は親の型の番号のベクターと comptype、
+     * ほかは comptype だけ。comptype は `0x5E`（array）・`0x5F`（struct）・`0x60`（関数）で、ほかは断る（Endive も断る）
+     */
+    private fun checkTypes(s: Reader, limits: ModuleLimits): IntArray? {
+        val groups = s.count("型", limits.maxTypes)
+        var fields = IntArray(minOf(groups, 16))
+        var types = 0
+        var totalFields = 0L
+        var gc = false
+        fun subType() {
+            var form = s.u8()
+            if (form == 0x50 || form == 0x4F) {
+                repeat(s.count("親の型", limits.maxTypes)) { s.u32() }
+                form = s.u8()
+            }
+            var n = 0
+            when (form) {
+                0x5E -> {
+                    s.fieldType()
+                    gc = true
+                }
+                0x5F -> {
+                    val count = s.u32()
+                    if (count > limits.maxStructFields) fail("struct の型 $types のフィールドの数 $count が上限 ${limits.maxStructFields} を超える")
+                    if (count > s.end - s.pos) fail("struct の型 $types のフィールドの数 $count が型のセクションの大きさに合わない")
+                    totalFields += count
+                    if (totalFields > limits.maxTotalStructFields) fail("struct の型のフィールドの数の合計が上限 ${limits.maxTotalStructFields} を超える")
+                    repeat(count.toInt()) { s.fieldType() }
+                    n = count.toInt()
+                    gc = true
+                }
+                0x60 -> {
+                    repeat(s.count("関数の型の引数", Int.MAX_VALUE)) { s.valType() }
+                    repeat(s.count("関数の型の戻り値", Int.MAX_VALUE)) { s.valType() }
+                }
+                else -> fail("知らない型の形 0x${form.toString(16)}")
+            }
+            if (types >= limits.maxTypes) fail("型の数（rec グループの中の型も数える）が上限 ${limits.maxTypes} を超える")
+            if (types == fields.size) fields = fields.copyOf(maxOf(16, fields.size * 2))
+            fields[types++] = n
+        }
+        repeat(groups) {
+            if (s.peek() == 0x4E) {
+                s.u8()
+                repeat(s.count("rec グループの型", limits.maxTypes)) { subType() }
+            } else {
+                subType()
+            }
+        }
+        return if (gc) fields.copyOf(types) else null
+    }
+
+    /**
+     * ランタイムの検証の手間のうち、型の大きさ・即値に比例する分を数え、上限（[ModuleLimits.maxGcValidationWork]）を超えれば断る（#1009）。
+     *
+     * Endive 1.2.0 の検証は、`struct.new`・`struct.new_default` 1 つごとに型の全フィールドを、`array.new_fixed` 1 つごとに即値の数だけ
+     * オペランドを確かめる（`Validator.java`）。どれも型・即値の大きさに上限がないので、小さなモジュールで検証を何時間にも延ばせ、
+     * 検証は途中で止められない。そこで、関数の本体と定数式（グローバルの初期値・要素の式）の全部の命令について、
+     * `struct.new`・`struct.new_default` は型のフィールドの数、`array.new_fixed` は要素の数を足し上げる。届かない場所（`unreachable` の後）も数える
+     * （検証はそこも確かめる）。`array.new_fixed` は 1 つで重くできるので、1 つの要素の数にも上限（[ModuleLimits.maxArrayNewFixed]）を置く。
+     *
+     * 命令は Endive の検証なしの parse（型・グローバル・要素・コードのセクションだけ）で読む（後の検証が見るものと同じ並び）。
+     * parse が失敗するモジュールは、ここでは断らずに通す（後のランタイムの parse が同じところで失敗して、いつもの理由で断る。
+     * 重い検証は parse の後なので、そこには届かない）。struct でない型の番号は 0 と数える（検証は最初の命令で断る）
+     */
+    private fun checkGcWork(bytes: ByteArray, structFields: IntArray, limits: ModuleLimits, deadline: LoadDeadline?) {
+        val code = ArrayList<CodeSection>(1)
+        val globals = ArrayList<GlobalSection>(1)
+        val elements = ArrayList<ElementSection>(1)
+        try {
+            Parser.builder()
+                .withValidation(false)
+                .includeSectionId(SectionId.TYPE)
+                .includeSectionId(SectionId.GLOBAL)
+                .includeSectionId(SectionId.ELEMENT)
+                .includeSectionId(SectionId.CODE)
+                .build()
+                .parse(ByteArrayInputStream(bytes)) { section ->
+                    when (section) {
+                        is CodeSection -> code += section
+                        is GlobalSection -> globals += section
+                        is ElementSection -> elements += section
+                        else -> Unit
+                    }
+                }
+        } catch (e: RuntimeException) {
+            return
+        } catch (e: StackOverflowError) {
+            return
+        }
+        deadline?.check("構造の確認")
+        var work = 0L
+        var seen = 0
+        fun add(ins: Instruction) {
+            if (deadline != null && ++seen and 0xffff == 0) deadline.check("構造の確認")
+            when (ins.opcode()) {
+                OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT -> {
+                    val idx = ins.operand(0)
+                    if (idx in structFields.indices) work += structFields[idx.toInt()]
+                }
+                OpCode.ARRAY_NEW_FIXED -> {
+                    val n = ins.operand(1) and 0xFFFF_FFFFL
+                    if (n > limits.maxArrayNewFixed) fail("array.new_fixed の要素の数 $n が上限 ${limits.maxArrayNewFixed} を超える")
+                    work += n
+                }
+                else -> return
+            }
+            // 1 つ足す分は 2^32 未満なので、上限（Long）を超えたところで止めれば桁あふれしない
+            if (work > limits.maxGcValidationWork) {
+                fail("struct.new・array.new_fixed の検証の手間（フィールド・要素の数の合計）が上限 ${limits.maxGcValidationWork} を超える")
+            }
+        }
+        for (section in globals) for (g in section.globals()) g.initInstructions().forEach(::add)
+        for (section in elements) for (el in section.elements()) for (init in el.initializers()) init.forEach(::add)
+        for (section in code) {
+            for ((i, body) in section.functionBodies().withIndex()) {
+                body.instructions().forEach(::add)
+                if (deadline != null && i and 0xff == 0xff) deadline.check("構造の確認")
+            }
+        }
     }
 
     private fun checkTables(s: Reader, limits: ModuleLimits) {
@@ -143,6 +285,12 @@ internal object ModulePrescan {
             if (n > max) fail("${what}の数 $n が上限 $max を超える")
             if (n > end - pos) fail("${what}の数 $n がセクションの大きさに合わない")
             return n.toInt()
+        }
+
+        /** struct・array のフィールドの型（i8・i16 か値の型と、可変かの 1 バイト）を読み飛ばす */
+        fun fieldType() {
+            if (peek() == 0x78 || peek() == 0x77) u8() else valType()
+            u8()
         }
 
         /** 値の型（参照の型を含む）を読み飛ばす */

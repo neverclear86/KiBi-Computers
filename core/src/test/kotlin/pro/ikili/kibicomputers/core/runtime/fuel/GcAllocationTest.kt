@@ -797,4 +797,25 @@ class GcAllocationTest {
         assertNull(plan.elementFuel(newElems[1]))
         assertEquals(11L, plan.elementFuel(tableInit))
     }
+
+    @Test
+    fun `structのバイト数は型ごとに覚えた値でも、毎回計算した値と同じで、structでない型は毎回断る`() {
+        val module = Parser.parse(
+            WitTool.wat(
+                w(
+                    """
+                    (module
+                      (type %f (func))
+                      (rec (type %a (struct (field i32) (field anyref))) (type %b (struct)))
+                      (type %c (array i8)))
+                    """.trimIndent(),
+                ),
+            ),
+        )
+        val types = module.typeSection()
+        val structs = GcCosts.StructBytes(types)
+        for (idx in listOf(1L, 2L, 1L, 2L)) assertEquals(GcCosts.structBytes(types, idx), structs[idx])
+        assertEquals(GcCosts.OBJECT_BYTES + 2 * GcCosts.REF_ELEMENT_BYTES + GcCosts.I31_BYTES, structs[1])
+        for (idx in listOf(0L, 3L, 0L, 3L, 4L, -1L)) assertThrows<WasmLoadException>("型 $idx") { structs[idx] }
+    }
 }

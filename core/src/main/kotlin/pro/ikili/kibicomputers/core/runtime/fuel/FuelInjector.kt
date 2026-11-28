@@ -228,7 +228,7 @@ internal object FuelInjector {
         val newTypeIdx = module.typeSection().subTypeCount()
         val fuelFunc = importedFuncs
         // GC のオブジェクトを作る命令（と、オブジェクトを作る式の要素セグメントを使う命令）があれば、作る前に RAM に数える import を足す（#939）
-        val gc = GcPlan(module)
+        val gc = GcPlan(module, checkpoint)
         val gcFunc = if (gc.needed) fuelFunc + 1 else -1
         val addedFuncs = if (gc.needed) 2L else 1L
         // 共有するなら、グローバルの import の最後に足す（定義済みのグローバルが1つずれる）。しないなら、定義済みの最後に足す
