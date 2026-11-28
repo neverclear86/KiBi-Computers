@@ -59,8 +59,13 @@ class MachineQuiesceTest {
         }
     }
 
+    /**
+     * 止めている間は、起こされた待機点型は先へ進まない（CPU の許可が取れず、終わらない）。ここで確かめるのは、
+     * 進まないことと、最後に READY（待機点）へ戻ることだけ。途中で step を一度だけ始めて燃料待ちへ戻る一瞬が
+     * あるかどうかは問わない（その窓は次のテストが固定する）
+     */
     @Test
-    fun `止めている間は起こされた待機点型にstepが割り当てられず、READYのまま`() = timeout(limit) {
+    fun `止めている間は起こされた待機点型は先へ進まず、最後はREADYに戻る`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine()
             val gate = Gate(m)
@@ -75,6 +80,56 @@ class MachineQuiesceTest {
             }
             assertFalse(m.stateOf(pid).isTerminal, "止めている間は進まない")
             h.tickUntilTrue("READY にならない") { handle.readiness == SaveReadiness.READY }
+            handle.close()
+            h.tickUntilTrue("続かない") { m.stateOf(pid) == ProcessState.EXITED }
+        }
+    }
+
+    /**
+     * 止めた後に起こされると、ワーカーが CPU を受け取って step を1回だけ始め（`rt.thread` を登録する）、許可が取れずに
+     * 燃料待ちへ戻る（#1020）。その間はスレッドを持つので待機点ではなく TRANSIENT（ADR 0043、`isAtWaitPointLocked`）。
+     * 起こした直後（`thread == null` の `RUNNABLE`）に待機点を見ても、写しを取るまでにこの窓に入りうるので、保存するテストは
+     * 写しが取れるまで待つ。ここでは step の始めで止めて、窓を決まった順で作る。
+     *
+     * このテストは今の振る舞い（止めた後でも、起こされた待機点型は step を1回始める）を前提にして、その窓を再現する。
+     * 製品を「止めている間は step を割り当てない」に変えたら（窓がなくなる）、`beforeStepStart` が呼ばれず
+     * 「起こされた step が始まらない」で落ちるので、そのときは窓の再現ごとこのテストを消すか、前提を直す
+     */
+    @Test
+    fun `止めた後に起こされた待機点型は、stepを始めて燃料待ちに戻るまでの一瞬だけTRANSIENTで、待てばREADYに戻る`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            val pid = m.spawnTest(h.program(emptyModule()), gated(gate, code = 3, kind = ProcessKind.WAIT_POINT))
+            h.tickUntilTrue { m.stateOf(pid) == ProcessState.WAITING_EVENT }
+            val handle = m.quiesce()
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            h.releaseOnClose { release.countDown() }
+            h.scheduler.hooks.beforeStepStart = { machine, p ->
+                if (machine === m && p == pid) {
+                    entered.countDown()
+                    release.await()
+                }
+            }
+            try {
+                gate.open()
+                h.tickUntilTrue("起こされた step が始まらない") { entered.count == 0L }
+                assertEquals(SaveReadiness.TRANSIENT, handle.readiness, "step を始めた一瞬は待機点ではない")
+                assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+            } finally {
+                h.scheduler.hooks.beforeStepStart = null
+                release.countDown()
+            }
+            // 止めているので許可は取れず、スレッドを持たない RUNNABLE（待機点）に戻る
+            var snapshot: Any? = null
+            h.tickUntilTrue("写しが取れない") {
+                snapshot = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)
+                snapshot != null
+            }
+            assertEquals(ProcessState.RUNNABLE, m.stateOf(pid))
+            assertEquals(SaveReadiness.READY, handle.readiness)
+            assertTrue(m.isAtWaitPoint)
             handle.close()
             h.tickUntilTrue("続かない") { m.stateOf(pid) == ProcessState.EXITED }
         }
