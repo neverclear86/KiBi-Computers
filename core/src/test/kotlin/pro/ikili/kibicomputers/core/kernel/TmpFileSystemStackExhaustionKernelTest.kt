@@ -210,11 +210,31 @@ class TmpFileSystemStackExhaustionKernelTest {
                         h.scheduler.tick()
                         rt.process.state.isTerminal || m.state == MachineState.CRASHED
                     }
+                    // 終わりの片付け（finishLocked。インスタンスを閉じて線形メモリの区画の表などを返す）はマシンのロックの中で、
+                    // 状態を CRASHED にしてから進む（#1031）。ほかのスレッドからマシンのロックを取って（取れることも確かめる）、
+                    // 片付けが終わってから勘定を読む。ロックの中では数値を写すだけにする。
+                    // ロックが取れなくても（スタックが尽きた後にロックが残る形）、その回の診断の行と、ほかの失敗の原因を先に出すため、
+                    // 取れたかどうかの確かめは勘定を比べる直前に置く（取れなかったときの値はロックの外で読んだもの）
+                    val locked = m.lock.tryLock(5, TimeUnit.SECONDS)
+                    val tmpAfter: Long
+                    val processAfter: Long
+                    val machineAfter: Long
+                    val serverAfter: Long
+                    try {
+                        tmpAfter = tmp.usedBytes
+                        processAfter = rt.memory.usedBytes
+                        machineAfter = m.memoryAccount.usedBytes - tmpAfter
+                        serverAfter = h.scheduler.memoryAccount.usedBytes - tmpAfter
+                    } finally {
+                        if (locked) m.lock.unlock()
+                    }
+                    // /tmp のモニターは、マシンのロックを放してから取る（プロセスは終わっていて、/tmp はもう誰も変えない）
                     val problems = tmp.consistencyProblemsForTest()
                     println(
                         "#883 $kind $op（$r 回目）: 深さ ${round.next}、通った ${round.completed.get()}、断られた ${round.refused.get()}、" +
-                            "/tmp ${tmp.usedBytes}、マシン（/tmp を除く）$machineBefore → ${m.memoryAccount.usedBytes - tmp.usedBytes}、" +
-                            "サーバー（/tmp を除く）$serverBefore → ${h.scheduler.memoryAccount.usedBytes - tmp.usedBytes}、食い違い $problems",
+                            "/tmp $tmpAfter、プロセス $processAfter、マシン（/tmp を除く）$machineBefore → $machineAfter、" +
+                            "サーバー（/tmp を除く）$serverBefore → $serverAfter、食い違い $problems" +
+                            if (locked) "" else "、マシンのロックが取れない（勘定はロックの外で読んだ）: ${m.lock}",
                     )
                     round.unexpected?.let { throw AssertionError("$op: スタックが尽きた以外の失敗", it) }
                     assertEquals(MachineState.RUNNING, m.state, "マシンが壊れた（$r 回目、$op）: ${rt.lastError}")
@@ -223,11 +243,11 @@ class TmpFileSystemStackExhaustionKernelTest {
                     assertTrue(round.completed.get() > 0, "$op: 底の近くで本体が通った深さがない（試験の窓が底から遠い）")
                     assertTrue(round.refused.get() > 0, "$op: スタック不足で断られた深さがない（試験の窓が底まで届かない）")
                     assertEquals(emptyList<String>(), problems, "$op: /tmp の木と usedBytes が食い違った")
-                    assertEquals(machineBefore, m.memoryAccount.usedBytes - tmp.usedBytes, "$op: マシンの勘定が /tmp とずれた")
-                    assertEquals(serverBefore, h.scheduler.memoryAccount.usedBytes - tmp.usedBytes, "$op: サーバー全体の勘定が /tmp とずれた")
-                    // ほかのスレッドから、マシンのロックが取れる。同じ台と別の台のプロセスが進み続ける
-                    assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$r 回目、$op）: ${m.lock}")
-                    m.lock.unlock()
+                    // ほかのスレッドから、マシンのロックが取れる（取れないと、上の勘定は片付けの途中の値かもしれないので、比べる前に確かめる）
+                    assertTrue(locked, "マシンのロックが取れない（$r 回目、$op）: ${m.lock}")
+                    assertEquals(machineBefore, machineAfter, "$op: マシンの勘定が /tmp とずれた（プロセス $processAfter）")
+                    assertEquals(serverBefore, serverAfter, "$op: サーバー全体の勘定が /tmp とずれた（プロセス $processAfter）")
+                    // 同じ台と別の台のプロセスが進み続ける
                     val same = sameProgress.get()
                     val otherBefore = otherProgress.get()
                     h.tickUntilTrue("同じ台のプロセスが止まった（$r 回目、$op）") { sameProgress.get() > same + 2 }
