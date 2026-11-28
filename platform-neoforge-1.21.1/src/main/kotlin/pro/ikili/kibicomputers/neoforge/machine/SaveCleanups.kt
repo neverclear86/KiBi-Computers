@@ -31,6 +31,7 @@ import net.neoforged.neoforge.event.server.ServerStoppingEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.Opcodes
+import org.spongepowered.asm.mixin.extensibility.IMixinInfo
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineReference
@@ -41,6 +42,8 @@ import pro.ikili.kibicomputers.core.persist.SaveCleanupSettings
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.io.IOException
+import java.lang.reflect.Field
+import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.nio.file.DirectoryIteratorException
 import java.nio.file.Files
@@ -216,6 +219,23 @@ internal fun interface TransformAudit {
 }
 
 /**
+ * あるクラスを狙う Mixin の1つを写したもの（[ChunkReferenceProbe.mixinRegistry]。#969）。[name] は Mixin のクラス名、[accessor] はアクセサー・インボーカーだけの
+ * Mixin（インターフェース。[ChunkReferenceProbe.isAccessorMixin]）か、[hasPlugin] は Mixin の config に plugin（`IMixinConfigPlugin`）があるか
+ */
+internal data class MixinRecord(val name: String, val accessor: Boolean, val hasPlugin: Boolean) {
+    /** ログ・理由に載せる形 */
+    fun describe(): String = name + if (accessor && hasPlugin) " (accessor in a config with a plugin)" else ""
+}
+
+/**
+ * クラス名を狙う Mixin の一覧を返す口（[ChunkReferenceProbe.mixinRegistry]。テストは差し替える）。そのクラスの Mixin の記録がなければ `null`、
+ * 読むのに失敗したら例外
+ */
+internal fun interface MixinRegistry {
+    fun mixins(className: String): List<MixinRecord>?
+}
+
+/**
  * `owner.bin` の位置のチャンクに、その ID のケースがあるかを答える（#564。[MachineReferenceProbe]）。メインスレッドで問われ、答えはどのスレッドからでも返る。
  *
  * - ディメンションが今のサーバーにない（MOD を外しただけかもしれない）: [MachineReference.UNKNOWN]
@@ -238,7 +258,7 @@ internal fun interface TransformAudit {
  *
  * チャンクの NBT は覚えない（1,000 件分を持つと大きいため。同じチャンクを何度か読むことはある。問いの数は [SaveCleanupSettings.maxProbesInFlight] まで）
  *
- * [regionNamesTrusted] は、チャンクを読み書きする側（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）に処理を書き換える Mixin が当たっておらず、
+ * [regionNamesTrusted] は、チャンクを読み書きする側（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` と、その入れ子のクラス）に処理を書き換える Mixin が当たっておらず、
  * 実際に使われているインスタンスがバニラのクラスそのもので、coremod などの変換も当たっていないか（`ChunkMap` も含む。[untrustedRegionStorage]）。
  * 作るときに1回だけ決める（メインスレッドで作る。問いごと・IO のスレッドでは調べない）。テストは差し替える
  */
@@ -343,6 +363,45 @@ internal class ChunkReferenceProbe(
         private val REGION_STORAGE_CLASSES: List<Class<*>> =
             listOf(RegionFileStorage::class.java, RegionFile::class.java, IOWorker::class.java, ChunkStorage::class.java)
 
+        /**
+         * [REGION_STORAGE_CLASSES] の入れ子のクラスの名前（#969。1.21.1 の実物にあるもの。匿名のクラスはない。ラムダの本体は外側のクラスの synthetic なメソッドなので、外側のクラスで見えている）。
+         * `RegionFile$ChunkBuffer` は `close` で書き込み先を決める。`IOWorker$PendingStore`・`IOWorker$Priority`・`RegionFile$CommitOp` はデータ・enum・関数のインターフェースに近いが、
+         * 数件で掃除1回につき定数のコストなので同じに見る。一覧は版で変わりうるので、GameTest が実物の `declaredClasses` と比べる
+         */
+        val NESTED_REGION_STORAGE_CLASSES: List<String> = listOf(
+            "net.minecraft.world.level.chunk.storage.IOWorker\$PendingStore",
+            "net.minecraft.world.level.chunk.storage.IOWorker\$Priority",
+            "net.minecraft.world.level.chunk.storage.RegionFile\$ChunkBuffer",
+            "net.minecraft.world.level.chunk.storage.RegionFile\$CommitOp",
+        )
+
+        /**
+         * 入れ子のクラス（[names]）を読み込む（初期化はしない。まだ読み込まれていなければ、ここで読み込まれて変換が走り、記録が残る）。
+         * 読み込めたクラスと、読み込めなかったものの理由（「クラス名: not found」。[untrustedRegionStorage] は数える）を返す
+         */
+        fun nestedRegionStorage(
+            names: List<String> = NESTED_REGION_STORAGE_CLASSES,
+            load: (String) -> Class<*> = { Class.forName(it, false, RegionFile::class.java.classLoader) },
+        ): Pair<List<Class<*>>, List<String>> {
+            val loaded = ArrayList<Class<*>>()
+            val missing = ArrayList<String>()
+            for (name in names) {
+                try {
+                    loaded += load(name)
+                } catch (e: ReflectiveOperationException) {
+                    missing += "$name: not found"
+                } catch (e: RuntimeException) {
+                    missing += "$name: not found"
+                } catch (e: LinkageError) {
+                    missing += "$name: not found"
+                }
+            }
+            return loaded to missing
+        }
+
+        /** リージョンファイルの名前と中身を決めるクラス（[REGION_STORAGE_CLASSES] とその入れ子のうち、読み込めたもの） */
+        fun regionStorageClasses(): List<Class<*>> = REGION_STORAGE_CLASSES + nestedRegionStorage().first
+
         /** Mixin が合わせたメソッドに付ける印（実行時に見える注釈） */
         private const val MIXIN_MERGED = "org.spongepowered.asm.mixin.transformer.meta.MixinMerged"
 
@@ -350,30 +409,101 @@ internal class ChunkReferenceProbe(
          * サーバー [server] のチャンクを読み書きする側が、既定の作りと確かめられない理由（空なら既定の作り）。
          * 既定の作りなら「リージョンファイル `r.X.Z.mca` がない ⇒ そのチャンクはない」が成り立つ（外部のチャンクファイル `.mcc` はリージョンのヘッダーからしか指されない）。
          *
-         * 3つを見る。
-         * - クラスの書き換え（[modifiedRegionStorage]）: `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` に、処理を書き換える Mixin が当たっていないか。
+         * 3つを見る。対象のクラスは、`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` と、その入れ子のクラス（[NESTED_REGION_STORAGE_CLASSES]。#969。読み込めなければ数える）。
+         * - クラスの書き換え（[modifiedRegionStorage]）: 対象のクラスに、処理を書き換える Mixin が当たっていないか。
          *   `ChunkMap` は、`ChunkStorage` のメソッドを上書きする Mixin が当たっていないか
          * - 差し替え（[substitutedRegionStorage]）: 全ディメンションで、実際に使われている `ChunkMap`・`IOWorker`・`RegionFileStorage` のインスタンスがバニラのクラスそのものか。
          *   `IOWorker` は `final` でなく、コンストラクターは `protected`、`loadAsync`・`store` は上書きできるので、バイトコードを書き換えなくてもサブクラスが作れる。
          *   それを `ChunkStorage.worker`（`final`）に入れるのは、アクセサーの Mixin・リフレクション・AT で足りる（アクセサーの Mixin はクラスの書き換えとしては数えないので、こちらで見る）
-         * - 変換の記録（[transformedRegionStorage]。#959）: 上の4クラスと `ChunkMap` に、coremod などの変換（ModLauncher の記録の TRANSFORMER、許可した名前でない PLUGIN）が当たっていないか。
-         *   coremod はメソッドの本体を書き換えても、Mixin の印にも実行時のクラスにも現れないので、ModLauncher の記録で見る。[audit] はテストが差し替える
+         * - 変換の記録（[transformedRegionStorage]。#959）: 対象のクラスと `ChunkMap` に、coremod などの変換（ModLauncher の記録の TRANSFORMER、許可した名前でない PLUGIN）が当たっていないか。
+         *   coremod はメソッドの本体を書き換えても、Mixin の印にも実行時のクラスにも現れないので、ModLauncher の記録で見る。[audit] はテストが差し替える。
+         *   対象のクラス（`ChunkMap` を除く）に PLUGIN `mixin` があれば、Mixin の記録（[mixins]。#969）で、当たった Mixin がアクセサーだけ（plugin のない config のもの）と説明できるかも見る
+         *   （合わせたメンバーのない Mixin は印が付かないため）
          *
          * 調べるのに失敗したら、確かめられないとして理由に数える（残す側）。掃除1回につき1回、メインスレッドで呼ぶ（問いごと・IO のスレッドでは調べない）
          */
-        fun untrustedRegionStorage(server: MinecraftServer, audit: TransformAudit? = modLauncherAudit()): List<String> =
-            modifiedRegionStorage() + substitutedRegionStorage(server) + transformedRegionStorage(audit)
-
-        /** 変換の記録を見るクラス（[transformedRegionStorage]）。[REGION_STORAGE_CLASSES] に `ChunkMap` を足したもの */
-        private val AUDITED_CLASSES: List<Class<*>> = REGION_STORAGE_CLASSES + ChunkMap::class.java
+        fun untrustedRegionStorage(
+            server: MinecraftServer,
+            audit: TransformAudit? = modLauncherAudit(),
+            mixins: MixinRegistry? = mixinRegistry(),
+            nestedStorage: () -> Pair<List<Class<*>>, List<String>> = { nestedRegionStorage() },
+        ): List<String> {
+            val (nested, missing) = nestedStorage()
+            val storage = REGION_STORAGE_CLASSES + nested
+            return missing + modifiedRegionStorage(storage) + substitutedRegionStorage(server) +
+                transformedRegionStorage(audit, storage + ChunkMap::class.java, mixins = mixins, mixinChecked = storage.toSet())
+        }
 
         /**
          * 変換の記録の PLUGIN のうち、数えないもの（launch plugin の名前。前方一致でなく、名前がそのまま一致するものだけ）。
          * - `accesstransformer`: アクセス修飾子だけを変える（製品の環境では、このプロジェクト自身の AT もこれで当たる）
-         * - `mixin`: Mixin は合わせたメンバーの印（[modifiedRegionStorage]）で細かく見ていて、`ChunkMap` の性能のための Mixin を数えない方針もそちらで保つ
+         * - `mixin`: Mixin は合わせたメンバーの印（[modifiedRegionStorage]）と、Mixin の記録（[unexplainedMixins]。`ChunkMap` 以外）で細かく見る。
+         *   `ChunkMap` の性能のための Mixin を数えない方針は、`ChunkMap` では Mixin の記録を見ないことで保つ
          * - `runtimedistcleaner`: 反対側（クライアント）だけのメンバーを消すだけで、処理を変えない
          */
         private val HARMLESS_PLUGINS: Set<String> = setOf("accesstransformer", "mixin", "runtimedistcleaner")
+
+        /** Mixin の launch plugin の名前（変換の記録の PLUGIN の先頭） */
+        private const val MIXIN_PLUGIN = "mixin"
+
+        /** Mixin がクラスの情報を覚える表（`ClassInfo`。公開の API でないので、反射で読む） */
+        private const val CLASS_INFO = "org.spongepowered.asm.mixin.transformer.ClassInfo"
+
+        /**
+         * `ClassInfo.fromCache(String)`（public static）と、private のフィールド `mixins`（そのクラスを狙う MixinInfo の `HashSet`。それを返す package-private の `getMixins()` は、
+         * 配られている jar では削られていて引けない）。引けなければ例外（毎回引き直す）
+         */
+        private val classInfoAccess: Pair<Method, Field> by lazy {
+            val type = Class.forName(CLASS_INFO, false, RegionFile::class.java.classLoader)
+            val fromCache = type.getMethod("fromCache", String::class.java)
+            val mixins = type.getDeclaredField("mixins").apply { isAccessible = true }
+            fromCache to mixins
+        }
+
+        /**
+         * Mixin の記録を読む口（#969）。クラス名の `ClassInfo` を Mixin のキャッシュから引き（`fromCache`。キャッシュにない名前のクラスを読み込む `forName` は使わない）、
+         * そのクラスを狙う Mixin（フィールド `mixins`。Mixin の config を準備するときに、対象のクラスごとに入る）を写して返す。キャッシュにない・`null` なら `null`。
+         * Mixin の版が変わって反射が通らない、読むのに失敗した（集合はほかのスレッドのクラスの読み込みと同時に書き換わりうるので、すぐに写し、写すのに失敗したら）は例外
+         * （[unexplainedMixins] は数える）。Mixin のロックは取らない（ほかのスレッドのクラスの読み込みを待たせない）。
+         * Mixin がアクセサーかは、クラスファイルのアクセスフラグで見る（[isAccessorMixin]。`getClassNode` などの重い読み直しはしない）。
+         * 返す口を作るだけでは反射しない（呼ばれたときに引く。PLUGIN `mixin` のないバニラの環境では呼ばれない）
+         */
+        fun mixinRegistry(): MixinRegistry = MixinRegistry { name ->
+            val (fromCache, mixinsField) = classInfoAccess
+            val info = fromCache.invoke(null, name) ?: return@MixinRegistry null
+            val targeting = mixinsField.get(info) as? Collection<*> ?: return@MixinRegistry null
+            val loader = RegionFile::class.java.classLoader
+            ArrayList(targeting).map { mixin ->
+                mixin as IMixinInfo
+                val className = mixin.className
+                MixinRecord(className, isAccessorMixin(loader, className), mixin.config?.plugin != null)
+            }
+        }
+
+        /**
+         * PLUGIN `mixin` の記録があるクラス [name] の Mixin を、Mixin の記録 [mixins] で説明できなければ、その理由（説明できれば `null`）。
+         *
+         * 説明できるのは、そのクラスを狙う Mixin が1つ以上あり、すべてアクセサー・インボーカーだけの Mixin で、その config に plugin がないときだけ。
+         * plugin の `preApply`・`postApply` は、その config の Mixin が当たるたびに対象の ClassNode を受け取って書き換えられるので、アクセサーでも plugin のある config のものは数える。
+         * 処理を書き換える Mixin は、合わせたメンバーの有無を問わず数える（空の Mixin・`<clinit>` だけの Mixin が見える）。性能のための Mixin とは分けられない
+         * （Mixin の名前・config・plugin・MOD からは、形式を変えるかが分からない）。記録が引けない・ない・空（PLUGIN `mixin` があるのに説明できない）・読めないも数える
+         */
+        fun unexplainedMixins(name: String, mixins: MixinRegistry?): String? {
+            if (mixins == null) return "the mixin records are unavailable"
+            val records = try {
+                mixins.mixins(name)
+            } catch (e: ReflectiveOperationException) {
+                return "the mixin records are unreadable"
+            } catch (e: RuntimeException) {
+                return "the mixin records are unreadable"
+            } catch (e: LinkageError) {
+                return "the mixin records are unreadable"
+            }
+            if (records.isNullOrEmpty()) return "no mixin record explains the mixin transformation"
+            val counted = records.filter { !it.accessor || it.hasPlugin }
+            if (counted.isEmpty()) return null
+            return "mixin ${counted.joinToString { it.describe() }}".take(MAX_ACTIVITY_LENGTH)
+        }
 
         /** 理由に載せる記録の文字列の長さの上限（ログの1行を長くしすぎない） */
         private const val MAX_ACTIVITY_LENGTH = 200
@@ -398,29 +528,40 @@ internal class ChunkReferenceProbe(
             null
         }
 
+        /** 変換の記録を見る既定のクラス（[transformedRegionStorage]）。[regionStorageClasses] に `ChunkMap` を足したもの */
+        fun auditedClasses(): List<Class<*>> = regionStorageClasses() + ChunkMap::class.java
+
         /**
-         * チャンクを読み書きする経路のクラス（[AUDITED_CLASSES]）のうち、coremod などの変換が当たったもの（「クラス名: 記録」。確かめられなければ「クラス名: 理由」）。
+         * チャンクを読み書きする経路のクラス（[classes]。既定は [auditedClasses]）のうち、coremod などの変換が当たったもの（「クラス名: 記録」。確かめられなければ「クラス名: 理由」）。
          *
          * ModLauncher の変換の記録で見る。FML の coremod（JS・Java の `ICoreMod`）とほかの `ITransformationService` の変換は TRANSFORMER として、
          * 書き換えた launch plugin は PLUGIN として残る。TRANSFORMER は1つでもあれば数え、PLUGIN は [HARMLESS_PLUGINS] にない名前なら数える（REASON は数えない）。
+         * [mixinChecked] のクラス（既定は `ChunkMap` 以外の [regionStorageClasses]）に PLUGIN `mixin` があれば、Mixin の記録 [mixins] で説明できるかを見て、
+         * できなければ数える（[unexplainedMixins]。#969）。PLUGIN `mixin` のないクラスでは Mixin の記録を引かない（Mixin の内部の読みが版上げで壊れても、
+         * Mixin の当たっていない環境の回収は止まらない）。Mixin の当たったクラスでは、PLUGIN `mixin` は相（`A`・`B`）の印として必ず残る。
+         * Mixin 自身が足す `mixin:APP:…` などの記録は、Mixin の監査の口がスレッドの間で同期されないので抜けうる。判定には使わない。
          * 記録が空であることは、変換されていないことの証拠にならない（変換も plugin もないクラスは、記録を残さずに読み込まれる）。そこで、
          * クラスが ModLauncher の `TransformingClassLoader` で読み込まれていること（[transforming]。そうでなければ、記録の外で読み込まれた）も確かめる。
          * 記録が引けない（[audit] が `null`）、読むのに失敗した、クラスローダーが違う、はどれも数える（残す側）。
          *
-         * 見えないもの: JVM エージェント（`java.lang.instrument`）の書き換えと、記録の外での書き換え（[modifiedRegionStorage]）。入れ子のクラス
-         * （`IOWorker$PendingStore` など）は見ない。掃除1回につき1回、メインスレッドで呼ぶ（クラスの数だけ記録を写す。台の数によらない）
+         * 見えないもの: JVM エージェント（`java.lang.instrument`）の書き換えと、記録の外での書き換え（[modifiedRegionStorage]）。
+         * 掃除1回につき1回、メインスレッドで呼ぶ（クラスの数だけ記録を写す。台の数によらない）
          */
         fun transformedRegionStorage(
             audit: TransformAudit?,
-            classes: List<Class<*>> = AUDITED_CLASSES,
+            classes: List<Class<*>> = auditedClasses(),
             transforming: (Class<*>) -> Boolean = { it.classLoader is TransformingClassLoader },
+            mixins: MixinRegistry? = mixinRegistry(),
+            mixinChecked: Set<Class<*>> = regionStorageClasses().toSet(),
         ): List<String> = classes.mapNotNull { type ->
             val name = type.name
             if (audit == null) return@mapNotNull "$name: the transformer audit trail is unavailable"
             try {
                 if (!transforming(type)) return@mapNotNull "$name: not loaded by the transforming class loader"
                 val activities = audit.activities(name) ?: return@mapNotNull "$name: the transformer audit trail is unavailable"
-                activities.firstOrNull { transformsCode(it) }?.let { "$name: ${it.describe().take(MAX_ACTIVITY_LENGTH)}" }
+                activities.firstOrNull { transformsCode(it) }?.let { return@mapNotNull "$name: ${it.describe().take(MAX_ACTIVITY_LENGTH)}" }
+                val mixed = activities.any { it.type == TransformActivity.PLUGIN && it.context.firstOrNull() == MIXIN_PLUGIN }
+                if (mixed && type in mixinChecked) unexplainedMixins(name, mixins)?.let { "$name: $it" } else null
             } catch (e: RuntimeException) {
                 "$name: the transformer audit trail is unreadable"
             } catch (e: LinkageError) {
@@ -436,23 +577,24 @@ internal class ChunkReferenceProbe(
         }
 
         /**
-         * チャンクを読み書きする経路のクラス（[REGION_STORAGE_CLASSES]）のうち、処理を書き換える Mixin が当たったもの（の名前）。
+         * チャンクを読み書きする経路のクラス（[classes]。既定は [regionStorageClasses]）のうち、処理を書き換える Mixin が当たったもの（の名前）。
          *
          * Mixin は、合わせたメンバーの印（`@MixinMerged`。[isMixinTarget]）で見る。調べるのに失敗したら、当たったものとして数える（残す側）。
          * アクセサー・インボーカーだけの Mixin（NeoForge 自身が `BlockEntityType` などに当てているもの。[isAccessorMixin]）は、処理を書き換えないので数えない
          * （それで入れ替えたインスタンスは [substitutedRegionStorage] が見る）。
          * 処理を書き換える Mixin は、形式を変えないもの（性能のためのもの）も区別できず数える。その環境では、リージョンファイルのない位置の残骸は回収されない（毎回「判定できない」）。
          *
-         * 見えないもの: 合わせたメソッド・フィールドを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、
-         * `<clinit>` だけの Mixin。どちらも印が付かない）と、JVM エージェントの書き換え（coremod は [transformedRegionStorage] が変換の記録で見る）。当てたクラスの記録（`Mixins.getMixinsForClass`）は、
-         * 適用の記録が Mixin 自身のクラスの側にしか付かず、対象のクラスでは作りの上で常に空なので使わない。
+         * 印の付かない Mixin（合わせたメソッド・フィールドを1つも持たない Mixin。`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、
+         * `<clinit>` だけの Mixin）は、ここでは見えず、変換の記録の PLUGIN `mixin` と Mixin の記録（[transformedRegionStorage]・[unexplainedMixins]。#969）で見る。
+         * 見えないもの: JVM エージェントの書き換え（coremod は [transformedRegionStorage] が変換の記録で見る）。当てたクラスの記録（`Mixins.getMixinsForClass`）は、
+         * 適用の記録が Mixin 自身のクラスの側にしか付かず、対象のクラスでは作りの上で常に空なので使わない（狙う Mixin の記録は `ClassInfo` の別の集合にある。[mixinRegistry]）。
          * `ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので、Mixin が当たったこと自体は数えない（数えると、ほとんどの環境で
          * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。
          * ただし、`ChunkStorage` のメソッド（`read`・`write` など）を `ChunkMap` で上書きする Mixin（Mixin のクラスが `ChunkStorage` を継承して override を足す形）は、
          * チャンクの読み書きをすべて横取りできるので数える（[overridesWithMixin]）
          */
-        fun modifiedRegionStorage(): List<String> =
-            REGION_STORAGE_CLASSES.filter { isMixinTarget(it) }.map { it.name } +
+        fun modifiedRegionStorage(classes: List<Class<*>> = regionStorageClasses()): List<String> =
+            classes.filter { isMixinTarget(it) }.map { it.name } +
                 listOfNotNull(ChunkMap::class.java.name.takeIf { overridesWithMixin(ChunkMap::class.java, ChunkStorage::class.java) })
 
         /**
@@ -514,7 +656,8 @@ internal class ChunkReferenceProbe(
         }
 
         /**
-         * Mixin のクラス [mixin] が、アクセサー・インボーカーだけのもの（インターフェース）か。Mixin のインターフェースにはアクセサーとインボーカーしか書けない。
+         * Mixin のクラス [mixin] が、アクセサー・インボーカーだけのもの（インターフェース）か。Mixin のインターフェースには、ふつうアクセサーとインボーカーしか書けない。
+         * ただし、クラスを狙うインターフェースの Mixin でも、synthetic なメソッドや `<clinit>` は印なしで対象に足されうる（sponge-mixin 0.16.4）。この判定はアクセスフラグだけを見るので、それは見えない（ADR 0564 の限界）。
          * 処理を書き換えるクラスの Mixin は Mixin が読み込みを弾く（`isLoadable()` が偽）が、アクセサーの Mixin は対象のクラスが実装するインターフェースとして読み込まれる。
          * どちらも読み込まずに同じ方法で扱えるよう、クラスファイルのアクセスフラグを読む。名前がない・読めないなら `false`（数える）
          */
