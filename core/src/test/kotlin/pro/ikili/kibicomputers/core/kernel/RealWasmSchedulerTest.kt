@@ -14,12 +14,20 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** 実際の Endive で fib.wasm（燃料を計測しない。#38 の挿入がまだないため）を動かす。燃料のテストは FakeWasmRuntime で行う。 */
+/**
+ * 実際の Endive で、燃料を計測しない読み込み（[SharedPrograms.load]。挿入なし）の WASM を動かす。
+ * 計算中の pauseAll が時間切れになることと、割り込みによる停止を確かめる（ADR 0043）。燃料の計測は FuelMeteringTest で確かめる。
+ */
 class RealWasmSchedulerTest {
-    private val fib: Program by lazy {
-        val bytes = javaClass.getResourceAsStream("/kibicomputers/wasm/fib.wasm")?.use { it.readBytes() }
-        assertNotNull(bytes, "fib.wasm がリソースにない")
-        SharedPrograms.load(bytes!!)
+    private val fib: Program by lazy { loadResource("fib.wasm") }
+
+    /** fuel.wasm の `forever`（燃料を入れない読み込みでは、割り込み以外では終わらない無限ループ）を呼ぶためのもの（#994）。 */
+    private val forever: Program by lazy { loadResource("fuel.wasm") }
+
+    private fun loadResource(name: String): Program {
+        val bytes = javaClass.getResourceAsStream("/kibicomputers/wasm/$name")?.use { it.readBytes() }
+        assertNotNull(bytes, "$name がリソースにない")
+        return SharedPrograms.load(bytes!!)
     }
 
     private fun fibDriver(n: Int, result: AtomicLong) = TestDriver(ProcessKind.BLOCKING) { ctx ->
@@ -40,11 +48,20 @@ class RealWasmSchedulerTest {
         }
     }
 
+    /**
+     * 計算は本当に終わらない（#994。前は 2^31 回のループで、負荷の下では stop より先に終わることがあった）。
+     * 割り込みが効かないと stop でも Harness の片付けでも止まらないので、Endive を上げたときの検査を兼ねる。
+     */
     @Test
     fun `終わらない計算はpauseAllでTimeoutExceptionになり、stopでEndiveの中断によってKILLEDになる`() = timeout(Duration.ofSeconds(30)) {
         Harness().use { h ->
             val m = h.machine()
-            val pid = m.spawnTest(fib, fibDriver(0x7fffffff, AtomicLong()), unmetered = true)
+            val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                ctx.instance.call("forever")
+                // ここには届かない。届けば EXITED になり、下の assertState で落ちる
+                StepResult.Exit(0)
+            }
+            val pid = m.spawnTest(forever, driver, unmetered = true)
             eventually { h.scheduler.activeProcesses == 1 }
             assertThrows<TimeoutException> { h.scheduler.pauseAll(100) }
             m.stop()
