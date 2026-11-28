@@ -48,7 +48,11 @@ class InitTest {
 
         fun text(): String = out.toString().replace("\r\n", "\n")
 
-        fun lines(): List<String> = text().lines().filter { it.isNotEmpty() }
+        /**
+         * 改行まで届いた行だけ（[timed] と同じ一覧）。書きかけの最後の行は含めない。
+         * [boot] の until はこれで判定する: 書きかけの行で成立すると、stop の後にその行の残りが届かず、返す一覧から落ちる（#1006）
+         */
+        fun completedLines(): List<String> = synchronized(timed) { timed.map { it.first } }
     }
 
     private val image: ImageFileSystem by lazy { requireNotNull(ImageFileSystem.bundled("os")) { "os.zip がリソースにない" } }
@@ -78,7 +82,11 @@ class InitTest {
         override fun open(diskId: String): BootVolume? = if (diskId == "d") BootVolume(fs, readOnly = false) else null
     }
 
-    /** [files] を置いたディスクから起動し、[until] がそろうまで tick を回してから止める。コンソールの行を返す */
+    /**
+     * [files] を置いたディスクから起動し、[until] がそろうまで tick を回してから止める。コンソールの行を返す。
+     * [until] には改行まで届いた行だけを渡す（[ConsoleHost.completedLines]。返す一覧と同じもの）。
+     * 書きかけの行で成立すると、stop の後にその行の残りが届かず、返す一覧から落ちるため（#1006）
+     */
     private fun boot(
         files: Map<String, ByteArray>,
         dirs: List<String> = emptyList(),
@@ -101,7 +109,7 @@ class InitTest {
             eventuallyDescribe(90_000, { "そろわない: ${host.text()}" }) {
                 h.scheduler.tick()
                 Thread.sleep(1)
-                until(host.lines())
+                until(host.completedLines())
             }
             m.stop()
             eventually(30_000, "止まらない") {
@@ -111,6 +119,23 @@ class InitTest {
             }
             assertTrue(m.awaitTermination(5_000))
             synchronized(host.timed) { host.timed.toList() }
+        }
+    }
+
+    @Test
+    fun `untilに渡す行は改行まで届いたものだけ`() {
+        // initprobe は 1 行を何回にも分けて書き、コンソールの配りは tick をまたぐことがある（#1006）
+        val host = ConsoleHost()
+        Harness().use { h ->
+            // 起動はしない。onConsoleOutput の引数に渡すだけ
+            val m = h.machine(host = host)
+            host.onConsoleOutput(m, "sh".toByteArray())
+            host.onConsoleOutput(m, " fg=self".toByteArray())
+            assertEquals(emptyList<String>(), host.completedLines())
+            host.onConsoleOutput(m, " tty=raw\r\nshe".toByteArray())
+            assertEquals(listOf("sh fg=self tty=raw"), host.completedLines())
+            host.onConsoleOutput(m, "ll\r\n".toByteArray())
+            assertEquals(listOf("sh fg=self tty=raw", "shell"), host.completedLines())
         }
     }
 
