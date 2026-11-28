@@ -7,7 +7,8 @@ int fib(int n) {
     return n < 2 ? n : fib(n - 1) + fib(n - 2);
 }
 
-// 終わらないループ（燃料切れで止める）
+// 終わらないループ。燃料を入れた読み込みでは燃料切れで止め、燃料を入れない読み込み（SharedPrograms.load）では、
+// 割り込み以外で終わらない計算として RealWasmSchedulerTest（#994）が頼っている。止まるように変えない
 void forever(void) {
     volatile int x = 0;
     for (;;) x++;
