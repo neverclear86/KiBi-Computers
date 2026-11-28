@@ -993,7 +993,7 @@ internal object FuelInjector {
          * Endive の `Parser.parse`（検証あり）を通すが、Endive 1.2.0 の検証は、グローバルの初期値と能動な要素セグメント（flag 0・2・4・6）の
          * 定数式しか確かめない。パッシブ・宣言の要素セグメント（flag 5・7）の初期値は検証されずにここへ届くので、この分岐は届く経路がある
          * （`drop` などの命令で断る。型が合わないだけの `v128.const` は、命令としては定数式なので写す。型の合わないものは、挿入の後の読み込みで
-         * `EndiveRuntime.parseModule` が断る。#893）
+         * `EndiveRuntime.parseModule` が断る。#893。命令が取る値の型も、挿入の後の読み込みで断る。#942）
          */
         fun copyConstExpr(out: Sink, remap: (Long) -> Long, globalRemap: (Long) -> Long) {
             while (true) {
