@@ -1747,3 +1747,112 @@ test('重い PR の判定: 重くない area は Opus のレビューだけが�
   assert.ok(r.count('review') >= 1)
   assert.equal(r.count('review-fable'), 0)
 })
+
+// ---- push していないローカルのコミット（#1007） ----
+
+test('#1007 スタック: 取り込みの続きでない push していないコミットがあれば、確かめもマージもせず、取り込みの失敗と別の文で止まる', async () => {
+  const r = await run({
+    'stack-detect': [STACK2],
+    'stack-check': [STACK2],
+    'stack-sync': [{ outcome: 'failed', pushed: false, unpushedCommits: true, headSha: 'abc', worktree: 'D:/KiBi/.worktrees/stack-pr-900', summary: 'push していないコミット abc1234 Fix foo' }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 1)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.equal(r.count('merge'), 0)
+  assert.match(r.issue.mergeReason, /push していないローカルのコミットがある/)
+  assert.match(r.issue.mergeReason, /abc1234/)
+  assert.doesNotMatch(r.issue.mergeReason, /取り込めなかった/)
+})
+
+test('#1007 スタック: unpushedCommits の申告がない failed は、今までどおり取り込みの失敗として止まる', async () => {
+  const r = await run({
+    'stack-detect': [STACK2],
+    'stack-check': [STACK2],
+    'stack-sync': [{ outcome: 'failed', pushed: false, headSha: null, worktree: null, summary: '作業ツリーが汚れている: a.kt' }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-merge'), 0)
+  assert.match(r.issue.mergeReason, /取り込めなかった/)
+})
+
+test('#1007 プロンプト: stack-sync とマージの段階は、push の前に取り込みの続きだけを通す確かめをする', async () => {
+  const stack = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2] })
+  const [lowerSync, topSync] = stack.promptsOf('stack-sync').map(p => p.prompt)
+  // 一番下の段は main、上の段は一つ下の段のブランチを取り込み元として除く
+  assert.match(lowerSync, new RegExp(`git rev-list HEAD \\^origin/${LOWER.branch} \\^origin/main`))
+  assert.match(topSync, new RegExp(`git rev-list HEAD \\^origin/${TOP.branch} \\^origin/${LOWER.branch}`))
+  for (const p of [lowerSync, topSync]) {
+    assert.match(p, /merge-base --is-ancestor <c>\^2/)
+    // 取り込み直した合わせるマージ（2 つ目の親が origin/<branch> の古い先頭）も通す
+    assert.match(p, /merge-base --is-ancestor <c>\^2 origin\/issue-/)
+    assert.match(p, /rev-list --parents -n 1/)
+    assert.match(p, /\*\*push しない\*\*/)
+    assert.match(p, /unpushedCommits=true/)
+    // 確かめは、手順 2 で合わせるマージを作る前に置く
+    assert.ok(p.indexOf('rev-list HEAD') < p.indexOf('git merge --ff-only'))
+  }
+  const stackMerge = stack.promptOf('stack-merge')
+  assert.match(stackMerge, new RegExp(`git rev-list HEAD \\^origin/${TOP.branch} \\^origin/${LOWER.branch}`))
+  const plain = await run()
+  const merge = plain.promptOf('merge')
+  assert.match(merge, new RegExp(`git rev-list HEAD \\^origin/${IMPL.branch} \\^origin/main`))
+  assert.match(merge, /merge-base --is-ancestor <c>\^2 origin\/main/)
+  assert.match(merge, /failedStep=merge/)
+})
+
+test('#1007 レビューの直し: コミットしたが push できなかったら ready にならず、マージもせず人に上がる', async () => {
+  const r = await run({
+    review: [{ findings: [FINDING] }],
+    verify: [{ confirmed: [0], notes: '' }],
+    fix: [{ pushed: false, unpushedCommits: true, summary: 'push が断られた。def5678 が残っている', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('merge'), 0)
+  assert.equal(r.count('stack-detect'), 0)
+  assert.match(r.promptOf('report'), /結論: 人の確認が必要/)
+  assert.match(r.issue.question, /push できなかった/)
+  assert.match(r.promptOf('fix'), new RegExp(`git rev-list origin/${IMPL.branch}\\.\\.HEAD`))
+})
+
+test('#1007 レビューの直し: 直す必要がなく push しなかった（unpushedCommits=false）なら、今までどおりマージまで進む', async () => {
+  const r = await run({
+    review: [{ findings: [FINDING] }],
+    verify: [{ confirmed: [0], notes: '' }],
+    fix: [{ pushed: false, unpushedCommits: false, summary: '直す必要がなかった', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge'), 1)
+})
+
+test('#1007 スタック: 同じ実行の下の段のレビューの直しが push できなければ、上の段はスタックごとマージしない', async () => {
+  const low = { ...LOWER, pr: 906, branch: 'issue-904-x' }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: 'issue-904-x' }
+  const r = await run({
+    select: [{ issues: TWO_ISSUES }],
+    implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+    review: prompt => prompt.includes('PR #906') ? { findings: [FINDING] } : { findings: [] },
+    verify: [{ confirmed: [0], notes: '' }],
+    fix: [{ pushed: false, unpushedCommits: true, summary: 'push できなかった', gradleStillRunning: false, runningLogs: [] }],
+    'stack-detect': () => ({ stackNumber: 925, baseRef: 'issue-904-x', members: [low, up] }),
+  }, { issues: [904, 905] })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.notEqual(byIssue[904].status, 'ready')
+  assert.notEqual(byIssue[904].status, 'merged')
+  assert.equal(byIssue[905].status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+})
+
+test('#1007 確認事項の反映: コミットしたが push できなかったら、CI にもレビューにも進まず人に上がる', async () => {
+  const r = await run({
+    implement: [{ ...IMPL, openQuestions: ['q'] }],
+    'cross-check': [{ premiseSound: true, needsHuman: false, findings: 'f', question: null, guidance: 'g' }],
+    resolve: [{ pushed: false, unpushedCommits: true, summary: 'push が断られた', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('ci'), 0)
+  assert.equal(r.count('merge'), 0)
+  assert.match(r.issue.reason, /push できなかったコミット/)
+  assert.match(r.promptOf('resolve'), new RegExp(`git rev-list origin/${IMPL.branch}\\.\\.HEAD`))
+})
