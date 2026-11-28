@@ -25,8 +25,9 @@ internal class ModuleLimits(
     /** `array.new_fixed` 1 つの要素の数（即値。仮の値、確定は #251。V8・Endive の `WasmLimits` と同じ値。#1009） */
     val maxArrayNewFixed: Int = 10_000,
     /**
-     * ランタイムの検証の手間のうち、型の大きさ・即値に比例する分の上限（仮の値。確定は #251。#1009）。関数の本体と定数式の、
-     * `struct.new`・`struct.new_default` の型のフィールドの数と、`array.new_fixed` の要素の数の合計で数える（[ModulePrescan]）。
+     * ランタイムの検証の手間のうち、型の大きさ・即値に比例する分の上限（仮の値。確定は #251。#1009）。関数の本体と全部の定数式の、
+     * 具体的な struct の型を使う命令（`struct.new`・`struct.get`・`ref.null`・`ref.cast` など。スタックの型を作り直す `ref.as_non_null` などは
+     * いちばん大きな struct の型）のフィールドの数と、`array.new_fixed` の要素の数の合計で数える（[ModulePrescan]）。
      *
      * Endive 1.2.0 の検証は、正しいモジュールで 1 単位あたり約 0.15 µs（読み込みで最大 4 回走るので、合わせて約 0.6 µs）、
      * オペランドが足りない正しくないモジュールでは 1 回目で断るが、1 単位あたり約 1.3 µs と約 800 バイトのヒープを使う。
