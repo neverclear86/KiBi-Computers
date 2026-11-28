@@ -73,6 +73,11 @@ const FIX_BASE_DIFF = '段階の始めに worktree で `git rev-parse HEAD` を�
 // 接続層のコンパイル（両バージョン）。main だけでなく dev のソースセット（src/dev/。dev-driver を devCompileOnly で使い、
 // associateWith で接続層の internal な型も使う）も入れる。core や dev-driver だけの直しでは GameTest も回らないので、
 // compileDevKotlin を入れないと、src/dev/ の壊れが push の後の CI まで分からない
+// レビューの直しと確認事項の反映の終わりに、push できなかったコミットが残っていないかを申告させる（#1007）。
+// pushed=false には「直す必要がなかった」と「コミットしたが push できなかった」の 2 つの意味があるので、それを見分ける
+function unpushedReportStep(branch) {
+  return `最後に（push しなかったときも）、\`git fetch origin\` してから \`git rev-list origin/${branch}..HEAD\` を見る。空でなければ（コミットしたが push できなかったものが残っている）、unpushedCommits=true・pushed=false で、summary に残ったコミットの hash と push できなかった理由を書く（reset・stash で消さない）。空なら unpushedCommits=false。`
+}
 const PLATFORM_COMPILE_BOTH = '`:platform-neoforge-1.21.1:compileKotlin :platform-neoforge-1.21.1:compileDevKotlin :platform-forge-1.20.1:compileKotlin :platform-forge-1.20.1:compileDevKotlin`（main と、`src/dev/` の dev のソースセット）'
 const FIX_LOCAL_CHECKS = `手元の確認（#985。通しの \`./gradlew build\` と両バージョンの \`runGameTestServer\` は、ここでは回さない。push の後の CI が確かめる）:
 - 差分の取り方: ${FIX_BASE_DIFF}。
@@ -524,6 +529,9 @@ const FIX_SCHEMA = withGradlePending({
     // CI の直し（ci-fix）だけが使う。PR と関係のない不安定なテストと判断し、push せずに落ちたジョブを回し直した
     // （マージの段階の同じ確かめは、FLAKY_SCHEMA の outcome で返す。#961）
     rerun: { type: 'boolean' },
+    // レビューの直しと確認事項の反映が使う（#1007）。省略可能。段階の終わりに `git rev-list origin/<branch>..HEAD` が空でない
+    // （コミットしたが push できなかった）。pushed=false の「直す必要がなかった」と見分ける
+    unpushedCommits: { type: 'boolean', description: '段階の終わりに `git rev-list origin/<ブランチ>..HEAD` が空でない（コミットしたが push できなかったコミットが残っている）なら true' },
     summary: { type: 'string' },
   },
   required: ['pushed', 'summary'],
@@ -588,8 +596,10 @@ const STACK_SCHEMA = {
 const STACK_SYNC_SCHEMA = {
   type: 'object',
   properties: {
-    outcome: { type: 'string', enum: ['merged', 'up_to_date', 'conflict', 'failed'], description: 'merged: 取り込んで（または push していないコミットを）push した。up_to_date: 取り込むものも push するものもなかった。conflict: 字面で解けない衝突（取り込みは戻した）。failed: 作業ツリーが汚れている、push が断られ続けた、など' },
+    outcome: { type: 'string', enum: ['merged', 'up_to_date', 'conflict', 'failed'], description: 'merged: 取り込みのコミット（と、前の回の取り込みの続きのマージのコミット）を push した。up_to_date: 取り込むものも push するものもなかった。conflict: 字面で解けない衝突（取り込みは戻した）。failed: 作業ツリーが汚れている、取り込みの続きでない push していないコミットがある、push が断られ続けた、など' },
     pushed: { type: 'boolean' },
+    // #1007。省略可能。取り込みの続きでない、push していないローカルのコミットがあって止めた
+    unpushedCommits: { type: 'boolean', description: '取り込みの続きでない、push していないローカルのコミットがあったので push せずに止めた（outcome=failed）なら true' },
     headSha: { type: ['string', 'null'] },
     worktree: { type: ['string', 'null'], description: '作業した worktree の絶対パス' },
     summary: { type: 'string' },
@@ -1082,8 +1092,18 @@ function mergeNodeTestStep(ref, scope = 'この PR') {
 }
 
 // 先頭のコミット（HEAD）を PR に載せる手順（#985）。Already up to date でも、push していないコミットが残っていることがある（前の回の続きなど）
-function mergePushStep(pr, branch) {
-  return `\`git rev-parse HEAD\` と \`gh pr view ${pr} --json headRefOid\` を比べる。違えば（取り込みのコミットや、前から push していなかったコミットがある）、通常の \`git push origin ${branch}\` で push する（force push はしない）。同じなら push しない。`
+// srcRef は取り込み元（ふつうのマージとスタックの一番下の段は main、スタックの上の段は一つ下の段のブランチ）
+function mergePushStep(pr, branch, srcRef) {
+  return `\`git fetch origin\` のあとに、${unpushedCheckStep(branch, srcRef)}外れたコミットがあれば、push もマージもせず status=needs_human・failedStep=merge で、理由に「レビューを通っていない、push していないローカルのコミットがある（push すると main に入る）」と、外れたコミットの hash と件名を書く（reset・stash・revert で消さない。人が判断する）。外れたコミットがなければ、\`git rev-parse HEAD\` と \`gh pr view ${pr} --json headRefOid\` を比べる。違えば（取り込みのコミットや、前の回の取り込みの続きのマージのコミットがある）、通常の \`git push origin ${branch}\` で push する（force push はしない）。同じなら push しない。`
+}
+
+// push していないローカルのコミットのうち、前の回（とこの回）の取り込みの続きのマージのコミットだけを通す確かめ（#1007）。
+// レビューは GitHub 上の差分（`gh pr diff`）しか読まないので、ローカルにしかないコミットはレビューを通っていない。
+// `origin/<branch>..HEAD` だけで数えると、push していない取り込みで入った取り込み元の普通のコミットまで数えてしまうので、取り込み元も除く。
+// 例外の判定は件名（`Merge ` で始まる、など）でなく親で行う（件名は任意に書ける）。マージのコミットの中身（衝突の解消の手直し）は調べない
+// （detectStack の「取り込みのマージはコードの直しとして数えない」と同じ割り切り）
+function unpushedCheckStep(branch, srcRef) {
+  return `push していないローカルのコミットを確かめる（#1007。レビューは GitHub 上の差分しか読まないので、ローカルにしかないコミットはレビューを通っていない）: \`git rev-list HEAD ^origin/${branch} ^origin/${srcRef}\` の各コミット \`<c>\` について、\`git rev-list --parents -n 1 <c>\` で親がちょうど 2 つ（3 つ以上のマージは不可）で、かつ \`git merge-base --is-ancestor <c>^2 origin/${srcRef}\` か \`git merge-base --is-ancestor <c>^2 origin/${branch}\` のどちらかが真（2 つ目の親が取り込み元か、このブランチの push 済みの先頭から辿れる。取り込みの続きのマージ。後者は、push が断られて取り込み直したときの、origin/${branch} を合わせるマージ）かを見る。1 つでも外れたら（ふつうのコミット、取り込み元でないものとのマージ）、**push しない**。`
 }
 
 // PR に needs-human が付いていないかを確かめる手順（#1008）。実行の途中（CI 待ち・レビューのあいだ）に人が付けたラベルで止まる。
@@ -1097,7 +1117,7 @@ function mergePrompt(info, impl, note) {
   return `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）をマージする。他の PR のマージとは直列に行っている。${note ? `\n${note}` : ''}
 0. ${labelCheckStep(impl.pr, '取り込み・push・マージをせず')}。
 1. worktree で \`git fetch origin\` し、\`git merge origin/main\` で main を取り込む（rebase と force push はしない）。衝突が字面の解消で済まない（ロジックの判断が要る）なら、\`git merge --abort\` で戻し、マージせず status=needs_human・failedStep=conflict で理由を返す。${mergeNodeTestStep('main')}
-2. ${mergePushStep(impl.pr, impl.branch)}
+2. ${mergePushStep(impl.pr, impl.branch, 'main')}
 3. \`gh pr checks ${impl.pr} --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（pending が残っている間はマージしない）。「通った」は、\`gh pr checks ${impl.pr} --json name,state,bucket\` の全チェックが pass か skipping のとき（必須の \`build\` だけでは決めない）。取り込みが Already up to date で push もせず、先頭のコミットの CI がもう通っていれば、待たずにそのまま手順 4 に進む。通らなければ status=needs_human・failedStep=ci で、落ちたチェックと run の ID を理由に書く。**CI は自分で回し直さない**（\`gh run rerun\` はしない。不安定なテストかどうかは、このスクリプトが別の段階で確かめて、回し直すかを決める）。
    CI の待ちには、下の「CI の待ちの上限」を当てる。待ちをあきらめたら、マージせず status=needs_human・failedStep=ci で、理由に「CI が終わる前に待ちの上限（または接続の失敗）で待つのをやめた」と、まだ終わっていないチェックと run の ID を書く（このスクリプトが別の段階で CI を確かめ直す）。
 4. マージの前に \`gh api repos/${REPO}/pulls/${impl.pr} --jq '{base: .base.ref, stack: .stack}'\` を確かめる。stack が null でないか、base が main でなければ（実装の後でスタックに積まれた、など。#936）、\`gh pr merge\` を実行せず status=needs_human・failedStep=merge で「スタックの PR になっている」と返す。続けて、もう 1 回 ${labelCheckStep(impl.pr, 'マージせず')}（手順 3 の CI の待ちの間に付いたもの）。\`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。「base branch policy prohibits the merge」で断られたら、\`gh pr view ${impl.pr} --json mergeStateStatus,statusCheckRollup\` で理由を確かめ、CI の待ちが理由なら 3 からもう1回やり直す。2回目も断られたら status=needs_human・failedStep=merge で理由を返す。マージできたら status=merged・failedStep=null。
@@ -1334,9 +1354,9 @@ function stackSyncPrompt(plan, i) {
     : `作業場所: このブランチをもうチェックアウトしている worktree があれば（\`git worktree list --porcelain\` の \`branch refs/heads/${m.branch}\`）、そこで作業する（同じブランチは 2 つの worktree で開けない）。なければリポジトリのルートで \`git worktree add ${dir} ${m.branch}\`（ローカルにブランチがなければ \`git worktree add -b ${m.branch} ${dir} origin/${m.branch}\`）で作る。${dir !== prDir ? `\`${dir}\` がもうあって、ほかのブランチを開いた worktree なら、それは別の流れのものなので触らず、ブランチも切り替えず、\`${prDir}\` に同じ手順で作る。` : ''}${m.issue != null && !shared ? worktreeCheck(m.issue) : ''}`
   return `${REPO} の${stackLabel(plan)}の ${i + 1}/${plan.members.length} 段目、PR #${m.pr}（ブランチ ${m.branch}）に、\`origin/${src}\` を取り込んで push する（#936。取り込みは下の段から順に行い、この段階はスクリプトが段ごとに呼ぶ）。**Gradle は動かさない**（確かめは、全段の取り込みのあとの各段の先頭のコミットの CI が行う。#985）。${where}
 1. \`git status --porcelain\` で作業ツリーが汚れていたら（コミットしていない変更がある）、何もせず outcome=failed・pushed=false で、summary に残っているファイルを書く。reset・stash・checkout で消さない。
-2. \`git fetch origin\` する。ローカルのブランチが \`origin/${m.branch}\` より遅れていれば \`git merge --ff-only origin/${m.branch}\`、分かれていれば \`git merge origin/${m.branch}\` で合わせる（push していないローカルのコミットは捨てない。reset しない）。
+2. \`git fetch origin\` する。手順 3 の取り込みより前に（ここで合わせるマージを作る前に）、${unpushedCheckStep(m.branch, src)}外れたコミットがあれば、取り込みもせず outcome=failed・pushed=false・unpushedCommits=true で、summary に「レビューを通っていない、push していないローカルのコミット（push すると main に入る）」と、外れたコミットの hash と件名を書く（reset・stash・revert で消さない。人が判断する）。外れたコミットがなければ、ローカルのブランチが \`origin/${m.branch}\` より遅れていれば \`git merge --ff-only origin/${m.branch}\`、分かれていれば \`git merge origin/${m.branch}\` で合わせる（push していない取り込みの続きは捨てない。reset しない）。
 3. \`git merge origin/${src}\` する。rebase はしない。衝突が字面の解消で済む（両方の変更を残せば済む、など）なら解いてコミットする。ロジックの判断が要るなら \`git merge --abort\` で戻し、push せず outcome=conflict・pushed=false で、summary に衝突したファイルと判断が要る理由を書く。
-4. push するもの（取り込みのコミットや、前から push していなかったコミット）があれば、通常の \`git push origin ${m.branch}\` で push し、outcome=merged・pushed=true。なければ何もせず outcome=up_to_date・pushed=false。push が non-fast-forward で断られたら、\`git fetch origin\` して \`git merge origin/${m.branch}\` してから 1 回だけ push し直す。それでも断られたら outcome=failed。
+4. push するもの（取り込みのコミットや、手順 2 の確かめで残った、前の回の取り込みの続きのマージのコミット）があれば、通常の \`git push origin ${m.branch}\` で push し、outcome=merged・pushed=true。なければ何もせず outcome=up_to_date・pushed=false。push が non-fast-forward で断られたら、\`git fetch origin\` して \`git merge origin/${m.branch}\` してから 1 回だけ push し直す。それでも断られたら outcome=failed。
 5. headSha に \`git rev-parse HEAD\`、worktree に作業した worktree の絶対パスを入れる。
 **force push はしない**（\`--force\`・\`--force-with-lease\` を付けない）。\`gh stack sync\`・\`gh stack rebase\`・\`gh stack push\`・\`gh stack submit\` は force-with-lease で push するので使わない。`
 }
@@ -1349,7 +1369,7 @@ function stackMergePrompt(info, impl, note, plan) {
   const cmd = `gh stack merge ${impl.pr} --yes --squash`
   return `${REPO} の${stackLabel(plan)}を、一番上の段 PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の木で取り込みを確かめ、全段の CI を待ってから、スタックごとマージする（#936）。他の PR のマージとは直列に行っている。下の段から順の取り込み（一番下の段は main、上の段は一つ下の段のブランチ）は、この段階の前に済ませて push してある。${note ? `\n${note}` : ''}
 1. worktree で \`git fetch origin\` し、\`git merge origin/${belowRef}\` する（ふつうは Already up to date）。${belowRef === 'main' ? '' : 'main は直接取り込まない（下の段を通して入っている）。'}rebase と force push はしない。\`gh stack sync\`・\`gh stack rebase\`・\`gh stack push\`・\`gh stack submit\` は force-with-lease で push するので使わない。衝突が字面の解消で済まないなら、\`git merge --abort\` で戻し、マージせず status=needs_human・failedStep=conflict で理由を返す。${mergeNodeTestStep('main', 'スタック全体')}
-2. ${mergePushStep(impl.pr, impl.branch)}
+2. ${mergePushStep(impl.pr, impl.branch, belowRef)}
 3. 全段の PR（${prs}）について、それぞれ \`gh pr checks <n> --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（下の段に push すると下の段の CI、上の段に push すると上の段の CI が走る。どの段も、pending が残っている間はマージしない。「通った」は、\`gh pr checks <n> --json name,state,bucket\` の全チェックが pass か skipping のとき）。もう通っている段は待たなくてよい。どれかが通らなければ status=needs_human・failedStep=ci で、PR の番号・落ちたチェック・run の ID を理由に書く。**CI は自分で回し直さない**（\`gh run rerun\` はしない）。
    CI の待ちには、下の「CI の待ちの上限」を当てる（\`<n>\` は各段の PR の番号。上限は全段を合わせて測る）。待ちをあきらめたら、マージせず status=needs_human・failedStep=ci で、理由に「CI が終わる前に待ちの上限（または接続の失敗）で待つのをやめた」と、まだ終わっていない PR・チェック・run の ID を書く。
 4. 実行の前に、全段（${prs}）について \`gh pr view <n> --json labels --jq '[.labels[].name]'\` でラベルを確かめる（手順 3 の CI の待ちの間に人が付けたもの。#1008）。どれかの段に \`needs-human\` が付いていれば（人の回答待ち）、マージせず、status=needs_human・failedStep=labeled・labeledPr=<付いていた段のうち一番下の段の PR の番号> で、理由に付いていた段の PR の番号を書いて返す（質問のコメントもラベルの付け外しもしない）。
@@ -1468,6 +1488,11 @@ async function mergeStackTop(info, impl, plan) {
     for (let i = 0; i < now.members.length; i++) {
       const m = now.members[i]
       const s = await step(stackSyncPrompt(now, i), { label: `stack-sync:${m.pr}`, phase: 'Merge', schema: STACK_SYNC_SCHEMA, ...M.merge })
+      if (s && s.outcome === 'failed' && s.unpushedCommits === true) {
+        // 取り込みの失敗と読み違えないように、別の文にする（#1007）。push して進めればよい、と読まれないよう事実を書く
+        const done_ = synced.length ? `（${synced.join('、')} は取り込んで push 済み）` : ''
+        return { status: 'needs_human', failedStep: 'merge', reason: `${label}: ${i + 1} 段目 PR #${m.pr}（ブランチ ${m.branch}）の作業場所（${s.worktree ?? '-'}）に、レビューを通っていない、push していないローカルのコミットがある（取り込みの続きのマージではない）。push するとレビューなしで main に入るので、push・取り込み・確かめ・マージはしていない${done_}。ローカルのコミットは消していない。そのコミットを PR に載せてレビューを通すか、捨てるかを人が決める。詳細: ${s.summary}` }
+      }
       if (!s || s.outcome === 'conflict' || s.outcome === 'failed') {
         const why = !s ? '取り込みの段階が結果を返さなかった' : s.outcome === 'conflict' ? `字面で解けない衝突: ${s.summary}` : s.summary
         const done_ = synced.length ? `（${synced.join('、')} は取り込んで push 済み）` : ''
@@ -1504,13 +1529,13 @@ async function mergeStackTop(info, impl, plan) {
 
 // スタックに属する PR（か、base が main でない PR）のマージと報告。runIssue がロックを放してから呼ぶ
 async function runStack(info, d) {
-  const { impl, ci, rounds, ready, unverified, stack: st } = d
+  const { impl, ci, rounds, ready, unverified, unpushed, stack: st } = d
   const plan = stackPlan(st, impl.pr)
   let merge
   if (!plan.ok) merge = { status: 'needs_human', failedStep: 'merge', reason: plan.reason }
   else if (!plan.isTop) merge = await waitStackTop(info, plan)
   else merge = await mergeStackTop(info, impl, plan)
-  const question = await report(info, { impl, ci, rounds, merge, ready, unverified, escalateContext: merge.escalateContext })
+  const question = await report(info, { impl, ci, rounds, merge, ready, unverified, unpushed, escalateContext: merge.escalateContext })
   const merged = merge.status === 'merged'
   // 人に聞いた（か、論点を別の PR に置いた）場所。下の段の Issue の流れは、これを見て案内を付ける
   const pointer = merged ? null : (merge.pointerPr ?? (question ? impl.pr : null))
@@ -1646,6 +1671,7 @@ worktree は消さない（片付けはこのスクリプトが別に行う）�
     reasons.push(`最後のラウンドで直して push したが、レビューし直していない must の指摘: ${f.file}:${f.line ?? '-'} ${f.problem}`)
   }
   if (r.unverified) reasons.push(`直しを確かめられなかった: ${r.unverified}`)
+  if (r.unpushed) reasons.push(`レビューの直しを push できなかった: ${r.unpushed}`)
   if (r.merge && r.merge.status !== 'merged') reasons.push(`マージできなかった: ${r.merge.reason}`)
   const question = `自動ではマージできなかった。どう進めるか判断してほしい（直し方の指示、このままマージ、PR を閉じる など）:\n${reasons.map(x => `- ${x}`).join('\n')}`
   // この段階ではもう直す機会がないので、確かめた結果を添えて聞く
@@ -1726,6 +1752,7 @@ async function runIssueLocked(info) {
 ${FIX_LOCAL_CHECKS}
 ${gradleRules(info.number, note ? 'resolve-wait' : 'resolve')}
 どちらの場合も、PR 本文の「確認してほしいこと」を、確かめた結果と結論（決めたこととその根拠）に書き換える（\`gh pr edit ${impl.pr} --body-file <ファイル>\`）。
+${unpushedReportStep(impl.branch)}
 
 確認事項:
 ${listed}
@@ -1740,12 +1767,21 @@ ${e.guidance}`,
       if (appliedPending) {
         return escalateUnverified(info, impl.pr, `${pendingReason('確認事項の反映の段階', applied)}。最後の報告: ${applied.summary}`, `確認事項の反映の段階（ブランチ ${impl.branch}。Gradle の終わりを待つやり直しのあと）`)
       }
+      if (applied.unpushedCommits === true) {
+        // 直しを PR に載せられていない。CI もレビューも GitHub 上の差分しか見ないので、このまま進めると、ローカルにしかない直しを
+        // マージの段階が押し出してしまう（#1007）。マージの段階の確かめでも止まるが、その前の CI・レビューを無駄に回さない
+        const reason = `確認事項の反映の段階で、コミットしたが push できなかったコミットが worktree ${impl.worktree} に残っている（レビューも CI も通っていない）。最後の報告: ${applied.summary}`
+        const question = `確認事項の反映を PR に載せられなかった。どう進めるか判断してほしい（人が push してから resume する、ローカルのコミットを捨てる など）:\n- ${reason}`
+        const e2 = await escalate('pr', impl.pr, question, `確認事項の反映の段階（ブランチ ${impl.branch}）。push できなかったコミットが残った`, false)
+        return { issue: info.number, status: 'needs_human', pr: impl.pr, reason, question: e2.question }
+      }
     }
 
     const tag = `#${info.number}`
     let ci = await untilGreen(info, impl, tag)
     const rounds = []
     let unverified = null
+    let unpushed = null
     for (let round = 1; ci && ci.passed && round <= MAX_REVIEW_ROUNDS; round++) {
       const confirmed = await review(info, impl, round)
       // 検証で残った指摘は must・should を問わず直す（should をマージ前に止めるため）
@@ -1763,6 +1799,7 @@ ${e.guidance}`,
 Issue にし忘れた別の問題は、コードを直す代わりに新しい Issue にして適切な Epic のサブ Issue にし（AGENTS.md の手順）、PR 本文に番号を書く。
 ${FIX_LOCAL_CHECKS}
 ${gradleRules(info.number, `fix${round}${note ? '-wait' : ''}`)}
+${unpushedReportStep(impl.branch)}
 ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join('\n')}`,
           { label: `fix${note ? '-wait' : ''}:${impl.pr}#${round}`, phase: 'Fix', schema: FIX_SCHEMA, ...(round === 1 ? M.fixFirst : M.fixAgain) },
         ),
@@ -1773,6 +1810,12 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
         unverified = pendingReason(`レビュー指摘の修正（${round}）の段階`, fixed)
         break
       }
+      if (fixed && fixed.unpushedCommits === true) {
+        // コミットしたが push できなかった（#1007）。直しは PR に載っておらず、レビューも CI も通っていない。前の回の CI で ready にすると、
+        // 「マージ可能」の記録が付き、後の実行のマージの段階や stack-sync がそのコミットを押し出す
+        unpushed = `レビュー指摘の修正（${round}）の段階で、コミットしたが push できなかったコミットが worktree ${impl.worktree} に残っている（レビューも CI も通っていない）。最後の報告: ${fixed.summary}`
+        break
+      }
       if (!fixed || !fixed.pushed) break
       entry.fixed = true
       ci = await untilGreen(info, impl, `${tag}-r${round}`)
@@ -1780,10 +1823,10 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
 
     // マージの条件は変えない: 最後のラウンドの must は、直して push していてもレビューし直していないので止める
     const { all: lastConfirmed, remaining, fixedUnreviewed } = lastFindings(rounds)
-    const ready = ci && ci.passed && !unverified && !lastConfirmed.some(f => f.severity === 'must')
+    const ready = ci && ci.passed && !unverified && !unpushed && !lastConfirmed.some(f => f.severity === 'must')
     // スタックの上の段が待つ「マージしてよいところまで進んだか」は、マージの段階に入る前（mergeLock を取る前）に知らせる（#936）
     const signal = (ok, reason) => readySignals.get(info.number)?.resolve({ ready: ok, reason: ok ? null : reason })
-    const notReady = ci && !ci.passed ? 'CI が通っていない' : unverified ? '直しを確かめられなかった' : 'レビューの must が残った'
+    const notReady = ci && !ci.passed ? 'CI が通っていない' : unverified ? '直しを確かめられなかった' : unpushed ? 'レビューの直しを push できなかった' : 'レビューの must が残った'
     let stackUnknown = null
     if (MERGE && ready) {
       // マージの前に、スタックの PR か（base が main でないか）を確かめる（実装の後で積まれることがあるので、実装のときの値は使わない）。
@@ -1795,7 +1838,7 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
         log(`PR #${impl.pr}: スタックの判定が結果を返さなかった。マージしない`)
       } else if (st.stackNumber != null || (st.baseRef && st.baseRef !== 'main')) {
         signal(true)
-        return { stackDeferred: { impl, ci, rounds, ready, unverified, stack: st } }
+        return { stackDeferred: { impl, ci, rounds, ready, unverified, unpushed, stack: st } }
       }
     }
     // 判定できなかった段は「マージしてよい」と知らせない（同じ実行の上の段がスタックごとマージし、この流れの結果と食い違わないように）
@@ -1805,7 +1848,7 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
       : null
 
     const result = { impl, ci, rounds, merge }
-    const question = await report(info, { ...result, ready, unverified })
+    const question = await report(info, { ...result, ready, unverified, unpushed })
     return {
       issue: info.number,
       status: merge?.status === 'merged' ? 'merged' : ready ? 'ready' : 'needs_human',
