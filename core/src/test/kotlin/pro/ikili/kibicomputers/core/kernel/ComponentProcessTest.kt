@@ -300,8 +300,11 @@ class ComponentProcessTest {
             assertEquals(KillResult.DELIVERED, m.lock.withLockValue { m.killLocked(rt.process.pid, KillSignal.TERMINATE) })
             h.tickUntilTrue("終わらない") { rt.process.state.isTerminal }
             assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
-            assertEquals(0L, rt.memory.usedBytes, "プロセスの RAM を返す")
-            lockedCheck(m) { assertTrue(rt.instances.isEmpty(), "作った core インスタンスを閉じる") }
+            // 終わりの片付け（finishLocked）は状態を KILLED にしてから RAM を返すので、勘定はマシンのロックの中で読む（#1031）
+            lockedCheck(m) {
+                assertEquals(0L, rt.memory.usedBytes, "プロセスの RAM を返す")
+                assertTrue(rt.instances.isEmpty(), "作った core インスタンスを閉じる")
+            }
             m.stop()
         }
     }
