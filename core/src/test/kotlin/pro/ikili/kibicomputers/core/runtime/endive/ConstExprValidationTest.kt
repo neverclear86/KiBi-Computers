@@ -300,6 +300,58 @@ class ConstExprValidationTest {
         EndiveRuntime().load(bytes)
     }
 
+    @Test
+    fun `宣言した部分型と別の rec グループの同じ形の型を取る値にする正しい式は断らない`() {
+        // GC の言語が出す定数式の形: vtable（フィールドが上位の関数の型）、上位の struct の型のフィールドに下位の型の値、
+        // 別の rec グループの同じ形の型（canonical に同じ型）、相互に参照する rec グループどうしの同じ形の型
+        val bytes = module(
+            """
+            (type ${'$'}F1 (sub (func (result i32))))
+            (type ${'$'}F2 (sub ${'$'}F1 (func (result i32))))
+            (type ${'$'}VT1 (sub (struct (field (ref null ${'$'}F1)))))
+            (type ${'$'}VT2 (sub ${'$'}VT1 (struct (field (ref null ${'$'}F2)))))
+            (type ${'$'}Obj1 (sub (struct (field (ref null ${'$'}VT1)) (field i32))))
+            (type ${'$'}Obj2 (sub ${'$'}Obj1 (struct (field (ref null ${'$'}VT2)) (field i32))))
+            (type ${'$'}B1 (struct (field i32)))
+            (type ${'$'}B2 (struct (field i32)))
+            (type ${'$'}HB (struct (field (ref null ${'$'}B1))))
+            (rec (type ${'$'}M1 (struct (field (ref null ${'$'}M2)))) (type ${'$'}M2 (struct (field (ref null ${'$'}M1)))))
+            (rec (type ${'$'}N1 (struct (field (ref null ${'$'}N2)))) (type ${'$'}N2 (struct (field (ref null ${'$'}N1)))))
+            (table ${'$'}tv 1 (ref null ${'$'}VT1))
+            (table ${'$'}to 1 (ref null ${'$'}Obj1))
+            (func ${'$'}m (type ${'$'}F2) (i32.const 3))
+            (global ${'$'}vt1 (ref ${'$'}VT1) (struct.new ${'$'}VT1 (ref.func ${'$'}m)))
+            (global ${'$'}vt2 (ref ${'$'}VT2) (struct.new ${'$'}VT2 (ref.func ${'$'}m)))
+            (global ${'$'}o1 (ref ${'$'}Obj1) (struct.new ${'$'}Obj1 (global.get ${'$'}vt2) (i32.const 5)))
+            (global ${'$'}o2 (ref ${'$'}Obj2) (struct.new ${'$'}Obj2 (global.get ${'$'}vt2) (i32.const 6)))
+            (global ${'$'}o3 (ref ${'$'}Obj1) (struct.new ${'$'}Obj1 (global.get ${'$'}vt1) (i32.const 7)))
+            (global ${'$'}hb (ref ${'$'}HB) (struct.new ${'$'}HB (struct.new ${'$'}B2 (i32.const 9))))
+            (global ${'$'}mm (ref ${'$'}M1) (struct.new ${'$'}M1 (struct.new ${'$'}N2 (ref.null none))))
+            (global ${'$'}nn (ref ${'$'}N1) (struct.new ${'$'}N1 (struct.new ${'$'}M2 (ref.null none))))
+            (elem (table ${'$'}tv) (i32.const 0) (ref null ${'$'}VT1) (global.get ${'$'}vt2))
+            (elem (table ${'$'}to) (i32.const 0) (ref null ${'$'}Obj1) (struct.new ${'$'}Obj2 (global.get ${'$'}vt2) (i32.const 8)))
+            (elem (ref null ${'$'}VT1) (struct.new ${'$'}VT2 (ref.func ${'$'}m)) (global.get ${'$'}vt2))
+            (func (export "vt") (result i32) (call_ref ${'$'}F1 (struct.get ${'$'}VT1 0 (global.get ${'$'}vt2))))
+            (func (export "o1") (result i32) (struct.get ${'$'}Obj1 1 (global.get ${'$'}o1)))
+            (func (export "o2") (result i32) (struct.get ${'$'}Obj1 1 (global.get ${'$'}o2)))
+            (func (export "hb") (result i32) (struct.get ${'$'}B1 0 (struct.get ${'$'}HB 0 (global.get ${'$'}hb))))
+            (func (export "to") (result i32) (struct.get ${'$'}Obj1 1 (ref.as_non_null (table.get ${'$'}to (i32.const 0)))))
+            """,
+        )
+        assertEquals(null, WitTool.validate(bytes))
+        assertNull(EndiveRuntime.invalidConstExpr(Parser.parse(bytes)))
+        for (runtime in listOf(EndiveRuntime(false), EndiveRuntime())) {
+            runtime.load(bytes).instantiate(WasmInstanceConfig.builder().build()).use { inst ->
+                assertEquals(3L, inst.call("vt").single())
+                assertEquals(5L, inst.call("o1").single())
+                assertEquals(6L, inst.call("o2").single())
+                assertEquals(9L, inst.call("hb").single())
+                assertEquals(8L, inst.call("to").single())
+            }
+            Program.loadMetered(runtime, bytes, null, emptySet())
+        }
+    }
+
     /** null の底の型（`none`・`nofunc`・`noextern`・`noexn`）を取る値にする式のための型（[head] の型の前に置く） */
     private val bottomTypes = """
         (type ${'$'}S0 (struct (field i32)))
@@ -388,6 +440,8 @@ class ConstExprValidationTest {
             "(global (ref \$AN) (struct.new \$AN (ref.null noextern)))",
             // null を持てないフィールドに null
             "(global (ref \$NE) (struct.new \$NE (ref.null none)))",
+            // none は番号の関数の型（func の階層）にもない（番号の型が struct・array のときだけ通す）
+            "(global (ref \$CF) (struct.new \$CF (ref.null none)))",
         )
         for (g in globals) assertRejectedEverywhere(g, bottomModule(g), "グローバル 0 の初期値: ")
         assertRejectedEverywhere(

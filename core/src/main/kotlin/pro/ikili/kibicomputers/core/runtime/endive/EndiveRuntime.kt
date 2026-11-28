@@ -624,7 +624,7 @@ public class EndiveRuntime internal constructor(
          *
          * 式の先頭の `ref.func` の範囲（flag 1・3 の番号の並びを含む）は、Endive の検証（`Validator` のコンストラクターの `declaredFunctions`）が
          * もう断るので、ここに届くのは先頭でない `ref.func` だけ。
-         * 型が合うかは [valTypeMatches]（Endive の `ValType.matches` に、`none` を eq・struct・array・i31 の部分型として扱わない穴を足したもの）で決める。
+         * 型が合うかは [valTypeMatches]（Endive の `ValType.matches` の、`none` を eq・struct・array・i31 の部分型として扱わない穴をふさいだもの）で決める。
          * 判定は読み込みのときに 1 回だけで、式の長さの和に比例する（関数の型とグローバルの一覧は 1 回だけ作る）。
          * Endive が直ったら、この判定を外す
          */
@@ -819,7 +819,7 @@ public class EndiveRuntime internal constructor(
         }
 
         /**
-         * [actual] が [want] の部分型か（[constExprProblem] が使う）。Endive 1.2.0 の `ValType.matches` に、null の底の型 `none` の穴を足したもの。
+         * [actual] が [want] の部分型か（[constExprProblem] が使う）。Endive 1.2.0 の `ValType.matches` の、null の底の型 `none` の穴（eq・struct・array・i31 の部分型として扱わない）をふさいだもの。
          *
          * Endive の `heapTypeSubtype` は、`none` を any と番号の struct・array の型の部分型としか扱わず、eq・struct・array・i31 の部分型として扱わない
          * （仕様では `none` は any の階層の全部の型の部分型）。そのままでは、`(struct.new $X (ref.null none))`（`$X` のフィールドが eqref など）のような
