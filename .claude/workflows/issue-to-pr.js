@@ -546,7 +546,9 @@ const MERGE_SCHEMA = {
   properties: {
     status: { type: 'string', enum: ['merged', 'needs_human'] },
     reason: { type: ['string', 'null'] },
-    failedStep: { type: ['string', 'null'], enum: ['conflict', 'test', 'ci', 'merge', null], description: '止まった手順（マージしたら null）。test は、取り込んだ結果のワークフローの検査（node --test）が落ちたとき' },
+    failedStep: { type: ['string', 'null'], enum: ['conflict', 'test', 'ci', 'merge', 'labeled', null], description: '止まった手順（マージしたら null）。test は、取り込んだ結果のワークフローの検査（node --test）が落ちたとき。labeled は、PR（スタックならどれかの段）に needs-human が付いていた（人の回答待ち。実行の途中で人が付けたもの。#1008）とき' },
+    // needs-human で止まった（failedStep=labeled）スタックのマージだけが使う。省略可能（#1008）
+    labeledPr: { type: ['integer', 'null'], description: 'スタックのマージの段階で failedStep=labeled のときだけ: needs-human が付いていた段のうち、一番下の段の PR の番号。それ以外は null' },
     // スタックのマージ（#936）だけが使う。省略可能
     stackMergeOutcome: { type: ['string', 'null'], enum: ['merged', 'permission_denied', 'github_rejected', null], description: 'スタックのマージ（`gh stack merge`）の段階だけ: merged（全段が MERGED になった）、permission_denied（ツールの権限の判定で拒否された）、github_rejected（GitHub が断った、または全段が MERGED にならなかった）。手順 4 まで進まなかったら null' },
   },
@@ -1084,14 +1086,21 @@ function mergePushStep(pr, branch) {
   return `\`git rev-parse HEAD\` と \`gh pr view ${pr} --json headRefOid\` を比べる。違えば（取り込みのコミットや、前から push していなかったコミットがある）、通常の \`git push origin ${branch}\` で push する（force push はしない）。同じなら push しない。`
 }
 
+// PR に needs-human が付いていないかを確かめる手順（#1008）。実行の途中（CI 待ち・レビューのあいだ）に人が付けたラベルで止まる。
+// 入口（選択の段階・prepareResume）では見ているので、穴は途中で付いたものだけ。読むだけなので、確かめてからマージするまでの数秒の窓は残る
+function labelCheckStep(pr, what) {
+  return `\`gh pr view ${pr} --json labels --jq '[.labels[].name]'\` で PR のラベルを確かめる。\`needs-human\` が付いていれば（人の回答待ち）、${what}、status=needs_human・failedStep=labeled で、理由に「PR #${pr} に needs-human が付いている（人の回答待ち）」と書いて返す（質問のコメントもラベルの付け外しもしない）`
+}
+
 // note は CI の回し直しのあと（#961）の指示。ログの名前は使わない（Gradle を動かさないので）
 function mergePrompt(info, impl, note) {
   return `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）をマージする。他の PR のマージとは直列に行っている。${note ? `\n${note}` : ''}
+0. ${labelCheckStep(impl.pr, '取り込み・push・マージをせず')}。
 1. worktree で \`git fetch origin\` し、\`git merge origin/main\` で main を取り込む（rebase と force push はしない）。衝突が字面の解消で済まない（ロジックの判断が要る）なら、\`git merge --abort\` で戻し、マージせず status=needs_human・failedStep=conflict で理由を返す。${mergeNodeTestStep('main')}
 2. ${mergePushStep(impl.pr, impl.branch)}
 3. \`gh pr checks ${impl.pr} --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（pending が残っている間はマージしない）。「通った」は、\`gh pr checks ${impl.pr} --json name,state,bucket\` の全チェックが pass か skipping のとき（必須の \`build\` だけでは決めない）。取り込みが Already up to date で push もせず、先頭のコミットの CI がもう通っていれば、待たずにそのまま手順 4 に進む。通らなければ status=needs_human・failedStep=ci で、落ちたチェックと run の ID を理由に書く。**CI は自分で回し直さない**（\`gh run rerun\` はしない。不安定なテストかどうかは、このスクリプトが別の段階で確かめて、回し直すかを決める）。
    CI の待ちには、下の「CI の待ちの上限」を当てる。待ちをあきらめたら、マージせず status=needs_human・failedStep=ci で、理由に「CI が終わる前に待ちの上限（または接続の失敗）で待つのをやめた」と、まだ終わっていないチェックと run の ID を書く（このスクリプトが別の段階で CI を確かめ直す）。
-4. マージの前に \`gh api repos/${REPO}/pulls/${impl.pr} --jq '{base: .base.ref, stack: .stack}'\` を確かめる。stack が null でないか、base が main でなければ（実装の後でスタックに積まれた、など。#936）、\`gh pr merge\` を実行せず status=needs_human・failedStep=merge で「スタックの PR になっている」と返す。\`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。「base branch policy prohibits the merge」で断られたら、\`gh pr view ${impl.pr} --json mergeStateStatus,statusCheckRollup\` で理由を確かめ、CI の待ちが理由なら 3 からもう1回やり直す。2回目も断られたら status=needs_human・failedStep=merge で理由を返す。マージできたら status=merged・failedStep=null。
+4. マージの前に \`gh api repos/${REPO}/pulls/${impl.pr} --jq '{base: .base.ref, stack: .stack}'\` を確かめる。stack が null でないか、base が main でなければ（実装の後でスタックに積まれた、など。#936）、\`gh pr merge\` を実行せず status=needs_human・failedStep=merge で「スタックの PR になっている」と返す。続けて、もう 1 回 ${labelCheckStep(impl.pr, 'マージせず')}（手順 3 の CI の待ちの間に付いたもの）。\`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。「base branch policy prohibits the merge」で断られたら、\`gh pr view ${impl.pr} --json mergeStateStatus,statusCheckRollup\` で理由を確かめ、CI の待ちが理由なら 3 からもう1回やり直す。2回目も断られたら status=needs_human・failedStep=merge で理由を返す。マージできたら status=merged・failedStep=null。
 
 ${ciWaitRules(impl.pr, 'マージせずに返す（手順 3）。')}`
 }
@@ -1105,11 +1114,19 @@ async function mergePr(info, impl) {
   try {
     const res = await mergeOnce(info, impl, null, 'merge')
     if (!res) return { status: 'needs_human', failedStep: null, reason: 'マージの段階が失敗した' }
-    if (res.status !== 'needs_human' || res.failedStep !== 'ci') return res
-    return await rerunFlakyCi(info, impl, res)
+    if (res.status !== 'needs_human' || res.failedStep !== 'ci') return labeledStop(impl, res)
+    return labeledStop(impl, await rerunFlakyCi(info, impl, res))
   } finally {
     mergeLock.release()
   }
+}
+
+// PR に needs-human が付いていて止まった（failedStep=labeled。#1008）結果は、新しく聞かない（論点は人が付けたこの PR にある）。
+// 回し直しのあとのマージの段階（merge-rerun）で見つけた分も拾うよう、mergePr の最後の結果で変える
+function labeledStop(impl, res) {
+  if (res?.status !== 'needs_human' || res.failedStep !== 'labeled') return res
+  log(`PR #${impl.pr}: マージの直前に needs-human が付いていた。新しく聞かずに止まる`)
+  return { ...res, noQuestion: true, pointerPr: impl.pr, reason: `PR #${impl.pr} に needs-human が付いていた（人の回答待ち。実行の途中で付いたもの）ので、マージせずに止まった。新しい質問はしていない。${res.reason ?? '-'}` }
 }
 
 // マージの段階の push の後の CI の失敗を、CI の直しの段と同じ条件で不安定なテストか確かめ、そうなら記録して 1 回だけ回し直す（#961）。
@@ -1197,7 +1214,7 @@ function mergeOnce(info, impl, stageNote, stage, stack = null) {
 // 下の段から順に取り込み（一番下は main、上の段は一つ下の段のブランチ。通常の push だけ。手元で Gradle は動かさない。#985）→
 // 全段の先頭のコミットの CI → `gh stack merge <一番上> --yes --squash`。ツールの権限の判定で拒否されたら、確かめを済ませたうえで
 // 「スタックごとマージしてよいか」を 1 回だけ聞く（回避の手段は使わない）。人への新しい質問は、スタックにつき 1 つまで。
-// 下の段の論点（needs-human）がもう別の PR で聞かれているなら、新しく聞かず、その PR を指す短い報告だけを付ける（needs-human は付けない。付けると、人が論点の PR のラベルだけを外して resume したとき、案内のラベルで止まって互いを指し合う）。
+// どれかの段（一番上の段も。#1008）の論点（needs-human）がもう聞かれているなら、新しく聞かず、その PR を指す短い報告だけを付ける（needs-human は付けない。付けると、人が論点の PR のラベルだけを外して resume したとき、案内のラベルで止まって互いを指し合う）。
 // 段の担当: 一番上の段の Issue の流れがまとめてマージする。下の段の Issue の流れは、上の段がこの実行の中にあれば、その結果（done）を待つ。
 // 待つ前に slots と area のロックを放す（上の段がそれを取れずに詰まらないように）。上の段は下の段の「マージしてよい」（readySignals）を、
 // mergeLock の外で待つ（下の段は、マージの段階に入る前に、それを出す）
@@ -1335,14 +1352,15 @@ function stackMergePrompt(info, impl, note, plan) {
 2. ${mergePushStep(impl.pr, impl.branch)}
 3. 全段の PR（${prs}）について、それぞれ \`gh pr checks <n> --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（下の段に push すると下の段の CI、上の段に push すると上の段の CI が走る。どの段も、pending が残っている間はマージしない。「通った」は、\`gh pr checks <n> --json name,state,bucket\` の全チェックが pass か skipping のとき）。もう通っている段は待たなくてよい。どれかが通らなければ status=needs_human・failedStep=ci で、PR の番号・落ちたチェック・run の ID を理由に書く。**CI は自分で回し直さない**（\`gh run rerun\` はしない）。
    CI の待ちには、下の「CI の待ちの上限」を当てる（\`<n>\` は各段の PR の番号。上限は全段を合わせて測る）。待ちをあきらめたら、マージせず status=needs_human・failedStep=ci で、理由に「CI が終わる前に待ちの上限（または接続の失敗）で待つのをやめた」と、まだ終わっていない PR・チェック・run の ID を書く。
-4. \`${cmd}\` を 1 回だけ実行する（\`--squash\` は必ず付ける。\`--yes\` だけだと前回の方式でマージする）。**\`gh pr merge\`、\`gh api\` の \`PUT .../pulls/<n>/merge\`・\`merge-async\` など、別の口では試さない**（スタックの PR は \`gh pr merge\` では入らず、別の口で通すのは権限の判定の回避になる）。下の段だけの部分マージ（\`gh stack merge <下の段>\`）もしない。
+4. 実行の前に、全段（${prs}）について \`gh pr view <n> --json labels --jq '[.labels[].name]'\` でラベルを確かめる（手順 3 の CI の待ちの間に人が付けたもの。#1008）。どれかの段に \`needs-human\` が付いていれば（人の回答待ち）、マージせず、status=needs_human・failedStep=labeled・labeledPr=<付いていた段のうち一番下の段の PR の番号> で、理由に付いていた段の PR の番号を書いて返す（質問のコメントもラベルの付け外しもしない）。
+   付いていなければ、\`${cmd}\` を 1 回だけ実行する（\`--squash\` は必ず付ける。\`--yes\` だけだと前回の方式でマージする）。**\`gh pr merge\`、\`gh api\` の \`PUT .../pulls/<n>/merge\`・\`merge-async\` など、別の口では試さない**（スタックの PR は \`gh pr merge\` では入らず、別の口で通すのは権限の判定の回避になる）。下の段だけの部分マージ（\`gh stack merge <下の段>\`）もしない。
    - ツールの権限の判定で拒否された（コマンドが実行されなかった）ら、ほかの手段を試さず、status=needs_human・failedStep=merge・stackMergeOutcome=permission_denied で返す。reason には、確かめた事実（この木の先頭のコミット、各段の CI の run の ID と結果）を書く。
    - GitHub が断ったら（rebase が要る、チェックが終わっていない、など）、メッセージを確かめる。CI の待ちが理由なら 3 からもう 1 回だけやり直す。それ以外（rebase が要る、など）は、rebase も force push もせず、status=needs_human・failedStep=merge・stackMergeOutcome=github_rejected で、メッセージを理由に書く。
    - 通ったら、マージは非同期なので、全段（${prs}）の \`gh pr view <n> --json state,mergeCommit\` が MERGED になるまで、最大 10 分、\`gh pr checks ${impl.pr} --watch --interval 30\` を挟むなどで間を空けて取り直す。全段が MERGED なら status=merged・failedStep=null・stackMergeOutcome=merged。ならなければ status=needs_human・failedStep=merge・stackMergeOutcome=github_rejected で、各段の状態を理由に書く。
 
 ${ciWaitRules('<n>', 'マージせずに返す（手順 3）。')}
 
-返す値の stackMergeOutcome: 手順 4 の結果。手順 4 まで進まなかったら null。`
+返す値の stackMergeOutcome: 手順 4 の \`${cmd}\` の結果。実行しなかったら（ラベルで止まったときも）null。labeledPr: failedStep=labeled のときだけ番号、それ以外は null。`
 }
 
 // スタックの上の段がまとめてマージするのを待つ（下の段の Issue の流れ）。上の段がこの実行にないなら、下の段だけではマージしない
@@ -1415,7 +1433,7 @@ async function mergeStackTop(info, impl, plan) {
   }
   await mergeLock.acquire()
   try {
-    // b. マージの直前に、全段の状態を取り直す（実装の後で積まれた・外された、下の段に人の論点が付いた、など）
+    // b. マージの直前に、全段の状態を取り直す（実装の後で積まれた・外された、どれかの段（一番上の段も。#1008）に人の論点が付いた、など）
     const st = await detectStack(impl.pr, `stack-check:${impl.pr}`)
     if (!st) return { status: 'needs_human', failedStep: 'merge', reason: `${label}: マージの直前にスタックの状態を取り直せなかった（読むだけの段階が結果を返さなかった）。確かめもマージもしていない` }
     const now = stackPlan(st, impl.pr)
@@ -1428,10 +1446,11 @@ async function mergeStackTop(info, impl, plan) {
     if (broken.length) {
       return { status: 'needs_human', failedStep: 'merge', reason: `${label}: ${broken.map(m => `PR #${m.pr} が ${m.state !== 'OPEN' ? m.state : 'draft'}`).join('、')}。スタックの一部だけがマージ・クローズされた形は、残りに rebase（force push）が要るので、自動では進めない。確かめもマージもしていない` }
     }
-    const waiting = now.lowers.filter(m => m.needsHuman)
+    // どの段（一番上の段 = この流れの PR も）に付いていても止まる（#1008）。論点は付いている段のうち一番下の段に置く
+    const waiting = now.members.filter(m => m.needsHuman)
     if (waiting.length) {
-      log(`PR #${impl.pr}: ${label}の下の段に needs-human が付いている。取り込みも確かめもせずに止まる`)
-      return { status: 'needs_human', failedStep: 'merge', noQuestion: true, pointerPr: waiting[0].pr, reason: `${label}の下の段 ${waiting.map(m => `PR #${m.pr}`).join('・')} に needs-human が付いている（人の回答待ち）。上の段をマージすると下の段も一緒に入るので、スタックの論点として PR #${waiting[0].pr} の回答を待つ。取り込み・確かめ・マージはしていない` }
+      log(`PR #${impl.pr}: ${label}の ${waiting.map(m => `PR #${m.pr}`).join('・')} に needs-human が付いている。取り込みも確かめもせずに止まる`)
+      return { status: 'needs_human', failedStep: 'merge', noQuestion: true, pointerPr: waiting[0].pr, reason: `${label}の段 ${waiting.map(m => `PR #${m.pr}`).join('・')} に needs-human が付いている（人の回答待ち）。スタックはまとめてマージするので、スタックの論点として PR #${waiting[0].pr} の回答を待つ。取り込み・確かめ・マージはしていない` }
     }
     // この実行にない下の段は、このフローのレビュー（AGENTS.md の開発フローの 5）を通ったものだけ、一緒にマージする。
     // 一番上の段のレビューは base が下の段のブランチの差分なので、下の段のコードは見ない。通っていない段は、別の流れ
@@ -1463,6 +1482,12 @@ async function mergeStackTop(info, impl, plan) {
     // 不安定なテストの CI の回し直し（#961）は、1 つの PR を見る作りなので、スタックには使わない（落ちたら止まって人に上がる）
     const res = (await mergeOnce(info, impl, null, 'merge', now)) ?? { status: 'needs_human', failedStep: null, reason: 'スタックのマージの段階が失敗した' }
     const prefix = `${label}: 下の段から順に取り込んだ（${synced.join('、')}）。`
+    if (res.status === 'needs_human' && res.failedStep === 'labeled') {
+      // CI の待ちの間に人がどれかの段に needs-human を付けた（#1008）。新しく聞かず、付いた段（分からなければ一番上の段）を指す
+      const pointerPr = now.members.some(m => m.pr === res.labeledPr) ? res.labeledPr : impl.pr
+      log(`PR #${impl.pr}: ${label}の \`gh stack merge\` の直前に needs-human が付いていた。新しく聞かずに止まる`)
+      return { ...res, syncedWorktrees, noQuestion: true, pointerPr, reason: `${prefix}全段の CI は待ったが、\`gh stack merge\` の直前に needs-human が付いていた（人の回答待ち。論点は PR #${pointerPr}）ので、マージしていない。新しい質問はしていない。${res.reason ?? '-'}` }
+    }
     if (res.status === 'merged') return { ...res, syncedWorktrees, retried: true, reason: `${prefix}全段の CI を確かめ、\`gh stack merge ${impl.pr} --yes --squash\` でまとめてマージした` }
     if (res.stackMergeOutcome === 'permission_denied') {
       return {
