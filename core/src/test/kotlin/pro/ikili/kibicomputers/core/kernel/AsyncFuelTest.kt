@@ -352,8 +352,11 @@ class AsyncFuelTest {
                     "今の tick ${h.scheduler.now}、CPU の待ち ${m.cpu.waiting}）"
             }
         }) {
-            m.fuelWaiterCount == processes &&
-                m.lock.withLockValue { m.fuelAccount.lastRefillTick == h.scheduler.now && m.kernel.fuel <= 0 }
+            // 3 つの条件は 1 回のカーネルロックの中で読む（別々に読むと、間に状態が進む。止めた待ち手のスレッドが外れるまでの間は、
+            // 「全員が列にいて、その tick に補充済みで、燃料がまだ残っている」状態が tick の途中にできる）
+            m.lock.withLockValue {
+                m.fuelWaiterCount == processes && m.fuelAccount.lastRefillTick == h.scheduler.now && m.kernel.fuel <= 0
+            }
         }
     }
 

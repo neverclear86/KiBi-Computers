@@ -659,8 +659,10 @@ internal class ProcessRunner(private val machine: Machine) {
         // 手持ちを渡した後に tick が進んでいたら、その場で足さない（許可を回す）
         if (account.lastRefillTick != observed) return null
         if (account.afterGiveBack(observed, remaining) <= 0) return null
-        // 起こされてスレッドが外れるのを待っている者（巻き戻した直後に自分で起こした待機点型など）も、CPU を待つ者に数える。
-        // 数えないと、そのスレッドが外れる前にスライスを使い切った側が譲らずに足し、巻き戻しが 1 回減って配分がぶれる（#47）
+        // イベントで起こされ、スレッドが外れるのを待っている者（pendingSchedule。ProcessWaiter の道）も、CPU を待つ者に数える。
+        // 数えないと、そのスレッドが外れる前にスライスを使い切った側が譲らずに足し、巻き戻しが 1 回減って配分がぶれる（#47）。
+        // 燃料待ちの列の待ち手は、スレッドが外れるまで列に残る（#956）ので hasFuelWaitersLocked が数える。巻き戻した直後に自分の giveBack で
+        // 起こそうとした待機点型も、スレッドが付いている間は列で止まるので、数えるのは列の側
         if (machine.cpu.waiting > 0 || machine.hasFuelWaitersLocked() || machine.hasPendingSchedulesLocked()) return null
         account.giveBack(observed, remaining)
         val grant = account.take(observed, machine.config.fuelSlice)
