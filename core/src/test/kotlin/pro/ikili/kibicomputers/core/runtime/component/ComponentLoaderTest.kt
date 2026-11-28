@@ -1673,30 +1673,46 @@ class ComponentLoaderTest {
         assertDoesNotThrow { ComponentLoader.load(smallEq) }
     }
 
+    /**
+     * `(func)` の import を [funcs] 個持つコンポーネント型 `$ct` を、[imports] 個の import で受けるコンポーネント `$r` を、
+     * 引数 [imports] 個（どれも空のコンポーネント）で [instances] 回インスタンス化する（#963）
+     */
+    private fun instantiateWithComponentArgs(funcs: Int, imports: Int, instances: Int): ByteArray {
+        val funcDecls = (0 until funcs).joinToString(" ") { """(import "i$it" (func))""" }
+        val importDecls = (0 until imports).joinToString(" ") { """(import "c$it" (component (type ${'$'}ct)))""" }
+        val args = (0 until imports).joinToString(" ") { """(with "c$it" (component ${'$'}empty))""" }
+        val instanceDecls = (0 until instances).joinToString(" ") { "(instance (instantiate ${'$'}r $args))" }
+        return wat(
+            """
+            (component
+              (type ${'$'}ct (component $funcDecls))
+              (component ${'$'}empty)
+              (component ${'$'}r (alias outer 1 ${'$'}ct (type ${'$'}ct)) $importDecls)
+              $instanceDecls
+            )
+            """,
+        )
+    }
+
     @Test
     fun `インスタンス化の引数で受けるコンポーネント型の import は写し直しで数える`() {
         // #963: 同じ型をインスタンス化の引数で受ける形は、受ける側の import をインスタンス化ごとの写し直しが覆う
         // （wasmparser が引数ごとにたどる受ける側の import は、写し直しの数える import の宣言の大きさを超えない）ので、型の確認には足さない
-        val funcs = (0 until 100).joinToString(" ") { """(import "i$it" (func))""" }
-        val imports = (0 until 100).joinToString(" ") { """(import "c$it" (component (type ${'$'}ct)))""" }
-        val args = (0 until 100).joinToString(" ") { """(with "c$it" (component ${'$'}empty))""" }
-        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}r $args))" }
-        val bytes = wat(
-            """
-            (component
-              (type ${'$'}ct (component $funcs))
-              (component ${'$'}empty)
-              (component ${'$'}r (alias outer 1 ${'$'}ct (type ${'$'}ct)) $imports)
-              $instances
-            )
-            """,
-        )
+        val bytes = instantiateWithComponentArgs(funcs = 100, imports = 100, instances = 10)
         val e = estimateOf(bytes)
         assertEquals(1_000L, e.checkCount)
         // インスタンス化ごとに、受ける側の import 100 個それぞれのコンポーネント型（import 100 個）を写し直す分
         assertTrue(e.remapCost >= 10L * 100 * 100) { "${e.remapCost}" }
         // 型の確認は、渡す側（空のコンポーネント）の大きさだけ（受ける側を足すと、写し直しと二重に数える）。型のたどり（#955）は別に数える
         assertTrue(e.cost - e.remapCost - e.scanCost <= 1_000L * 2) { "${e.cost} - ${e.remapCost} - ${e.scanCost}" }
+        // この形の見積もり（約 30 万）は既定の上限に収まり、実際の検証も通る（検証に通らない形を測っているのではない）
+        assertTrue(e.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${e.cost}" }
+        assertDoesNotThrow { ComponentLoader.load(bytes) }
+
+        // 小さい版も、正しいコンポーネントとして実際の検証を通る
+        val small = instantiateWithComponentArgs(funcs = 3, imports = 4, instances = 2)
+        assertEquals(8L, estimateOf(small).checkCount)
+        assertDoesNotThrow { ComponentLoader.load(small) }
     }
 
     /**
