@@ -20,7 +20,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * `StackExhaustionLockTest` の `DISK_IO` は、ロックの面（マシンのロック・リースのロック・CPU・許可）だけを見る。ホストの関数の本体の中で
  * 尽きると、`rename` が「ホストの移動 → 表の付け替え」の間で、`create` が「ホストのファイルを作る → 使用量を数える」の間で止まりうる。
  * そこで、本物のディスクの 1 つの操作を、スタックの小さいスレッドで、尽きる位置を詰め物の 1 段ずつずらして動かし
- * （尽きる境目を二分探索で探し、そこから先の、操作が使う分の幅をすべて通る）、毎回の後に [DiskFileSystem.consistencyProblemsForTest] で
+ * （尽きる境目を二分探索で探し、そこから先の、操作が使う分の幅をすべて通る。最初の境目が古いと境目の直後を掃かないので、最初の区間が境目を
+ * またがなければ探し直してやり直す。#952）、毎回の後に [DiskFileSystem.consistencyProblemsForTest] で
  * 表・使用量・開いたままのファイルの枠がホストと合うことと、リースのロックが取れることを確かめる。尽きたときも、尽きなかったときも見る
  */
 class DiskFileSystemStackExhaustionTest {
@@ -149,46 +150,21 @@ class DiskFileSystemStackExhaustionTest {
     }
 
     /**
-     * 詰め物の段数を変えて [attempt]（尽きた・深いところで行えなかったら `true`）を動かす。JIT をかけてから、尽きる境目を探し、
-     * 境目の少し手前から先（詰め物が多く、残りのスタックが少ない側）を、操作が使う分の幅（[widthFrames] 段）だけ 1 段ずつ動かす。最後の境目を返す
+     * 詰め物の段数を変えて [attempt]（尽きた・深いところで行えなかったら `true`。`swept` は 1 段ずつの掃引の回）を動かす。JIT をかけてから、尽きる境目を探し、
+     * 境目の少し手前から先（詰め物が多く、残りのスタックが少ない側）を、操作が使う分の幅（[widthFrames] 段）だけ 1 段ずつ動かす。規則は [walkStackEdge] に
+     * まとめ、`TmpFileSystemTreeStackExhaustionTest` と同じものを使う（#952）。最初の区間が境目をまたがなかった（慣らしが詰め物 0 だけなので、最初の境目が
+     * 古い（低い）ことがある）ときは、探し直してやり直し、またいだことを `check` で確かめる。
+     *
+     * 境目は、操作のいちばん深い所が尽きる最小の詰め物で、それより浅い所（ホストの移動の後の付け替えなど）は、詰め物がもっと多いところで尽きる。
+     * 幅は回数の割合（`kibi.stackHeadroom.roundsScale`。インタプリタで回す opt-in のタスクは 1/4）で縮めない（#903）。縮めると
+     * 「境目から先を 1 段ずつ全部」でなくなり、`-Xint` では確かめ（`probe` もインタプリタの大きいフレーム）の幅より狭くなって、
+     * [sweepVfs] の尽きる位置が確かめの外まで届かなかった。1 回は速い（インタプリタでも 1 本が数分）ので、減らすのは JIT をかける回数だけにする
      */
-    private fun walkEdge(widthFrames: Int = WIDTH, attempt: (Int) -> Boolean): Int {
-        // 操作を何度か動かして、JIT をかける（インタプリタと JIT のコードでは、フレームの大きさが違い、境目が動く）
-        repeat(stackHeadroomRounds(WARMUP)) { attempt(0) }
-
-        /** 尽きる最小の詰め物の段数を探す（倍々で尽きるところを見つけ、二分で縮める） */
-        fun findEdge(): Int {
-            var lo = 0
-            var hi = 256
-            while (!attempt(hi)) {
-                lo = hi
-                hi *= 2
-                check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
-            }
-            while (hi - lo > 1) {
-                val mid = (lo + hi) / 2
-                if (attempt(mid)) hi = mid else lo = mid
-            }
-            return hi
-        }
-
-        // 幅は回数の割合（`kibi.stackHeadroom.roundsScale`。インタプリタで回す opt-in のタスクは 1/4）で縮めない（#903）。縮めると
-        // 「境目から先を 1 段ずつ全部」でなくなり、`-Xint` では確かめ（`probe` もインタプリタの大きいフレーム）の幅より狭くなって、
-        // [sweepVfs] の尽きる位置が確かめの外まで届かなかった。1 回は速い（インタプリタでも 1 本が数分）ので、減らすのは JIT をかける回数だけにする
-        val width = widthFrames
-        var edge = findEdge()
-        var done = 0
-        // 境目から先（詰め物が多く、残りのスタックが少ない側）を、操作が使う分の幅だけ 1 段ずつ。境目は、操作のいちばん深い所が尽きる
-        // 最小の詰め物で、それより浅い所（ホストの移動の後の付け替えなど）は、詰め物がもっと多いところで尽きる。境目は動くので
-        // （JIT が進む）、途中で探し直す
-        while (done < width) {
-            val batch = minOf(width - done, REFIND_EVERY)
-            for (k in 0 until batch) attempt(maxOf(0, edge - 8 + done + k))
-            done += batch
-            edge = findEdge()
-        }
-        return edge
-    }
+    private fun walkEdge(
+        widthFrames: Int = WIDTH,
+        commitSwept: (keep: Boolean) -> Unit = {},
+        attempt: (pad: Int, swept: Boolean) -> Boolean,
+    ): StackEdgeWalk = walkStackEdge(widthFrames, WARMUP, attempt, commitSwept)
 
     private fun sweep(op: Op) {
         val root = Files.createDirectories(dir.resolve("disk"))
@@ -206,7 +182,7 @@ class DiskFileSystemStackExhaustionTest {
             var completed = 0
 
             /** [pad] 段の詰め物で 1 回動かし、尽きたか（尽きなかったら終わりまで動いた）を返す。毎回、状態を確かめて片付ける */
-            fun attempt(pad: Int): Boolean {
+            fun attempt(pad: Int, @Suppress("UNUSED_PARAMETER") swept: Boolean): Boolean {
                 val n = counter.incrementAndGet()
                 val a = prepare(fs, op, n)
                 val error = runOnSmallStack(pad, a.run)
@@ -219,8 +195,8 @@ class DiskFileSystemStackExhaustionTest {
                 return soe != null
             }
 
-            val edge = walkEdge(attempt = ::attempt)
-            println("#858 disk $op: 境目 $edge、${counter.get()} 回動かし、尽きなかった（終わりまで動いた）$completed 回、尽きた位置: ${tally.describe()}")
+            val walk = walkEdge(attempt = ::attempt)
+            println("#858 disk $op: $walk、${counter.get()} 回動かし、尽きなかった（終わりまで動いた）$completed 回、尽きた位置: ${tally.describe()}")
             assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
             // 入口の確かめ（`ensure(HOST_IO_FRAMES)`）は、リースのロックを取る前に止める。ロック・NIO のチャンネルの中のロックの途中では尽きない
             assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
@@ -285,7 +261,7 @@ class DiskFileSystemStackExhaustionTest {
             var left = 0
 
             /** 深いところで行えなかった（知らせが列に残った、または尽きた）なら `true` */
-            fun attempt(pad: Int): Boolean {
+            fun attempt(pad: Int, @Suppress("UNUSED_PARAMETER") swept: Boolean): Boolean {
                 val n = ++counter
                 val f = vfs.open(p("/w/f$n"), OpenOptions(read = true, write = true, create = true))
                 assertEquals(1, fs.openHandles, "開いたファイルの枠を数えていない")
@@ -307,8 +283,8 @@ class DiskFileSystemStackExhaustionTest {
                 return queued || soe != null
             }
 
-            val edge = walkEdge(attempt = ::attempt)
-            println("#858 disk deferred release: 境目 $edge、$counter 回動かし、深いところで行えた $drained 回、列に残した $left 回、尽きた位置: ${tally.describe()}")
+            val walk = walkEdge(attempt = ::attempt)
+            println("#858 disk deferred release: $walk、$counter 回動かし、深いところで行えた $drained 回、列に残した $left 回、尽きた位置: ${tally.describe()}")
             assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
             assertTrue(drained > 0, "1 度も深いところで行えなかった")
             assertTrue(left > 0, "1 度も列に残さなかった（境目を通っていない）")
@@ -356,8 +332,13 @@ class DiskFileSystemStackExhaustionTest {
             val tally = SoePositions()
             var completed = 0
             val options = OpenOptions(read = true, write = true, create = true)
+            // 1 段ずつの掃引（境目から [VFS_WIDTH] 段）の分だけ。境目を探す途中の大きな詰め物（倍々の 4096 段など）は、いつも詰め物の中で尽きて
+            // [SoePositions.Position.OTHER] に入るので、全部の回で数えると下の検査が空振りする。区間の途中の分は [pendingSwept] に置き、
+            // [walkStackEdge] が区間を採るか（`commitSwept(true)`）、やり直しで捨てるか（`false`）を決める
+            val swept = SoePositions()
+            val pendingSwept = ArrayList<StackOverflowError>()
 
-            fun attempt(pad: Int): Boolean {
+            fun attempt(pad: Int, sweptStep: Boolean): Boolean {
                 val n = counter.incrementAndGet()
                 val path = p("/w/f$n")
                 val error = when (op) {
@@ -394,18 +375,32 @@ class DiskFileSystemStackExhaustionTest {
                     fail("開いたままのホストのファイルが残った（$what）: ${fs.openHandles}\nSOE: ${soe?.stackTrace?.take(14)?.joinToString(" <- ")}")
                 }
                 verify(fs, what, soe)
-                if (soe != null) tally.record(soe) else completed++
+                if (soe != null) {
+                    tally.record(soe)
+                    if (sweptStep) pendingSwept += soe
+                } else {
+                    completed++
+                }
                 scrub(fs, 0, listOf("/w/f$n"))
                 verify(fs, "$op、pad $pad、片付けた後", soe)
                 return soe != null
             }
 
-            val edge = walkEdge(VFS_WIDTH, ::attempt)
-            println("#901 vfs $op: 境目 $edge、${counter.get()} 回動かし、尽きなかった（終わりまで動いた）$completed 回、尽きた位置: ${tally.describe()}")
+            val walk = walkEdge(VFS_WIDTH, { keep ->
+                if (keep) pendingSwept.forEach { swept.record(it) }
+                pendingSwept.clear()
+            }, ::attempt)
+            println(
+                "#901 vfs $op: $walk、${counter.get()} 回動かし、尽きなかった（終わりまで動いた）$completed 回、尽きた位置: ${tally.describe()}、" +
+                    "1 段ずつの掃引: ${swept.describe()}",
+            )
             assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
             // 入口の確かめより浅い所を通り越し、操作の外（その上のテストのコード）でも尽きた。その間にある尽きうる位置（`Vfs` の
             // 関数の入口）は、すべて幅に入っている（JIT が `Vfs.close` を呼び手に畳むと、その入口はなくなり VFS の回は 0 になりうる）
-            assertTrue(tally.count(SoePositions.Position.OTHER) > 0, "操作より浅い所まで尽きる位置が届いていない（幅が足りない）: ${tally.describe()}")
+            assertTrue(
+                swept.count(SoePositions.Position.OTHER) > 0,
+                "1 段ずつの掃引で、操作より浅い所まで尽きる位置が届いていない（幅が足りない）: ${swept.describe()}",
+            )
             assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
             assertTrue(completed > 0, "1 度も終わりまで動かなかった")
             assertEquals(emptyList<String>(), fs.consistencyProblemsForTest())
@@ -523,8 +518,5 @@ class DiskFileSystemStackExhaustionTest {
 
         /** [sweepVfs] の幅（段数）。`release`・`open` の入口の確かめの幅より広くし、`Vfs` 自身のフレームとその上まで通る */
         const val VFS_WIDTH = 1800
-
-        /** 境目を探し直す間隔（回） */
-        const val REFIND_EVERY = 120
     }
 }

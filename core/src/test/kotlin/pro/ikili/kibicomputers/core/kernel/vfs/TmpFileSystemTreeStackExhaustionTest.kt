@@ -7,7 +7,6 @@ import org.junit.jupiter.api.fail
 import pro.ikili.kibicomputers.core.kernel.MachineClock
 import pro.ikili.kibicomputers.core.kernel.MemoryAccount
 import pro.ikili.kibicomputers.core.kernel.SoePositions
-import pro.ikili.kibicomputers.core.kernel.stackHeadroomRounds
 import pro.ikili.kibicomputers.core.persist.snapshot.TmpfsSectionCodec
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -296,69 +295,14 @@ class TmpFileSystemTreeStackExhaustionTest {
     }
 
     /**
-     * 詰め物の段数を変えて [attempt]（尽きたら `true`）を動かす（`DiskFileSystemStackExhaustionTest.walkEdge` と同じ形）。JIT をかけてから、
-     * 尽きる境目を探し、境目の少し手前から先（詰め物が多く、残りのスタックが少ない側）を [WIDTH] 段だけ 1 段ずつ動かす（`attempt` の
-     * `swept` は、この 1 段ずつの動かし方のとき `true`）。最初の区間が境目をまたがなかった（全部尽きた、または尽きなかった回が [MAX_LEAD] 回より多い）ときは、
-     * 探し直した境目からその区間をやり直す（`DiskFileSystemStackExhaustionTest.walkEdge` にはこのやり直しがない）。やり直す回数を使い切っても、
-     * 区間が境目をまたいではいれば（尽きた回も尽きなかった回もある）、そのまま進む（尽きなかった回が多いだけ。またがないときだけ失敗する）。
-     * 最初の区間を採ったら、境目から先に動かした段（尽きた回の数）だけ進める（区間の全部を進めると、境目の手前で使った回の分を飛ばす）。
-     * 境目から先を [WIDTH] 段動かすまで続ける。区間ごとに、1 段ずつ動かして尽きた回を [commitSwept] に渡す（`true` は数える、`false` はやり直しで捨てた区間）。最後の境目を返す
+     * 詰め物の段数を変えて [attempt]（尽きたら `true`）を動かす。規則（慣らし・境目の探し方・最初の区間のやり直し・進め方）は
+     * [walkStackEdge] にまとめ、`DiskFileSystemStackExhaustionTest` と同じものを使う（#952）。幅は [WIDTH] 段で、回数の割合（`kibi.stackHeadroom.roundsScale`。
+     * インタプリタで回す opt-in のタスクは 1/4）で縮めない（#903）。1/4（150 段）に縮めた版も、手元の 3 つの JVM では 29 の型すべてで確かめの外
+     * （[SoePositions.Position.OTHER]）まで届いたが、`-Xint` の余りは 20〜36 回と小さい（`-Xint` では確かめの中だけで 110 回前後を使う）。確かめが 128 段の
+     * `HOST_IO_FRAMES` の `DiskFileSystemStackExhaustionTest` では、縮めると届かなかった。減らすのは JIT をかける回数（[WARMUP]）だけ
      */
-    private fun walkEdge(attempt: (pad: Int, swept: Boolean) -> Boolean, commitSwept: (keep: Boolean) -> Unit): Int {
-        repeat(stackHeadroomRounds(WARMUP)) { attempt(0, false) }
-
-        fun findEdge(): Int {
-            var lo = 0
-            var hi = 256
-            while (!attempt(hi, false)) {
-                lo = hi
-                hi *= 2
-                check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
-            }
-            while (hi - lo > 1) {
-                val mid = (lo + hi) / 2
-                if (attempt(mid, false)) hi = mid else lo = mid
-            }
-            return hi
-        }
-
-        // 幅は回数の割合（`kibi.stackHeadroom.roundsScale`。インタプリタで回す opt-in のタスクは 1/4）で縮めない（#903。`DiskFileSystemStackExhaustionTest.walkEdge` と
-        // 同じ）。1/4（150 段）に縮めた版も、手元の 3 つの JVM では 29 の型すべてで確かめの外（[SoePositions.Position.OTHER]）まで届いたが、
-        // `-Xint` の余りは 20〜36 回と小さい（`-Xint` では確かめの中だけで 110 回前後を使う）。確かめが 128 段の `HOST_IO_FRAMES` の
-        // `DiskFileSystemStackExhaustionTest` では、縮めると届かなかった。減らすのは JIT をかける回数（[WARMUP]）だけ
-        val width = WIDTH
-        var edge = findEdge()
-        var done = 0
-        // 最初の区間（境目の直後。操作のいちばん深い所が尽きる範囲）を、境目をまたいで掃いたか（尽きなかった回が少なく、尽きた回もある）。慣らしは詰め物 0 だけなので、
-        // 最初の数回の境目は、詰め物の再帰が温まる前の古い値（低い）になることがある。そのときは区間の全部が尽きず、境目の直後を
-        // 1 段ずつ動かさないまま先へ進むので、探し直した境目からやり直す
-        var retries = 0
-        while (done < width) {
-            val batch = minOf(width - done, REFIND_EVERY)
-            var crashed = 0
-            for (k in 0 until batch) if (attempt(maxOf(0, edge - 8 + done + k), true)) crashed++
-            edge = findEdge()
-            val straddled = crashed in 1 until batch
-            // 境目の手前（尽きない回）が [MAX_LEAD] 回より多いと、境目の直後を掃いた幅が足りない（区間の終わりの数段でだけ尽きた）。
-            // やり直す回数を使い切ったら、境目をまたいではいる限り（[straddled]）進む（またいだ区間でも手前の回が [MAX_LEAD] を超えることは、マシンが混むとある）
-            if (done == 0 && (!straddled || batch - crashed > MAX_LEAD) && retries < EDGE_RETRIES) {
-                retries++
-                commitSwept(false)
-                continue
-            }
-            commitSwept(true)
-            if (done == 0) {
-                check(straddled) { "最初の 1 段ずつの区間が、境目をまたがない（$EDGE_RETRIES 回探し直しても。尽きた $crashed / $batch 回）" }
-                // 区間の初めの（batch − crashed）回は境目の手前で、1 段ずつ動かした境目から先は crashed 段だけ。区間の全部（batch）を進めると、
-                // 次の区間（探し直した境目の 8 段手前から）との間の段を飛ばすので、境目から先に動かした分（crashed）だけ進める
-                // （次の区間は、探し直した境目が本当の境目と同じなら、前の区間の終わりと 8 段重なる）
-                done += crashed
-            } else {
-                done += batch
-            }
-        }
-        return edge
-    }
+    private fun walkEdge(attempt: (pad: Int, swept: Boolean) -> Boolean, commitSwept: (keep: Boolean) -> Unit): StackEdgeWalk =
+        walkStackEdge(WIDTH, WARMUP, attempt, commitSwept)
 
     private fun sweep(op: Op) = timeout(Duration.ofSeconds(TIMEOUT_SECONDS)) {
         val rig = Rig()
@@ -410,17 +354,17 @@ class TmpFileSystemTreeStackExhaustionTest {
             return soe != null
         }
 
-        val edge = walkEdge(::attempt) { keep ->
+        val walk = walkEdge(::attempt) { keep ->
             if (keep) pendingSwept.forEach { swept.record(it) }
             pendingSwept.clear()
         }
         println(
-            "#902 tmpfs $op: 境目 $edge、$counter 回動かし、終わりまで動いた $completed 回、エラーで断られた $refused 回、尽きた位置: ${tally.describe()}、" +
+            "#902 tmpfs $op: $walk、$counter 回動かし、終わりまで動いた $completed 回、エラーで断られた $refused 回、尽きた位置: ${tally.describe()}、" +
                 "1 段ずつの掃引: ${swept.describe()}",
         )
         assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
         assertTrue(completed + refused > 0, "1 度も終わりまで動かなかった")
-        // 深い側（最初の 1 段ずつの区間が境目をまたいだこと）は、[walkEdge] の中の `check` が確かめる。幅が操作の深さを覆う（1 段ずつの掃引で、尽きる位置が、操作より浅いテストのコード（詰め物）まで届いた）
+        // 深い側（最初の 1 段ずつの区間が境目をまたいだこと）は、[walkStackEdge] の中の `check` が確かめる。幅が操作の深さを覆う（1 段ずつの掃引で、尽きる位置が、操作より浅いテストのコード（詰め物）まで届いた）
         assertTrue(
             swept.count(SoePositions.Position.OTHER) > 0,
             "1 段ずつの掃引で、操作より浅い所まで尽きる位置が届いていない（幅が足りない）: ${swept.describe()}",
@@ -531,20 +475,6 @@ class TmpFileSystemTreeStackExhaustionTest {
          * （1/4 の 150 段でも手元では確かめの外まで届いたが、`-Xint` では確かめの中だけで 110 回前後を使い、余りが 20 回ほどと小さい）
          */
         const val WIDTH = 600
-
-        /** 境目を探し直す間隔（回） */
-        const val REFIND_EVERY = 120
-
-        /** 最初の 1 段ずつの区間が境目をまたがなかったときに、探し直してやり直す回数の上限 */
-        const val EDGE_RETRIES = 3
-
-        /**
-         * 最初の 1 段ずつの区間で、尽きない回（境目の手前）の、やり直さずに済む上限。境目が合っていれば区間は境目の 8 段手前から始まるので 8 回前後だが、
-         * ふつうに出る幅は 2〜40 回で、混んだマシンや JDK 21 ではもっと大きい（境目は 1 段の精度では決まらず、JIT の段階で動く）。区間の長さ
-         * [REFIND_EVERY]（120）に対し、境目の直後を 20 段以上は掃いている 100 まで許す。これより多いと、探した境目が古い（低い）ので、探し直してやり直す
-         * （[EDGE_RETRIES] 回やり直しても超えるなら、境目をまたいでいる限りそのまま進む）
-         */
-        const val MAX_LEAD = 100
 
         val TIMEOUT_SECONDS: Long = System.getProperty("kibi.stackHeadroom.timeoutSeconds")?.toLongOrNull() ?: 120
 
