@@ -98,7 +98,8 @@ class ComponentProcessTest {
             }
             assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${rt.lastError}")
             assertEquals(ProcessState.EXITED, rt.process.state, "${rt.lastError}")
-            assertEquals(7, rt.process.exitCode)
+            // 終了コードは片付け（finishLocked）が状態の後に書くので、マシンのロックの中で読む（#1031）
+            assertEquals(7, lockedCheck(m) { rt.process.exitCode })
             assertEquals(50_000 + 2 * pids.get(), result.get())
             assertEquals(2, hostCalls.get())
             assertEquals(0, driver.configureCalls.get(), "コンポーネントのプロセスでは configure を呼ばない")
@@ -235,15 +236,16 @@ class ComponentProcessTest {
     /** 読み込みの途中で終わったプロセスが、作ったものをみな返したこと */
     private fun assertCleanedUp(m: Machine, rt: ProcessRuntime, before: Long) {
         assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${rt.lastError}")
-        assertEquals(before, m.memoryAccount.usedBytes, "マシンの RAM を返す")
-        assertEquals(0L, rt.memory.usedBytes, "プロセスの RAM を返す")
+        // 終わりの片付け（finishLocked）はマシンのロックの中で、状態を変えてから進むので、勘定もロックの中で読む（#1031）
         lockedCheck(m) {
+            assertEquals(before, m.memoryAccount.usedBytes, "マシンの RAM を返す")
+            assertEquals(0L, rt.memory.usedBytes, "プロセスの RAM を返す")
             assertTrue(rt.instances.isEmpty(), "作った core インスタンスを閉じる")
             assertNull(rt.component)
         }
     }
 
-    private fun lockedCheck(m: Machine, block: () -> Unit) = m.lock.withLockValue { block() }
+    private fun <T> lockedCheck(m: Machine, block: () -> T): T = m.lock.withLockValue { block() }
 
     /**
      * 作っている途中のプロセスが、core インスタンスの固定費（[pro.ikili.kibicomputers.core.kernel.process.CORE_INSTANCE_OVERHEAD_BYTES]。

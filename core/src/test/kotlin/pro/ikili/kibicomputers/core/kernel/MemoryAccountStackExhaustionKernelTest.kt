@@ -168,9 +168,22 @@ class MemoryAccountStackExhaustionKernelTest {
                         h.scheduler.tick()
                         rt.process.state.isTerminal || m.state == MachineState.CRASHED
                     }
+                    // 終わりの片付け（finishLocked。インスタンスを閉じて数えた分を返す）はマシンのロックの中で、状態を CRASHED にしてから
+                    // 進む（#1031）。ほかのスレッドからマシンのロックを取って（取れることも確かめる）、片付けが終わってから勘定を読む
+                    assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$r 回目、$op）: ${m.lock}")
+                    val processAfter: Long
+                    val machineAfter: Long
+                    val serverAfter: Long
+                    try {
+                        processAfter = rt.memory.usedBytes
+                        machineAfter = m.memoryAccount.usedBytes
+                        serverAfter = h.scheduler.memoryAccount.usedBytes
+                    } finally {
+                        m.lock.unlock()
+                    }
                     println(
                         "#856 $kind $op（$r 回目）: 深さ ${round.next}、通った ${round.completed.get()}、断られた ${round.refused.get()}、" +
-                            "マシン $machineBefore → ${m.memoryAccount.usedBytes}、サーバー $serverBefore → ${h.scheduler.memoryAccount.usedBytes}",
+                            "プロセス $processAfter、マシン $machineBefore → $machineAfter、サーバー $serverBefore → $serverAfter",
                     )
                     round.unexpected?.let { throw AssertionError("$op: スタックが尽きた以外の失敗", it) }
                     assertEquals(MachineState.RUNNING, m.state, "マシンが壊れた（$r 回目、$op）: ${rt.lastError}")
@@ -179,12 +192,10 @@ class MemoryAccountStackExhaustionKernelTest {
                     assertTrue(round.completed.get() > 0, "$op: 底の近くで確保が通った深さがない（試験の窓が底から遠い）")
                     assertTrue(round.refused.get() > 0, "$op: 確保がスタック不足で断られた深さがない（試験の窓が底まで届かない）")
                     // プロセスの終わりで数えた分をまとめて返したので、マシン・サーバー全体の勘定は元に戻る（ずれていない）
-                    assertEquals(0L, rt.memory.usedBytes, "$op: プロセスの勘定が残った")
-                    assertEquals(machineBefore, m.memoryAccount.usedBytes, "$op: マシンの勘定がずれた")
-                    assertEquals(serverBefore, h.scheduler.memoryAccount.usedBytes, "$op: サーバー全体の勘定がずれた")
-                    // ほかのスレッドから、マシンのロックが取れる。同じ台と別の台のプロセスが進み続ける
-                    assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$r 回目、$op）: ${m.lock}")
-                    m.lock.unlock()
+                    assertEquals(0L, processAfter, "$op: プロセスの勘定が残った")
+                    assertEquals(machineBefore, machineAfter, "$op: マシンの勘定がずれた")
+                    assertEquals(serverBefore, serverAfter, "$op: サーバー全体の勘定がずれた")
+                    // 同じ台と別の台のプロセスが進み続ける
                     val same = sameProgress.get()
                     val otherBefore = otherProgress.get()
                     h.tickUntilTrue("同じ台のプロセスが止まった（$r 回目、$op）") { sameProgress.get() > same + 2 }
