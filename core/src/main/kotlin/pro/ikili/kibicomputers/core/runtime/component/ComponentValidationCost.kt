@@ -19,7 +19,12 @@ import java.util.IdentityHashMap
  * 覚えない型のたどり（自由変数と名前の確かめ）の大きさの合計（#955。[Info.scan]）と、インスタンスの export ごとの resource のパスの写し（#964）。
  *
  * - 型の確認: コンポーネントのインスタンス化の引数（種類を問わない）と、型を付けた export（`(export "x" (func $f) (func (type $t)))`）。
- *   それぞれ、渡すもの（export するもの）の型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
+ *   インスタンス化の引数は、渡すものの型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
+ *   型を付けた export は、渡すもの（export するもの）と付けた型の両方の大きさを足す。コンポーネント型の部分型は import が反変で、
+ *   wasmparser の `component_type` は、渡す側の import が空でも受ける側（付けた型）の import を全部写して集めるので、確認の手間は
+ *   付けた型の大きさにも比例する（コンポーネント型がインスタンス型の export や `(type (eq ..))` の中にあっても同じなので、種類で
+ *   分けない。#963）。インスタンス化の引数の受ける側の import は、インスタンス化ごとの写し直し（受ける側のコンポーネントの import の
+ *   型を宣言ごとに数える）が覆うので、確認には足さない（足すと wac で合成した形の見積もりがほぼ倍になる）。
  *   wasmparser は型の確認を覚えない（同じ型の対でも、引数ごと・インスタンス化ごとに確かめ直す）ので、回数で掛ける
  * - 型の大きさ: wasmparser の `TypeInfo`（展開した大きさ）にならって、参照している型の大きさを足して数える。
  *   確かめる型の大きさには、100 万で止めない展開した大きさ（[Info.remapBound]）を使う。`MAX_WASM_TYPE_SIZE` = 100 万を超える型は
@@ -92,9 +97,10 @@ import java.util.IdentityHashMap
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
  * ただし canon は、型を共有して膨らむ型をたどる（lift・lower・`task.return`・stream・future の read・write）ので、上の 3 つ目として数える。
- * 型を付けた export（`(export "x" (component $c) (component (type $ct)))`）の確認も、渡す側の大きさしか数えない
- * （コンポーネントの部分型は import が反変で、確認の手間は受ける側の import の数に比例する）ので、見積もりが
- * 小さいまま検証が時間の上限に届く（受ける側の import 4,000 個 × 型を付けた export 5,000 個。#935 のレビュー。#963 で扱う）。
+ * 型の確認（型を付けた export とインスタンス化の引数）も、コンポーネント型を入れ子にした形では、wasmparser が段ごとに下の
+ * 部分木を写し直してたどり直す（`component_type`・`open_instance_type`）ので、手間が「段数 × 葉の大きさ」になる。
+ * 付けた型の大きさは 1 回しか数えないので、見積もりが上限未満のまま検証が時間の上限に届く（export 2,000 個の型を 16 段
+ * 包んで 240 回 export する形・約 33 KB。#963 のレビュー。#1023 で扱う）。
  * 見積もりにない形は、見張りが時間の上限で止める。
  *
  * 見積もりそのものの手間も抑える。写し直しの大きさをたどる手数（積んだ参照の数）を数え、見積もりの上限の [WORK_FACTOR] 倍を
@@ -426,7 +432,7 @@ internal object ComponentValidationCost {
          * 型を付けたコンポーネントの export の確認での、[target] のたどれるインスタンス型の explicit な resource の表の写しを数える（#964 のレビュー）。
          * wasmparser のコンポーネントの部分型の確認（`SubtypeCx::component_type`）は、確かめるたびに import・export の
          * インスタンス型を `remap_component_instance_type_id` で写し直す（表を丸ごと写す）。写し直しの大きさ（[Info.local]）は
-         * 型の確認の大きさ（[check]）に入っているので、表の件数だけを足す。引けなければ、それまでの最大
+         * 型を付けた export の確認の大きさ（[checkAscribed]。渡す側と付けた型の両方）に入っているので、表の件数だけを足す。引けなければ、それまでの最大
          */
         private fun remapExplicit(target: Info?) {
             val n = if (target == null) {
@@ -451,6 +457,17 @@ internal object ComponentValidationCost {
             // 確かめる手間は、型を展開した大きさ。enum・flags の名前は wasmparser の型の大きさに入らない（確かめるときは
             // 1 つずつ比べる）ので、100 万で止めた [Info.size] ではなく、止めていない [Info.remapBound] で数える（#935 のレビュー）
             cost = add(cost, info?.remapBound ?: maxFull)
+        }
+
+        /**
+         * 型を付けた export の型の確認を 1 回数える。確かめる手間は、渡すもの [found] の型と、付けた型 [ascribed] の両方の大きさ
+         * （引けなければ、それまでの最大）。コンポーネント型の部分型は import が反変で、wasmparser の `component_type` は
+         * 渡す側の import が空でも、受ける側（付けた型）の import を全部写して集めてから比べるので、付けた型の大きさに比例する
+         * （コンポーネント型がインスタンス型の export や `(type (eq ..))` の中にあっても同じ経路になるので、種類で分けずに足す。#963）
+         */
+        private fun checkAscribed(found: Info?, ascribed: Info?) {
+            checks++
+            cost = add(cost, add(found?.remapBound ?: maxFull, ascribed?.remapBound ?: maxFull))
         }
 
         /** それまでに見た型の大きさの最大 */
@@ -653,13 +670,13 @@ internal object ComponentValidationCost {
                         // 型を付けた export は、付けた型の部分型かを確かめ、付けた型をその export の型にする（wasmparser と同じ）。
                         // 実物は同じ宣言を共有していても、付けた型は `(type (eq ..))` ごとに別の型になることがあるので、実物では数えない
                         val desc = item.desc
-                        if (desc != null) check(found)
                         // 関数のほかは、export するときに型を写して新しく作る
                         val info = when {
                             desc != null -> descInfo(s, desc)
                             item.target.sort == Sort.FUNC -> found
                             else -> copied(found)
                         }
+                        if (desc != null) checkAscribed(found, info)
                         // コンポーネントの部分型の確認は、確かめるたびにコンポーネント型のインスタンスの import・export を写し直す
                         // （`SubtypeCx::component_type` → `open_instance_type`）ので、explicit な resource の表の写しを数える
                         // （#964 のレビュー。渡す側と付けた型の両方。大きい側）
