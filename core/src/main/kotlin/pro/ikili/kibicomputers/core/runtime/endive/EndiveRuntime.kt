@@ -625,7 +625,11 @@ public class EndiveRuntime internal constructor(
          * 式の先頭の `ref.func` の範囲（flag 1・3 の番号の並びを含む）は、Endive の検証（`Validator` のコンストラクターの `declaredFunctions`）が
          * もう断るので、ここに届くのは先頭でない `ref.func` だけ。
          * 型が合うかは [valTypeMatches]（Endive の `ValType.matches` の、`none` を eq・struct・array・i31 の部分型として扱わない穴をふさいだもの）で決める。
-         * 判定は読み込みのときに 1 回だけで、式の長さの和に比例する（関数の型とグローバルの一覧は 1 回だけ作る）。
+         * 判定は読み込みのときに 1 回だけ（関数の型とグローバルの一覧は 1 回だけ作る）。コストは「命令が取る値の数（式の長さの和に比例）×
+         * 型の照合 1 回のコスト」で、式の長さだけには比例しない: 型の番号の違う型どうしの照合（Endive の `ValType.matches` →
+         * `heapTypeSubtype`）は、上位の型を 1 段ずつたどり、各段で rec グループの全部の型を構造で比べ（`TypeSection.canonicallyEquivalent`）、
+         * グループの外の型への参照は結果を覚えずに比べ直すので、型セクションの形しだいで大きくなる。同じ照合は Endive 自身の検証
+         * （関数の本体と、定数式の結果の型）も 1 命令・1 式ごとに呼ぶので、ここで新しい最悪の場合を足すわけではない（回数が定数式の取る値の分だけ増える）。
          * Endive が直ったら、この判定を外す
          */
         internal fun invalidConstExpr(module: EndiveModule): String? {
