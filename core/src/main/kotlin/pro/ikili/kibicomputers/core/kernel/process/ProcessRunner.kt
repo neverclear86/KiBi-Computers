@@ -500,6 +500,8 @@ internal class ProcessRunner(private val machine: Machine) {
                 if (!rt.process.state.isTerminal) machine.cpu.enqueueThreadless(rt)
             }
             machine.clearPendingScheduleLocked(rt)
+            // 燃料待ちを起こすのがこのスレッドで止まっていたら、続きを起こす（#956）。止められたときも終えた後に呼ぶ（終わった待ち手は列から外して飛ばす）
+            machine.fuelWaiterThreadDetachedLocked(rt)
             if (rt.process.kind == ProcessKind.BLOCKING) {
                 scheduler.dedicatedThreads.remove(Thread.currentThread())
             }
@@ -521,14 +523,19 @@ internal class ProcessRunner(private val machine: Machine) {
      * [afterSlice] は、その tick の最後のスライスを使い切った直後に取り直すところ（燃料切れの処理）。最初の1回で取れなければ、燃料待ちの列の後ろに置く
      * （[Machine.addFuelWaiterLocked]。#742、ADR 0047）。燃料待ちから起こされた後に取れなかったときは、スライスを使っていないので前側に入れる
      * （後ろのままだと、起こされても取れなかった側が毎回後ろに回る）
+     *
+     * [yielded] は、スライスを使い切って譲った直後に取り直すところ（スレッドを持つ待ち手）。最初の1回で、燃料待ちを起こすのが
+     * 待ち手で止まっていたら（[Machine.isFuelWakeBlockedLocked]。#956）、燃料が残っていても取らずに燃料待ちの列の後ろに並ぶ
      */
     private fun acquireCpu(
         rt: ProcessRuntime,
         precheck: (() -> Boolean)?,
         afterSlice: Boolean = false,
+        yielded: Boolean = false,
         onNoFuelLocked: (() -> Unit)? = null,
     ): Long? {
         var behindCpu = afterSlice
+        var deferToBlocked = yielded
         while (true) {
             if (!rt.holdsCpu) {
                 try {
@@ -548,6 +555,13 @@ internal class ProcessRunner(private val machine: Machine) {
                 machine.fuelAccount.refill(observed)
                 when {
                     precheck != null && !precheck() -> Outcome.REARM
+                    deferToBlocked && machine.isFuelWakeBlockedLocked() -> {
+                        // 譲った直後で、燃料待ちを起こすのが待ち手で止まっている（#956）: 止まった待ち手とその後ろは、スレッドが外れるまで
+                        // CPU の待ち行列にいない。ここで燃料を取ると、譲ったのに CPU を取り直して続けて動き、止まっている間のスライスを
+                        // ひとり占めする（燃料が残っていても、列の後ろに並んで順番を待つ）。燃料がないのではないので、onNoFuelLocked は呼ばない
+                        enqueueFuelWaitLocked(rt, threadless = false, behindCpu = true)
+                        Outcome.NO_FUEL
+                    }
                     tryGrantLocked(rt, observed, threadless = false, behindCpu)?.also { grant = it } == null -> {
                         onNoFuelLocked?.invoke()
                         Outcome.NO_FUEL
@@ -561,6 +575,7 @@ internal class ProcessRunner(private val machine: Machine) {
             try {
                 waitForFuel(rt)
                 behindCpu = false
+                deferToBlocked = false
                 hooks.afterFuelWait?.invoke(machine, rt.pid)
             } catch (e: Throwable) {
                 // 起こされた（CPU の位置を予約された）後に止められたら、CPU に着かないので予約を外す（#742）
@@ -657,8 +672,10 @@ internal class ProcessRunner(private val machine: Machine) {
         // 手持ちを渡した後に tick が進んでいたら、その場で足さない（許可を回す）
         if (account.lastRefillTick != observed) return null
         if (account.afterGiveBack(observed, remaining) <= 0) return null
-        // 起こされてスレッドが外れるのを待っている者（巻き戻した直後に自分で起こした待機点型など）も、CPU を待つ者に数える。
-        // 数えないと、そのスレッドが外れる前にスライスを使い切った側が譲らずに足し、巻き戻しが 1 回減って配分がぶれる（#47）
+        // イベントで起こされ、スレッドが外れるのを待っている者（pendingSchedule。ProcessWaiter の道）も、CPU を待つ者に数える。
+        // 数えないと、そのスレッドが外れる前にスライスを使い切った側が譲らずに足し、巻き戻しが 1 回減って配分がぶれる（#47）。
+        // 燃料待ちの列の待ち手は、スレッドが外れるまで列に残る（#956）ので hasFuelWaitersLocked が数える。巻き戻した直後に自分の giveBack で
+        // 起こそうとした待機点型も、スレッドが付いている間は列で止まるので、数えるのは列の側
         if (machine.cpu.waiting > 0 || machine.hasFuelWaitersLocked() || machine.hasPendingSchedulesLocked()) return null
         account.giveBack(observed, remaining)
         val grant = account.take(observed, machine.config.fuelSlice)
@@ -764,7 +781,7 @@ internal class ProcessRunner(private val machine: Machine) {
         releasePermitAndCpu(rt)
         // その tick の最後のスライスを使い切った（譲るのではない）なら、取れなければ燃料待ちの列の後ろに並ぶ（#742）。
         // 譲ったときは CPU の待ち行列の後ろに回るので、そこで燃料がないと分かったら、CPU の待ち行列にいたほかの待ち手と同じく前側に入る
-        val grant = acquireCpu(rt, precheck = null, afterSlice = waitingFuel) {
+        val grant = acquireCpu(rt, precheck = null, afterSlice = waitingFuel, yielded = !waitingFuel) {
             // 譲った後、CPU を取り直したら燃料が残っていなかった: ここから次の tick（か再開）を待つ
             if (!waitingFuel) {
                 waitingFuel = true

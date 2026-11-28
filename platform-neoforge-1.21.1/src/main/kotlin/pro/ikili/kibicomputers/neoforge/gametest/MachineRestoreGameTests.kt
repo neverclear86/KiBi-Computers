@@ -26,6 +26,7 @@ import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
+import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
@@ -34,6 +35,8 @@ import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.io.DataInputStream
+import java.nio.file.Files
 import java.util.UUID
 
 /**
@@ -112,31 +115,61 @@ object MachineRestoreGameTests {
         helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
     }
 
-    /** 止めて書き、ケースの NBT を返す（アンロードの手順と同じ） */
-    private fun saveAndTag(helper: GameTestHelper, be: CaseBlockEntity): CompoundTag {
-        be.computer.prepareUnload()
-        try {
-            helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
-        } finally {
-            be.computer.endQuiesce()
+    /**
+     * READY を待って書いた結果（#979）。[saveWhenReady] を `thenWaitUntil` の中で呼んで埋め、続く `thenExecute` の [take] で取り出す
+     * （書いた後の確かめをやり直しの外に置き、本物の失敗をタイムアウトまで繰り返さない。PR #977 と同じ形）
+     */
+    private class ReadySave {
+        var tag: CompoundTag? = null
+        var failure: Throwable? = null
+
+        /** READY の後の書き込みの回数（書くまでは null）。0 回以下は [take] が GameTest の失敗として落とす */
+        var writes: Int? = null
+        var identity: MachineIdentity? = null
+
+        /**
+         * 書けたケースの NBT を返す。READY の後の書き込みが失敗していれば落とす。READY で取り出したので、写しの中で殺したプロセスはない
+         * （起こし直した sh が答えて復元を確かめたことにならない）ことを、世代のファイルの `killedPids` で確かめる
+         */
+        fun take(helper: GameTestHelper): CompoundTag {
+            failure?.let { throw IllegalStateException("saving the machine at a wait point should not fail", it) }
+            // 0 回は GameTestAssertException（assertTrue）で落とす。ほかの例外を投げるとサーバーごと落ちる
+            helper.assertTrue(writes != null && writes!! > 0, "the case should be saved but wrote $writes")
+            helper.assertTrue(tag != null && identity != null, "the case should be saved")
+            val id = identity!!
+            val file = WorldMachineSaves.current!!.generationFile(id.id, id.generation)
+            val snapshot = DataInputStream(Files.newInputStream(file).buffered()).use { MachineSnapshot.readFrom(it) }
+            helper.assertTrue(snapshot.killedPids.isEmpty(), "no process should be killed in the copy: ${snapshot.killedPids}")
+            return tag!!
         }
-        return be.saveWithFullMetadata(helper.level.registryAccess())
     }
 
     /**
-     * 止めてから保存の判定を見て、READY なら止めたまま書いてケースの NBT を返す。READY でなければ放して `null`
-     * （止めたままだと燃料待ちが起こされず、READY に近づかないことがある）。止めた後は新しい step が始まらないので、
-     * 確かめた判定のまま写しが取られる
+     * `thenWaitUntil` の中で呼ぶ: 止めてから保存の判定を見て、READY なら止めたまま書き、ケースの NBT を [save] に入れる。
+     * READY でなければ放して落とし、次の tick にやり直させる（止めたままだと燃料待ちが起こされず、READY に近づかないことがある）。
+     * 止めた後は新しい step が始まらないので、確かめた判定のまま写しが取られる。READY の後の書き込みの失敗（0 回か例外）は
+     * [save] に覚えて落とさない（やり直すと世代が tick ごとに増える）。[ReadySave.take] が落とす。
+     * 書く tick のうちに続く `thenExecute` も走る（成功した event は同じ tick に続けて走る）ので、置き直しを `onLoad` の前に行える
      */
-    private fun saveAndTagIfReady(helper: GameTestHelper, be: CaseBlockEntity): CompoundTag? {
+    private fun saveWhenReady(helper: GameTestHelper, be: CaseBlockEntity, save: ReadySave) {
+        if (save.tag != null || save.failure != null || save.writes != null) return
         be.computer.prepareUnload()
         try {
-            if (be.computer.saveReadiness() != SaveReadiness.READY) return null
-            helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+            val readiness = be.computer.saveReadiness()
+            helper.assertTrue(readiness == SaveReadiness.READY, "the machine should be at a wait point but was $readiness")
+            try {
+                val writes = saveNow(be, CapturePolicy.KILL_TRANSIENT)
+                save.writes = writes
+                if (writes <= 0) return
+            } catch (e: Exception) {
+                save.failure = e
+                return
+            }
         } finally {
             be.computer.endQuiesce()
         }
-        return be.saveWithFullMetadata(helper.level.registryAccess())
+        save.identity = be.identity
+        save.tag = be.saveWithFullMetadata(helper.level.registryAccess())
     }
 
     /** ケースを外し（`setRemoved`。ディレクトリは残る）、置き直して [tag] を読ませる（次の tick の `onLoad` で復元の順番待ちに入る） */
@@ -157,8 +190,11 @@ object MachineRestoreGameTests {
     fun restoresARunningComputerOnLoad(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
-        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
-            val tag = saveAndTag(helper, first)
+        val save = ReadySave()
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
+        }.thenExecute {
+            val tag = save.take(helper)
             helper.assertTrue(tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "a running case should save PoweredOn: $tag")
             copy = reload(helper, tag)
             helper.assertTrue(copy!!.computer.poweredOn, "the reloaded case should be powered on")
@@ -204,8 +240,11 @@ object MachineRestoreGameTests {
     fun restoresAPromotedChunkCaseAfterOnLoad(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
-        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
-            val tag = saveAndTag(helper, first)
+        val save = ReadySave()
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
+        }.thenExecute {
+            val tag = save.take(helper)
             helper.assertTrue(tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "a running case should save PoweredOn: $tag")
             val be = reload(helper, tag)
             copy = be
@@ -252,8 +291,11 @@ object MachineRestoreGameTests {
         var wait: WallClockWait? = null
         // 壁時計の上限で落ちたときの診断（thenWaitUntil の中の失敗は tick の上限まで握りつぶされるので、次の thenExecute で落とす）
         var expired: String? = null
-        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
-            val tag = saveAndTag(helper, first)
+        val save = ReadySave()
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
+        }.thenExecute {
+            val tag = save.take(helper)
             val id = first.identity!!.id
             val be = reload(helper, tag)
             copy = be
@@ -308,6 +350,7 @@ object MachineRestoreGameTests {
         val store = WorldMachineSaves.current!!
         val merged = UUID.randomUUID()
         var copy: CaseBlockEntity? = null
+        val save = ReadySave()
         helper.startSequence().thenWaitUntil {
             helper.assertTrue(be.isLoadedOnServer, "onLoad should run")
         }.thenExecute {
@@ -336,8 +379,10 @@ object MachineRestoreGameTests {
             helper.assertTrue(be.computer.machine === machine, "the machine should keep running")
         }.thenWaitUntil { assertPrompt(helper, be) }.thenExecute {
             typeLine(helper, keyboardAt(helper), WRITE_MARKER)
-        }.thenWaitUntil { assertScreenShows(helper, be, MARKED) }.thenExecute {
-            val tag = saveAndTag(helper, be)
+        }.thenWaitUntil { assertScreenShows(helper, be, MARKED) }.thenWaitUntil {
+            saveWhenReady(helper, be, save)
+        }.thenExecute {
+            val tag = save.take(helper)
             helper.assertTrue(
                 be.identity?.id == merged && be.identity!!.generation > 0,
                 "the state should be written under $merged: ${be.identity}",
@@ -384,6 +429,7 @@ object MachineRestoreGameTests {
         var wait: WallClockWait? = null
         // 壁時計の上限で落ちたときの診断（thenWaitUntil の中の失敗は tick の上限まで握りつぶされるので、次の thenExecute で落とす）
         var expired: String? = null
+        val save = ReadySave()
 
         fun assertRawTag(be: CaseBlockEntity, what: String) {
             val id = saved!!
@@ -399,8 +445,11 @@ object MachineRestoreGameTests {
 
         helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
             typeLine(helper, far.keyboard, WRITE_MARKER)
-        }.thenWaitUntil { assertScreenShows(helper, first, MARKED) }.thenExecute {
-            val tag = saveAndTag(helper, first)
+        }.thenWaitUntil { assertScreenShows(helper, first, MARKED) }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
+        }.thenExecute {
+            // ゲートは書き込みを終えた（saveNow の drainSaves）後に置く。先に置くと drainSaves がメインスレッドで止まる
+            val tag = save.take(helper)
             saved = first.identity
             // 置き直して、覚えていない ID（再起動の後と同じ）の NBT を onLoad の前に読ませる。読みは書き込みのスレッドに回り、門の後ろで待つ
             level.setBlock(far.pos, Blocks.AIR.defaultBlockState(), 3)
@@ -492,6 +541,7 @@ object MachineRestoreGameTests {
     fun restoredShellRedrawsThePrompt(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
+        val save = ReadySave()
         helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
             // 確定しない入力（Enter を押さない）
             for (packet in KeyboardEventCodec.encode(listOf(KeyboardEvent.Text("echo pending")))) {
@@ -500,8 +550,10 @@ object MachineRestoreGameTests {
         }.thenWaitUntil {
             val text = lines(first.wiring.connectedScreen!!.text)
             helper.assertTrue(text.any { it == "$ echo pending" }, "the typed text should be shown: $text")
+        }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
         }.thenExecute {
-            val tag = saveAndTag(helper, first)
+            val tag = save.take(helper)
             helper.setBlock(SCREEN, Blocks.AIR)
             helper.setBlock(
                 SCREEN,
@@ -547,6 +599,7 @@ object MachineRestoreGameTests {
     fun restoresALuaProgramWaitingInParallel(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
+        val save = ReadySave()
         val script = "os.queueEvent('o'); os.pullEvent('o'); local r, m = false, 0; parallel.waitForAll(" +
             "function() local e = os.pullEvent('restored'); r = true; print('lr,' .. e) end, " +
             "function() while not r do os.sleep(0.05) end; for i = 1, 3 do os.sleep(0.05); m = m + 1 end; " +
@@ -560,9 +613,9 @@ object MachineRestoreGameTests {
         }.thenWaitUntil {
             // step の途中で書くと、写しの中で Lua が殺されてシェルだけが戻る。数えるコルーチンのタイマーは tick と無関係に鳴るので、
             // 止めてから READY を確かめ、止めたまま書く（READY でなければ放して次の tick にやり直す）
-            val tag = saveAndTagIfReady(helper, first)
-            helper.assertTrue(tag != null, "lua should be at a wait point: ${first.computer.saveReadiness()}")
-            copy = reload(helper, tag!!)
+            saveWhenReady(helper, first, save)
+        }.thenExecute {
+            copy = reload(helper, save.take(helper))
         }.thenWaitUntil {
             assertRestored(helper, copy!!)
         }.thenExecute {
@@ -598,6 +651,7 @@ object MachineRestoreGameTests {
     fun restoredShellRedrawsAfterEscape(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
+        val save = ReadySave()
         fun send(event: KeyboardEvent) {
             for (packet in KeyboardEventCodec.encode(listOf(event))) {
                 helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the input")
@@ -616,8 +670,10 @@ object MachineRestoreGameTests {
             // （TTY の入力が空であることを見る）
         }.thenIdle(20).thenWaitUntil {
             helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the next key after Esc")
+        }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
         }.thenExecute {
-            val tag = saveAndTag(helper, first)
+            val tag = save.take(helper)
             helper.setBlock(SCREEN, Blocks.AIR)
             helper.setBlock(
                 SCREEN,
@@ -672,8 +728,11 @@ object MachineRestoreGameTests {
     fun turningOffWhileRestoringDoesNotWireTheOldMachine(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
-        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
-            copy = reload(helper, saveAndTag(helper, first))
+        val save = ReadySave()
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
+        }.thenExecute {
+            copy = reload(helper, save.take(helper))
         }.thenWaitUntil {
             helper.assertTrue(copy!!.computer.machine != null, "the restore should start")
         }.thenExecute {
@@ -1057,8 +1116,11 @@ object MachineRestoreGameTests {
         val first = placeComputer(helper)
         var before = RestoreStats.now()
         var copy: CaseBlockEntity? = null
-        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
-            val tag = saveAndTag(helper, first)
+        val save = ReadySave()
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenWaitUntil {
+            saveWhenReady(helper, first, save)
+        }.thenExecute {
+            val tag = save.take(helper)
             before = RestoreStats.now()
             copy = reload(helper, tag)
         }.thenWaitUntil {
