@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
@@ -22,7 +23,11 @@ class AsyncifyIndirectTest {
      * 止まりうる関数 `$f`（`() -> i32`）と、同じ型の止まらない `$g` を持つモジュール。`run` は `call_indirect (type $v_i)` で表の 0 番を呼ぶ。
      * [refs] は `$f` の参照を取る（かもしれない）ものの宣言
      */
-    private fun module(refs: String, table: String = "(elem (i32.const 0) \$g)") = WitTool.wat(
+    private fun module(
+        refs: String,
+        table: String = "(elem (i32.const 0) \$g)",
+        call: String = "(call_indirect (type \$v_i) (i32.const 0))",
+    ) = WitTool.wat(
         """
         (module
           (type ${'$'}v_i (func (result i32)))
@@ -33,9 +38,46 @@ class AsyncifyIndirectTest {
           (func ${'$'}f (type ${'$'}v_i) (call ${'$'}wait))
           (func ${'$'}g (type ${'$'}v_i) (i32.const 7))
           (func (export "run") (result i32)
-            (call_indirect (type ${'$'}v_i) (i32.const 0))))
+            $call))
         """.trimIndent(),
     )
+
+    /**
+     * 止まりうる関数 `$f` の参照を取らず、同じ型の止まらない `$g` の参照だけを取って、[call]（`call_ref`・`return_call_ref`）で呼ぶモジュール。
+     * [refsOfF] が `$f` の参照を取る宣言（空なら取らない）
+     */
+    private fun refModule(call: String, refsOfF: String = "") = WitTool.wat(
+        """
+        (module
+          (type ${'$'}v_i (func (result i32)))
+          (import "w" "wait" (func ${'$'}wait (result i32)))
+          (elem declare func ${'$'}g)
+          $refsOfF
+          (func ${'$'}f (type ${'$'}v_i) (call ${'$'}wait))
+          (func ${'$'}g (type ${'$'}v_i) (i32.const 7))
+          (func (export "run") (result i32)
+            $call))
+        """.trimIndent(),
+    )
+
+    /** 要素セクションの最初の要素セグメントの flag（要素セグメントが 1 つだけのモジュールで、その形を確かめる） */
+    private fun firstElemFlag(wasm: ByteArray): Int {
+        var pos = 8
+        while (pos < wasm.size) {
+            val id = wasm[pos++].toInt()
+            var size = 0
+            var shift = 0
+            do {
+                val b = wasm[pos++].toInt() and 0xFF
+                size = size or ((b and 0x7F) shl shift)
+                shift += 7
+            } while (b and 0x80 != 0)
+            // 要素の数（1 バイトの LEB）の次が、最初のセグメントの flag
+            if (id == 9) return wasm[pos + 1].toInt()
+            pos += size
+        }
+        throw AssertionError("要素セクションがない")
+    }
 
     @Test
     fun `型が同じでも、参照の取られない止まりうる関数があるだけでは、call_indirectは止まりうるとみなさない`() {
@@ -68,9 +110,59 @@ class AsyncifyIndirectTest {
             assertTrue("run" in exports(wasm), name)
             assertEquals(2, Asyncify.transform(wasm, setOf("w.wait")).instrumented, name)
         }
+        // テーブルの番号を明示する能動の形（flag 2・6）と、式の宣言の形（flag 7）。`rewriteElements` を集める用途で使う経路
+        val moreForms = linkedMapOf(
+            2 to "(table \$t1 1 funcref) (elem (table \$t1) (i32.const 0) func \$f)",
+            6 to "(table \$t1 1 funcref) (elem (table \$t1) (i32.const 0) funcref (ref.func \$f))",
+            7 to "(elem declare funcref (ref.func \$f))",
+        )
+        for ((flag, refs) in moreForms) {
+            // 要素セグメントがこの 1 つだけになるよう、$g を表に入れる要素は付けない（flag を確かめるため）
+            val wasm = module(refs, table = "")
+            assertEquals(flag, firstElemFlag(wasm), "要素セグメントの形が違う")
+            assertTrue("run" in exports(wasm), "flag $flag")
+            assertEquals(2, Asyncify.transform(wasm, setOf("w.wait")).instrumented, "flag $flag")
+        }
         // 止まりうる import そのものを表に入れたときも
         val direct = module("", table = "(elem (i32.const 0) \$wait)")
         assertEquals(setOf("run"), exports(direct))
+    }
+
+    /**
+     * `call_ref`・`return_call_indirect`・`return_call_ref` も、参照が取られない止まりうる関数だけが同じ型なら、止まりうるとみなさない。
+     * 前の解析（型だけ）では、止まりうる `call_ref`（#923）と止まりうる関数への末尾呼び出しとして読み込みを断っていた形
+     */
+    @Test
+    fun `参照の取られない止まりうる関数だけが同じ型なら、call_refと末尾の間接呼び出しは断らず変換できる`() {
+        val calls = linkedMapOf(
+            "call_ref" to refModule("(call_ref \$v_i (ref.func \$g))"),
+            "return_call_ref" to refModule("(return_call_ref \$v_i (ref.func \$g))"),
+            "return_call_indirect" to module("", call = "(return_call_indirect (type \$v_i) (i32.const 0))"),
+        )
+        for ((name, wasm) in calls) {
+            assertEquals(emptySet<String>(), exports(wasm), name)
+            // 変換するのは $f だけ
+            val result = Asyncify.transform(wasm, setOf("w.wait"))
+            assertEquals(1, result.instrumented, name)
+            assertNull(WitTool.validate(result.bytes), name)
+            // 前の解析（型だけ）は、$f を呼びうるとみなして断る
+            assertThrows<AsyncifyUnsupported>(name) { Asyncify.transform(wasm, setOf("w.wait"), typeOnlyIndirect = true) }
+            // 変換したものを動かすと、$g を呼ぶ
+            assertEquals(7L, run(result.bytes), name)
+        }
+    }
+
+    /** 止まりうる関数の参照が取られていれば、同じ形を今までどおり断る（絞り込みが断る側を緩めすぎない） */
+    @Test
+    fun `参照の取られる止まりうる関数があれば、call_refと末尾の間接呼び出しは断る`() {
+        val calls = linkedMapOf(
+            "call_ref" to refModule("(call_ref \$v_i (ref.func \$g))", "(elem declare func \$f)"),
+            "return_call_ref" to refModule("(return_call_ref \$v_i (ref.func \$g))", "(elem declare func \$f)"),
+            "return_call_indirect" to module("(elem func \$f)", call = "(return_call_indirect (type \$v_i) (i32.const 0))"),
+        )
+        for ((name, wasm) in calls) {
+            assertThrows<AsyncifyUnsupported>(name) { Asyncify.transform(wasm, setOf("w.wait")) }
+        }
     }
 
     /** 初期値の式を持つテーブル（関数参照の提案）は、式の `ref.func` を追わず、型だけで絞る前の判定に戻る */
