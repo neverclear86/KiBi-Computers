@@ -93,6 +93,7 @@ import pro.ikili.kibicomputers.core.kernel.process.MemoryBase
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
 import pro.ikili.kibicomputers.core.persist.FullSaveRule
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.KernelStateCopy
@@ -116,6 +117,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
@@ -471,6 +473,70 @@ public class Machine private constructor(
 
     internal fun countFuelUnwind() {
         fuelUnwindsDone.incrementAndGet()
+    }
+
+    /**
+     * インタプリタで動くコードを持つプログラム（[Program.interpreterUse]）でプロセスを作った回数（#931。exec と復元。実行時だけで、保存しない）。
+     * 書くのはカーネルロックの中（[noteProcessProgramLocked]）、読むのはどのスレッドからでもよい
+     */
+    private val interpretedProcesses = AtomicLong()
+
+    /** [interpretedProcesses] の理由ごと（[InterpreterReason] の順。コンポーネントで理由が複数あれば、それぞれに数える）。書くのはカーネルロックの中 */
+    private val interpretedProcessesByReason = AtomicLongArray(InterpreterReason.entries.size)
+
+    /** [interpretedProcesses] の理由の和（[InterpreterReason.bit]）。書くのはカーネルロックの中 */
+    @Volatile
+    private var interpretedReasonBits = 0
+
+    /** インタプリタで動くコードを持つプログラムのうち、最後にプロセスにしたものの名前（[Program.label]）。書くのはカーネルロックの中 */
+    @Volatile
+    private var lastInterpretedLabel: String? = null
+
+    /**
+     * この台が、インタプリタで動くコードを持つプログラムでプロセスを作った回数の累計（#931。exec したものと、保存から戻したもの）。
+     * 運用者の口（接続層のコマンド）が、どの台がインタプリタのプログラムを動かしているかを引くために読む。実行時だけで、保存しない
+     * （サーバーを立て直す・チャンクを読み直すと 0 から）
+     */
+    public val interpretedProcessCount: Long get() = interpretedProcesses.get()
+
+    /**
+     * [interpretedProcessCount] のうち、[reason] でインタプリタに回したコードを持つプログラムの分（#931）。運用者の口が、理由で絞って台を並べるために読む
+     * （既定の経路の SIMD_FUNCTIONS の台が多くても、TOO_LARGE_FUNCTIONS の台を引ける）。コンポーネントで理由が複数あれば、それぞれに数えるので、
+     * 理由ごとの和は [interpretedProcessCount] より大きくなりうる
+     */
+    public fun interpretedProcessCount(reason: InterpreterReason): Long = interpretedProcessesByReason.get(reason.ordinal)
+
+    /** [interpretedProcessCount] に数えたプログラムの、インタプリタに回した理由の和（#931） */
+    public val interpretedReasons: Set<InterpreterReason> get() = InterpreterReason.setOf(interpretedReasonBits)
+
+    /** [interpretedProcessCount] に数えたプログラムのうち、最後のものの名前（#931。[Program.label]。数えていなければ `null`） */
+    public val lastInterpretedProgram: String? get() = lastInterpretedLabel
+
+    /**
+     * [program] でプロセスを作った（引き返せない点の後。#931）。インタプリタで動くコードを持つなら、この台とサーバー全体の数え口に足す。
+     * この [Machine] で初めての理由があれば、DEBUG に1行出す（この [Machine] のオブジェクトにつき、1理由1回。ADR 0088 の「追記（#931）」。
+     * 同じ理由の2回目からは出さない）。間引く状態はオブジェクトごとで、電源の入れ直し・チャンクの読み直し・サーバーの立て直しで台を作り直すと
+     * また出る（行の数の上限は、台を起動・復元した回数 × 理由の数）。
+     * 足すのは O(1)（理由と数は読み込みのときに決めてある）。カーネルロックの中で呼ぶ
+     */
+    internal fun noteProcessProgramLocked(program: Program, pid: Int, restored: Boolean) {
+        val use = program.interpreterUse ?: return
+        interpretedProcesses.incrementAndGet()
+        for (r in InterpreterReason.entries) if (use.reasonBits and r.bit != 0) interpretedProcessesByReason.incrementAndGet(r.ordinal)
+        lastInterpretedLabel = program.label
+        scheduler.countInterpretedProcess(use)
+        val fresh = use.reasonBits and interpretedReasonBits.inv()
+        if (fresh == 0) return
+        interpretedReasonBits = interpretedReasonBits or use.reasonBits
+        if (LOG.isLoggable(System.Logger.Level.DEBUG)) {
+            LOG.log(
+                System.Logger.Level.DEBUG,
+                "マシン $id で、インタプリタで動くコードを持つ WASM（SHA-256 ${program.label}…）のプロセス pid $pid を" +
+                    (if (restored) "保存から戻した" else "作った（exec）") +
+                    "（理由 ${InterpreterReason.setOf(use.reasonBits).joinToString(", ")}、全体をインタプリタで動かす core モジュール ${use.wholeModules} 個、" +
+                    "インタプリタで動かす関数 ${use.functions} 個）。この台で同じ理由の2回目からは出さない",
+            )
+        }
     }
 
     /** 線形メモリの使用量（RAM。#39）。親はサーバー全体の勘定（#362） */
@@ -1316,6 +1382,8 @@ public class Machine private constructor(
             return@withLockValue false
         }
         restoringValue = false
+        // 戻したプロセスも、exec したものと同じく数える（#931。サーバーの立て直しの後も、どの台かの手がかりが 0 にならないように）
+        for ((rt, _) in prepared.runtimes) noteProcessProgramLocked(rt.program, rt.pid, restored = true)
         // 前段が終わった: 取り消しの登録を外す（待っている読み込みはないので、登録は何もしない。#587）
         restoreCancelSignal.complete(Unit)
         // 段の予約を外す（戻したマウントの持ち主はカーネルに移った）。戻した表にある挿し込みは自動マウントしない（#56）。
@@ -1775,6 +1843,8 @@ public class Machine private constructor(
                 throw t
             }
             // ここからは投げない処理だけ（巻き戻せないので）
+            // 断った spawn（上限・MFILE など）は数えない（#931）
+            noteProcessProgramLocked(program, checkNotNull(process).pid, restored = false)
             if (stateValue == MachineState.STOPPED) setStateLocked(MachineState.RUNNING, null)
             if (asInit) {
                 initStartTick = scheduler.now

@@ -76,7 +76,8 @@ internal enum class AsyncifyDebug {
  *   巻き直しの後の専用の引数ローカルの中身に頼る変換（読む場所を足す、退避を省いて直接使う、など）を入れるときは、これを崩さないこと
  * - 結果が2つ以上のブロック型（`$body` と最後のランの `if`）は、型セクションに `[] -> [T…]` の型を足して、その番号で書く。
  *   足す型は `async_push`・`async_pop` の型の後に並ぶ（同じ型は1つにまとめる）。そのため、コードセクションを先に書き換えてから型セクションを書く
- * - `call_indirect` は、型が同じ止まりうる関数があるときだけ止まりうる、と見る
+ * - `call_indirect`・`call_ref` は、型が同じ（か宣言した部分型の）止まりうる関数のうち、参照が取られうるもの（要素セグメント・`ref.func`・export。#338）が
+ *   あるときだけ止まりうる、と見る
  *
  * 足すもの（名前は [WasmAsync]。カーネルと変換したコードの間の取り決めで、プログラムには見せない）:
  * - import の関数 `kibi.async_push`（`(i64) -> ()`）・`kibi.async_pop`（`() -> (i64)`）。退避先はホスト（カーネル）で、
@@ -160,6 +161,8 @@ internal object Asyncify {
      * [fuelSites] は、[wasm] に挿入した燃料の課金の位置（#389。`FuelInjector.Result.sites`）。あれば、止まりうる関数の
      * セグメントの課金を `FuelSites.weight` 倍にして、変換が足したコードの分を見込む。`null` なら課金は変えない（#389 の前と同じ出力）。
      *
+     * [typeOnlyIndirect] はテスト用（#338）: `call_indirect`・`call_ref` を型だけで絞る前の解析で変換する（測って比べるため）。本番は `false`
+     *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
      *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出し、止まりうる `call_ref`（#923）など）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
      *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は断らない（#851）
@@ -174,8 +177,9 @@ internal object Asyncify {
         originalFunc: (Int) -> Int = { it },
         debug: AsyncifyDebug = AsyncifyDebug.NONE,
         fuelSites: FuelSites? = null,
+        typeOnlyIndirect: Boolean = false,
         checkpoint: () -> Unit = {},
-    ): Result = prepare(wasm, checkpoint, fuelSites = fuelSites).transform(waitImports, emptySet(), yieldImport, originalFunc, debug, checkpoint)
+    ): Result = prepare(wasm, checkpoint, fuelSites = fuelSites).transform(waitImports, emptySet(), yieldImport, originalFunc, debug, typeOnlyIndirect, checkpoint)
 
     /**
      * 関数の型（引数と結果の値の型の並び。値の型は WASM のバイナリの型の番号）。コンポーネントの core モジュールをまたいで、
@@ -227,12 +231,14 @@ internal object Asyncify {
             yieldImport: String? = null,
             originalFunc: (Int) -> Int = numbering,
             debug: AsyncifyDebug = AsyncifyDebug.NONE,
+            /** テスト用（#338。[Asyncify.transform]） */
+            typeOnlyIndirect: Boolean = false,
             checkpoint: () -> Unit = {},
         ): Result = guard {
             // 位置は挿入の結果から渡されたもの。合わなければ内部の誤り。ほかの変換の誤りと同じく、変換できない（[AsyncifyUnsupported]）として断る
             // （燃料の数を壊さないように、黙って続けない。p1 は段1 → 段2 と試して読み込みを断り、コンポーネントは待機点に変換せずに動く）
             fuelSites?.let { check(it.charges.size == module.codeSection().functionBodyCount()) { "燃料の計測コードの位置が、関数の数と合わない" } }
-            Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes, debug, fuelSites).run()
+            Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes, debug, fuelSites, typeOnlyIndirect).run()
         }
 
         private inline fun <T> guard(block: () -> T): T = try {
@@ -264,6 +270,15 @@ internal object Asyncify {
         return Prepared(wasm, module, originalFunc, fuelSites)
     }
 
+    /**
+     * [wasm] の `call_indirect`・`call_ref` を、参照が取られうる関数で絞れるか（テスト用。#338）。絞れないときは、その理由。
+     * 読めないときも黙って型だけの判定に戻る（変換の結果は正しいまま、絞り込みだけが効かなくなる）ので、テストで形ごとに確かめる
+     */
+    internal fun indirectNarrowing(wasm: ByteArray): IndirectNarrowing {
+        val module = parse(wasm)
+        return Transformer(wasm, module, emptySet(), null, { it }, {}, emptySet()).indirectNarrowing()
+    }
+
     /** 予約した名前をすでに使っていたら断る（プレイヤーが退避した値や状態を自分で書き換えられてしまう） */
     private fun checkReserved(module: WasmModule) {
         val imports = module.importSection()
@@ -278,6 +293,24 @@ internal object Asyncify {
             if (exports.getExport(i).name() == WasmAsync.STATE_EXPORT) throw WasmLoadException("${WasmAsync.STATE_EXPORT} は予約された export")
         }
     }
+}
+
+/** 関数の参照を運べない参照型（i31ref と、null だけの none・nofunc・noextern・noexn。`Transformer.foreignFuncRefs`） */
+private val NO_FUNC_REFS = setOf(0x6C, 0x71, 0x72, 0x73, 0x74)
+
+/** [Asyncify.indirectNarrowing] の結果（#338） */
+internal enum class IndirectNarrowing {
+    /** 参照が取られうる関数で絞れる */
+    NARROWED,
+
+    /** 初期値の式を持つテーブルがあるので、すべての関数を取られうるとみなす */
+    TABLE_INIT_EXPR,
+
+    /** 要素・グローバル・テーブルのセクションを読めなかったので、すべての関数を取られうるとみなす */
+    UNREADABLE,
+
+    /** 関数の番号の範囲を超えた参照があるので、すべての関数を取られうるとみなす */
+    OUT_OF_RANGE,
 }
 
 private const val UNWINDING = 1
@@ -405,6 +438,8 @@ private class Transformer(
     private val debug: AsyncifyDebug = AsyncifyDebug.NONE,
     /** 挿入した燃料の計測コードの位置（#389）。`null` なら課金を変えない */
     private val fuelSites: FuelSites? = null,
+    /** テスト用（#338）: `call_indirect`・`call_ref` を、参照が取られうるかを見ずに型だけで絞る（前の解析。測って比べるため）。本番は `false` */
+    private val typeOnlyIndirect: Boolean = false,
 ) {
     private val importedFuncs: Int
     private val funcSigs = ArrayList<Sig>()
@@ -533,14 +568,17 @@ private class Transformer(
      * `call_ref` の参照も、静的な型の部分型の関数を指す。そのため、呼び出しの型が、止まりうる関数の型か、その上位の型の
      * どれかと並びが同じなら止まりうるとみなす（並びの一致は構造の同値より粗いので、安全側に含まれる）。
      * import した関数も、表には自分のインスタンスの関数として入り、宣言した import の型で照合されるので、同じ扱いにする
+     *
+     * 入れるのは、参照が取られうる止まりうる関数（[referencedFuncs]）の型だけ（#338）。参照が取られない関数は、テーブルにも
+     * 関数の参照にも入らないので、`call_indirect`・`call_ref` からは呼ばれない
      */
     private val suspendTypes = HashSet<Pair<List<Int>, List<Int>>>()
 
     /** [suspendTypes] に入れた型の番号（同じ型と上位の型を何度もたどらない） */
     private val suspendTypeIdx = HashSet<Int>()
 
-    /** 型の番号 [idx] と、その宣言した上位の型をすべて [suspendTypes] に入れる（#937） */
-    private fun addSuspendType(idx: Int) {
+    /** 型の番号 [idx] と、その宣言した上位の型をすべて [suspendTypes] に入れる（#937）。新しく入った並びごとに [added] を呼ぶ */
+    private inline fun addSuspendType(idx: Int, added: (Pair<List<Int>, List<Int>>) -> Unit) {
         val types = module.typeSection()
         val pending = ArrayList<Int>()
         pending += idx
@@ -549,7 +587,7 @@ private class Transformer(
             // 検証が上位の型の非循環を保証するが、同じ型を 2 度たどらないための集合で守る
             if (!suspendTypeIdx.add(i)) continue
             // 関数の型の上位は関数の型（検証が保証する）。struct・array（null）は飛ばす
-            typeSigs.getOrNull(i)?.let { suspendTypes += it.params to it.results }
+            typeSigs.getOrNull(i)?.let { t -> (t.params to t.results).let { if (suspendTypes.add(it)) added(it) } }
             if (i in 0 until types.subTypeCount()) types.getSubType(i).typeIdx().forEach { pending += it }
         }
     }
@@ -588,9 +626,13 @@ private class Transformer(
     }
 
     private fun indirectMaySuspend(ins: AnnotatedInstruction): Boolean {
+        val sig = typeSig(ins.operand(0).toInt())
+        return sig.params to sig.results in suspendTypes || externallyMaySuspend(ins)
+    }
+
+    /** `call_indirect`・`call_ref` が、外の型（[externalSuspendTypes]）に当たって止まりうるか（#757・#937）。解析の途中で変わらない */
+    private fun externallyMaySuspend(ins: AnnotatedInstruction): Boolean {
         val idx = ins.operand(0).toInt()
-        val sig = typeSig(idx)
-        if (sig.params to sig.results in suspendTypes) return true
         if (externalSuspendTypes.isEmpty() || !externalMatch[idx]) return false
         // 外の型は、中身をほかのモジュールが入れられるもの（import・export したテーブル、関数の参照）にだけ当てる（#757）。
         // ほかのモジュールの関数の参照が入りうる形のモジュールでは、import も export もしていないテーブルにも入れられる
@@ -606,11 +648,15 @@ private class Transformer(
      * import・export したテーブルがある（`table.get`・`table.copy` で、import も export もしていないテーブルに移せる）、
      * funcref のグローバルを import・export している、import・export した関数の引数・結果に funcref がある（`table.set` で入れられる）、
      * funcref を運ぶタグがある（例外の値で渡せる）。型を追えない参照型（[BOT]）は funcref かもしれないので、同じく `true` にする。
+     * funcref 以外の参照型（anyref・eqref・structref・arrayref・externref・exnref）も、funcref のフィールドを持つ struct・array
+     * （externref は `any.convert_extern` で戻したもの、exnref は `try_table` で取り出した例外の値）を運べる（`ref.cast` → `struct.get` →
+     * `table.set` で、import も export もしていないテーブルに入れられる）ので `true` にする（#338。参照が取られない関数を外したので、
+     * 外から入る参照はここで全部拾う必要がある）。中身を持てない i31ref と、null だけの型（none・nofunc・noextern・noexn）だけは外す。
      * 参照が入りうるかだけを見る（テーブルへの命令の流れは追わない）ので、実際には入らなくても `true` になることがある
      * （そのときは止まりうるとみなす関数が増えるだけで、変換は正しい）
      */
     private val foreignFuncRefs: Boolean by lazy {
-        fun mayHoldFunc(t: Int) = t == FUNCREF || t == BOT
+        fun mayHoldFunc(t: Int) = t == BOT || (isRef(t) && t !in NO_FUNC_REFS)
         fun sigMayHoldFunc(s: Sig) = s.params.any(::mayHoldFunc) || s.results.any(::mayHoldFunc)
         if (sharedTables.any { it }) return@lazy true
         if (tagSigs.any(::sigMayHoldFunc)) return@lazy true
@@ -650,30 +696,120 @@ private class Transformer(
     private fun bodies(): List<List<AnnotatedInstruction>> =
         (0 until module.codeSection().functionBodyCount()).map { module.codeSection().getFunctionBody(it).instructions() }
 
+    /**
+     * 止まりうる関数（[suspendable]）を求める。止まりうる import から、呼ぶ側へ逆向きにたどる（#338）:
+     * 直接の呼び出し（`call`・`return_call`）は呼ばれる側から呼ぶ側への辺で、`call_indirect`・`call_ref` とその末尾呼び出しは、
+     * 呼び出しの型の並びが [suspendTypes] に入ったときに止まりうる。外の型に当たるもの（[externallyMaySuspend]）は最初から止まりうる。
+     * 各関数は一度だけ作業リストに入り、各辺は一度だけたどるので、命令の数と関数の数に比例する時間で終わる
+     * （前は答えが変わらなくなるまで全部の本体をなめ直したので、呼び出しの鎖が長いと「関数の数 × 命令の数」になった）。
+     * 本体をなめる間は、関数ごとに [checkpoint] を呼ぶ（時間の上限。#40）。
+     * 答え（最小の不動点）はたどる順に依らないので、出力は決定的
+     */
     private fun analyze(bodies: List<List<AnnotatedInstruction>>) {
         if (asyncFuncs.isEmpty() && externalSuspendTypes.isEmpty()) return
-        suspendable += asyncFuncs
-        var changed = true
-        while (changed) {
-            changed = false
-            for (f in suspendable) addSuspendType(funcTypeIdx[f])
-            for ((i, body) in bodies.withIndex()) {
-                val f = importedFuncs + i
-                if (f in suspendable) continue
-                val calls = body.any { ins ->
-                    when (ins.opcode()) {
-                        OpCode.CALL, OpCode.RETURN_CALL -> ins.operand(0).toInt() in suspendable
-                        OpCode.CALL_INDIRECT, OpCode.CALL_REF, OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
-                            indirectMaySuspend(ins)
-                        else -> false
+        val referenced = if (typeOnlyIndirect) null else referencedFuncs(bodies)
+        // 呼ばれる関数 → 呼ぶ関数。呼び出しの型の並び → その型の `call_indirect`・`call_ref` を持つ関数
+        val callers = HashMap<Int, ArrayList<Int>>()
+        val indirect = HashMap<Pair<List<Int>, List<Int>>, ArrayList<Int>>()
+        val work = ArrayDeque<Int>()
+        fun mark(f: Int) {
+            if (suspendable.add(f)) work += f
+        }
+        asyncFuncs.forEach(::mark)
+        for ((i, body) in bodies.withIndex()) {
+            checkpoint()
+            val f = importedFuncs + i
+            for (ins in body) {
+                when (ins.opcode()) {
+                    OpCode.CALL, OpCode.RETURN_CALL -> callers.getOrPut(ins.operand(0).toInt()) { ArrayList() } += f
+                    OpCode.CALL_INDIRECT, OpCode.CALL_REF, OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF -> {
+                        if (externallyMaySuspend(ins)) {
+                            mark(f)
+                        } else {
+                            val sig = typeSig(ins.operand(0).toInt())
+                            indirect.getOrPut(sig.params to sig.results) { ArrayList() } += f
+                        }
                     }
-                }
-                if (calls) {
-                    suspendable += f
-                    changed = true
+                    else -> {}
                 }
             }
         }
+        while (work.isNotEmpty()) {
+            val g = work.removeFirst()
+            callers.remove(g)?.forEach(::mark)
+            if (referenced == null || referenced[g]) {
+                addSuspendType(funcTypeIdx[g]) { key -> indirect.remove(key)?.forEach(::mark) }
+            }
+        }
+    }
+
+    /**
+     * 参照が取られうる関数（関数の番号 → 取られうるか。#338）。`call_indirect`・`call_ref` で呼ばれうるのは、これらの関数だけ:
+     * 要素セグメント（能動・パッシブ・宣言のすべての形の、関数の番号の並びと式の `ref.func`）、グローバルの初期値の `ref.func`、
+     * 関数の本体の `ref.func`（Endive の検証が「宣言済みの関数だけ」を確かめていると決めつけず、すべて集める）、export した関数
+     * （ほかのモジュールが import して、共有するテーブルや関数の参照に入れられる）。import した関数も、同じ規則で入る。
+     * ここで集めるのは、このモジュールの中で作る参照だけ。コンポーネントでほかのモジュールから入る関数の参照（このモジュールが import していて
+     * 参照を取っていない関数のものも含む）は、外の型（[externallyMaySuspend]）で止まりうるとみなす。入りうる経路は [foreignFuncRefs] が
+     * 型で網羅する（p1 は外の型が空で、ホストは関数の参照を作らない）。
+     * 初期値の式を持つテーブル（関数参照の提案）があるとき、または要素・グローバル・テーブルのセクションを読めなければ `null`（すべての関数を取られうるとみなす。前と同じ判定。読めないものは、変換の写しが同じく断る）
+     */
+    private fun referencedFuncs(bodies: List<List<AnnotatedInstruction>>): BooleanArray? {
+        narrowing = IndirectNarrowing.NARROWED
+        val referenced = BooleanArray(funcSigs.size)
+        var outOfRange = false
+        fun mark(idx: Long): Long {
+            if (idx in 0 until referenced.size) referenced[idx.toInt()] = true else outOfRange = true
+            return idx
+        }
+        val es = module.exportSection()
+        for (i in 0 until es.exportCount()) {
+            val e = es.getExport(i)
+            if (e.exportType() == ExternalType.FUNCTION) mark(e.index().toLong())
+        }
+        for (body in bodies) for (ins in body) if (ins.opcode() == OpCode.REF_FUNC) mark(ins.operand(0))
+        try {
+            for (s in scanSections()) {
+                val r = Reader(wasm, s.start, s.end)
+                when (s.id) {
+                    // 初期値の式を持つテーブル（関数参照の提案の `0x40 0x00` の形）は、式の `ref.func` を追わず、すべてを取られうるとみなす
+                    4 -> repeat(r.leb().toInt()) {
+                        if (r.u8() == 0x40) {
+                            narrowing = IndirectNarrowing.TABLE_INIT_EXPR
+                            return null
+                        }
+                        r.pos--
+                        r.copyValType(Sink())
+                        val flags = r.u8()
+                        r.leb()
+                        if (flags and 1 != 0) r.leb()
+                    }
+                    6 -> repeat(r.leb().toInt()) {
+                        val sink = Sink()
+                        r.copyValType(sink)
+                        r.u8()
+                        r.copyConstExpr(sink, ::mark)
+                    }
+                    9 -> rewriteElements(r, ::mark)
+                }
+            }
+        } catch (e: Exception) {
+            narrowing = IndirectNarrowing.UNREADABLE
+            return null
+        }
+        if (outOfRange) {
+            narrowing = IndirectNarrowing.OUT_OF_RANGE
+            return null
+        }
+        return referenced
+    }
+
+    /** 最後の [referencedFuncs] の結果の形（テスト用。#338） */
+    private var narrowing = IndirectNarrowing.NARROWED
+
+    /** 参照が取られうる関数で絞れるか、絞れないならその理由（テスト用。#338。[Asyncify.indirectNarrowing]） */
+    fun indirectNarrowing(): IndirectNarrowing {
+        referencedFuncs(bodies())
+        return narrowing
     }
 
     fun run(): Asyncify.Result {
@@ -871,7 +1007,8 @@ private class Transformer(
         return list
     }
 
-    private fun rewriteElements(r: Reader): Sink {
+    /** 要素のセクションを写し、関数の番号を [map] で付け替える（[referencedFuncs] は、集めるだけに使う） */
+    private fun rewriteElements(r: Reader, map: (Long) -> Long = ::remap): Sink {
         val body = Sink()
         val n = r.leb()
         body.leb(n)
@@ -881,16 +1018,16 @@ private class Transformer(
             fun funcIdxVec() {
                 val m = r.leb()
                 body.leb(m)
-                repeat(m.toInt()) { body.leb(remap(r.leb())) }
+                repeat(m.toInt()) { body.leb(map(r.leb())) }
             }
             fun exprVec() {
                 val m = r.leb()
                 body.leb(m)
-                repeat(m.toInt()) { r.copyConstExpr(body, ::remap) }
+                repeat(m.toInt()) { r.copyConstExpr(body, map) }
             }
             when (flag) {
                 0 -> {
-                    r.copyConstExpr(body, ::remap)
+                    r.copyConstExpr(body, map)
                     funcIdxVec()
                 }
                 1, 3 -> {
@@ -899,12 +1036,12 @@ private class Transformer(
                 }
                 2 -> {
                     body.leb(r.leb())
-                    r.copyConstExpr(body, ::remap)
+                    r.copyConstExpr(body, map)
                     body.u8(r.u8())
                     funcIdxVec()
                 }
                 4 -> {
-                    r.copyConstExpr(body, ::remap)
+                    r.copyConstExpr(body, map)
                     exprVec()
                 }
                 5, 7 -> {
@@ -913,7 +1050,7 @@ private class Transformer(
                 }
                 6 -> {
                     body.leb(r.leb())
-                    r.copyConstExpr(body, ::remap)
+                    r.copyConstExpr(body, map)
                     r.copyValType(body)
                     exprVec()
                 }
