@@ -426,8 +426,9 @@ internal class ChunkReferenceProbe(
             server: MinecraftServer,
             audit: TransformAudit? = modLauncherAudit(),
             mixins: MixinRegistry? = mixinRegistry(),
+            nestedStorage: () -> Pair<List<Class<*>>, List<String>> = { nestedRegionStorage() },
         ): List<String> {
-            val (nested, missing) = nestedRegionStorage()
+            val (nested, missing) = nestedStorage()
             val storage = REGION_STORAGE_CLASSES + nested
             return missing + modifiedRegionStorage(storage) + substitutedRegionStorage(server) +
                 transformedRegionStorage(audit, storage + ChunkMap::class.java, mixins = mixins, mixinChecked = storage.toSet())
@@ -655,7 +656,8 @@ internal class ChunkReferenceProbe(
         }
 
         /**
-         * Mixin のクラス [mixin] が、アクセサー・インボーカーだけのもの（インターフェース）か。Mixin のインターフェースにはアクセサーとインボーカーしか書けない。
+         * Mixin のクラス [mixin] が、アクセサー・インボーカーだけのもの（インターフェース）か。Mixin のインターフェースには、ふつうアクセサーとインボーカーしか書けない。
+         * ただし、クラスを狙うインターフェースの Mixin でも、synthetic なメソッドや `<clinit>` は印なしで対象に足されうる（sponge-mixin 0.16.4）。この判定はアクセスフラグだけを見るので、それは見えない（ADR 0564 の限界）。
          * 処理を書き換えるクラスの Mixin は Mixin が読み込みを弾く（`isLoadable()` が偽）が、アクセサーの Mixin は対象のクラスが実装するインターフェースとして読み込まれる。
          * どちらも読み込まずに同じ方法で扱えるよう、クラスファイルのアクセスフラグを読む。名前がない・読めないなら `false`（数える）
          */

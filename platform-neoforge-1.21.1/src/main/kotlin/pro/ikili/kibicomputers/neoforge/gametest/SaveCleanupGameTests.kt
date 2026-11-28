@@ -606,7 +606,7 @@ object SaveCleanupGameTests {
         helper.assertTrue(modified.isEmpty(), "the chunk storage classes should have no mixins: $modified")
         val substituted = ChunkReferenceProbe.substitutedRegionStorage(server)
         helper.assertTrue(substituted.isEmpty(), "the chunk storage instances should be vanilla: $substituted")
-        // 変換の記録（#959）: ModLauncher の記録が引け、読み書きの経路の5クラスに数える変換がない（製品の jar では AT が plugin として当たる）
+        // 変換の記録（#959）: ModLauncher の記録が引け、読み書きの経路の4クラスと入れ子のクラス、`ChunkMap` に数える変換がない（製品の jar では AT が plugin として当たる）
         val audit = ChunkReferenceProbe.modLauncherAudit()
         helper.assertTrue(audit != null, "the transformer audit trail should be available")
         AUDIT_LOGGER.log(System.Logger.Level.INFO) {
@@ -625,6 +625,33 @@ object SaveCleanupGameTests {
         helper.assertTrue(same.isEmpty(), "an exact instance should not be substituted: $same")
         val sub = ChunkReferenceProbe.substitutedInstances(listOf(BaseStorage::class.java to SubStorage(), BaseStorage::class.java to null))
         helper.assertTrue(sub == listOf(SubStorage::class.java.name, "null"), "a subclass and a missing instance should be substituted: $sub")
+        helper.succeed()
+    }
+
+    /**
+     * 入れ子のクラスが読み込めないときは、残す側に倒れる（#969。版上げで入れ子の名前が変わった環境）。
+     * [ChunkReferenceProbe.nestedRegionStorage] は、`ClassNotFoundException`・`RuntimeException`・`LinkageError` のどれで読み込めなくても「クラス名: not found」を返し、
+     * 読み込めたものはそのまま返す。[ChunkReferenceProbe.untrustedRegionStorage] は、それを理由の先頭に足す（ほかの理由は、本物のまま空）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun missingNestedClassMakesChunkStorageUntrusted(helper: GameTestHelper) {
+        val names = ChunkReferenceProbe.NESTED_REGION_STORAGE_CLASSES
+        val loader = RegionFile::class.java.classLoader
+        val load: (String) -> Class<*> = { name ->
+            when (name) {
+                names[0] -> throw ClassNotFoundException(name)
+                names[1] -> throw IllegalStateException(name)
+                names[2] -> throw NoClassDefFoundError(name)
+                else -> Class.forName(name, false, loader)
+            }
+        }
+        val (loaded, missing) = ChunkReferenceProbe.nestedRegionStorage(names, load)
+        helper.assertTrue(missing == names.take(3).map { "$it: not found" }, "the three kinds of load failures should be reported: $missing")
+        helper.assertTrue(loaded.map { it.name } == listOf(names[3]), "the loadable class should be returned: ${loaded.map { it.name }}")
+        helper.assertTrue(ChunkReferenceProbe.nestedRegionStorage(emptyList(), load) == (emptyList<Class<*>>() to emptyList<String>()), "no names should load nothing")
+        val reasons = ChunkReferenceProbe.untrustedRegionStorage(helper.level.server, nestedStorage = { ChunkReferenceProbe.nestedRegionStorage(names, load) })
+        helper.assertTrue(reasons == missing, "the missing nested classes should be the only reasons: $reasons")
         helper.succeed()
     }
 
@@ -680,7 +707,7 @@ object SaveCleanupGameTests {
         val audit = ChunkReferenceProbe.modLauncherAudit()
         helper.assertTrue(audit != null, "the transformer audit trail should be available")
         helper.assertTrue(ChunkReferenceProbe.transformedRegionStorage(audit, classes).isEmpty(), "the real RegionFileStorage should not count")
-        // 既定のクラスの一覧: 5クラスのどれに coremod が当たっても、そのクラスだけが数えられる（一覧からクラスを外すと落ちる）。
+        // 既定のクラスの一覧: 4クラスとその入れ子と `ChunkMap` のどれに coremod が当たっても、そのクラスだけが数えられる（一覧からクラスを外すと落ちる）。
         // 本物の記録に偽の TRANSFORMER を1つ足すだけで、クラスローダーの確かめは本物のまま
         fun withCoremodOn(target: Class<*>) = TransformAudit { name ->
             val activities = audit!!.activities(name)
