@@ -122,6 +122,9 @@ object MachineRestoreGameTests {
     private class ReadySave {
         var tag: CompoundTag? = null
         var failure: Throwable? = null
+
+        /** READY の後の書き込みの回数（書くまでは null）。0 回以下は [take] が GameTest の失敗として落とす */
+        var writes: Int? = null
         var identity: MachineIdentity? = null
 
         /**
@@ -130,6 +133,8 @@ object MachineRestoreGameTests {
          */
         fun take(helper: GameTestHelper): CompoundTag {
             failure?.let { throw IllegalStateException("saving the machine at a wait point should not fail", it) }
+            // 0 回は GameTestAssertException（assertTrue）で落とす。ほかの例外を投げるとサーバーごと落ちる
+            helper.assertTrue(writes != null && writes!! > 0, "the case should be saved but wrote $writes")
             helper.assertTrue(tag != null && identity != null, "the case should be saved")
             val id = identity!!
             val file = WorldMachineSaves.current!!.generationFile(id.id, id.generation)
@@ -147,17 +152,15 @@ object MachineRestoreGameTests {
      * 書く tick のうちに続く `thenExecute` も走る（成功した event は同じ tick に続けて走る）ので、置き直しを `onLoad` の前に行える
      */
     private fun saveWhenReady(helper: GameTestHelper, be: CaseBlockEntity, save: ReadySave) {
-        if (save.tag != null || save.failure != null) return
+        if (save.tag != null || save.failure != null || save.writes != null) return
         be.computer.prepareUnload()
         try {
             val readiness = be.computer.saveReadiness()
             helper.assertTrue(readiness == SaveReadiness.READY, "the machine should be at a wait point but was $readiness")
             try {
                 val writes = saveNow(be, CapturePolicy.KILL_TRANSIENT)
-                if (writes <= 0) {
-                    save.failure = IllegalStateException("the case should be saved but wrote $writes")
-                    return
-                }
+                save.writes = writes
+                if (writes <= 0) return
             } catch (e: Exception) {
                 save.failure = e
                 return
