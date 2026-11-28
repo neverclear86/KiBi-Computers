@@ -24,7 +24,7 @@ import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.locks.ReentrantLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 表示デバイス（#355）: プロセスの出力は、プロセスのスレッドで表示デバイスに書く */
 class ScreenDeviceDisplayTest {

@@ -15,7 +15,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.romChunks
 import pro.ikili.kibicomputers.core.runtime.endive.writtenChunks
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** RAM を書き換えた 4 KiB の区画で数える（#407）ことを、Endive とカーネルを通して確かめる */
 class WrittenMemoryTest {

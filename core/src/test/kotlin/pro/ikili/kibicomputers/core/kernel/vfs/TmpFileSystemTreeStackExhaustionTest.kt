@@ -8,9 +8,10 @@ import pro.ikili.kibicomputers.core.kernel.MachineClock
 import pro.ikili.kibicomputers.core.kernel.MemoryAccount
 import pro.ikili.kibicomputers.core.kernel.SoePositions
 import pro.ikili.kibicomputers.core.kernel.stackHeadroomRounds
+import pro.ikili.kibicomputers.core.kernel.stackHeadroomWait
 import pro.ikili.kibicomputers.core.persist.snapshot.TmpfsSectionCodec
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `/tmp`（[TmpFileSystem]）の木を変える操作の途中でスタックが尽きても、木と RAM の勘定が食い違わないことを、木の道全般で確かめる（#902）。
@@ -290,7 +291,7 @@ class TmpFileSystemTreeStackExhaustionTest {
             }
         }, "TmpFileSystemTreeStackExhaustionTest", STACK_BYTES)
         t.start()
-        t.join(60_000)
+        t.join(stackHeadroomWait(60_000))
         check(!t.isAlive) { "操作が終わらない: ${t.stackTrace.take(12).joinToString(" <- ")}" }
         return result
     }

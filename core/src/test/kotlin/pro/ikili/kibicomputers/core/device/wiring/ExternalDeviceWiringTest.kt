@@ -12,7 +12,7 @@ import pro.ikili.kibicomputers.core.device.DeviceAddress
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 他 MOD のデバイスの結線（#153、ADR 0153）: 実体の単位の排他（[DeviceHolder.exclusionKey]）、他 MOD のコードが投げたときの受け方、

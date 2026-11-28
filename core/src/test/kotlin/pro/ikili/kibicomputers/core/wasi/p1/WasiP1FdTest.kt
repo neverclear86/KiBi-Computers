@@ -34,7 +34,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** WASI p1 の fd_*（#70）。ダミーのモジュールから import を直接呼び、メモリの中身で確かめる */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）

@@ -26,7 +26,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.call
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * コンポーネントの canon の lift・lower の中（realloc・post-return を含む）からロックを取る道で、スタックが尽きる位置をずらしても、

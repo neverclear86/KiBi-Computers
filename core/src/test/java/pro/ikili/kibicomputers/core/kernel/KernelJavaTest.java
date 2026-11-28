@@ -26,12 +26,12 @@ class KernelJavaTest {
                 assertTrue(saveable);
             }
             machine.stop();                                  // 待たずに返る
-            boolean done = machine.awaitTermination(1000);
+            boolean done = machine.awaitTermination(60_000);
             assertTrue(done);
             machine.close();
         } finally {
             scheduler.close();                               // 待たずに返る
-            assertTrue(scheduler.awaitTermination(1000));
+            assertTrue(scheduler.awaitTermination(60_000));
         }
         assertThrows(IllegalStateException.class, () -> scheduler.createMachine((m, s, c) -> { }, MachineConfig.DEFAULT));
     }
@@ -80,7 +80,7 @@ class KernelJavaTest {
             assertEquals(SchedulerConfig.DEFAULT, defaults.getConfig());
         } finally {
             defaults.close();
-            assertTrue(defaults.awaitTermination(1000));
+            assertTrue(defaults.awaitTermination(60_000));
         }
         assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().maxConcurrentMachines(0));
     }

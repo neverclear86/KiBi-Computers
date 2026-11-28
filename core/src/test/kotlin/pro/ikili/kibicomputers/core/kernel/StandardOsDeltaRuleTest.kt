@@ -21,7 +21,7 @@ import java.io.DataOutputStream
 import java.time.Duration
 import java.util.UUID
 import java.util.zip.CRC32C
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 標準 OS（本物の `/sbin/init` と `/bin/sh`）で、全体か差分かの規則（[FullSaveRule]。#668、ADR 0083 の規則 3）を確かめる。

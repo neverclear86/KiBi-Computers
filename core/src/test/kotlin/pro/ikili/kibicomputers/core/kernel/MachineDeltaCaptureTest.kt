@@ -37,7 +37,7 @@ import java.io.DataOutputStream
 import java.time.Duration
 import java.util.UUID
 import java.util.zip.CRC32C
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 差分の写しと、プロセスの線形メモリの基準（`MemoryBase`）の進め方（#83、ADR 0083 の 5.）。

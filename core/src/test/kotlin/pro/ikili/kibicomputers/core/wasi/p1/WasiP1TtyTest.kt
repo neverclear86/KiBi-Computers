@@ -26,7 +26,7 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 独自拡張 `kibi:io/tty`（#427）の p1 の import を、kibi_tty.c（実際の Endive）とカーネルで確かめる。

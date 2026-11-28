@@ -14,7 +14,7 @@ import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
 import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 出力を止めている間に、コンソールの持ち主（マシン）が替わるときと、止めている間の順序（#381）。

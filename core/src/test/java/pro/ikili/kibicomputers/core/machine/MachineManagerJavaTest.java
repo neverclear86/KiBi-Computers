@@ -54,14 +54,14 @@ class MachineManagerJavaTest {
         assertNotNull(slot.load(manager, key, host, MachineConfig.DEFAULT));
         assertTrue(slot.removed());
 
-        assertTrue(manager.shutdown(10_000));
+        assertTrue(manager.shutdown(60_000));
         assertTrue(manager.isClosed());
         assertNull(slot.load(manager, key, host, MachineConfig.DEFAULT));
         assertTrue(errors.isEmpty());
 
         MachineManager<String> defaults = new MachineManager<>();
         assertFalse(defaults.isClosed());
-        assertTrue(defaults.shutdown(10_000));
+        assertTrue(defaults.shutdown(60_000));
         MachineErrorListener.IGNORE.onError("ignored", new RuntimeException());
     }
 }

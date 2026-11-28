@@ -18,7 +18,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 実 Endive の WASI p1 のプログラム（`stack-deep-wasi`）で、スタックを使い切るまで再帰させ、尽きる位置をずらしても、

@@ -63,7 +63,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 保存データからの復元（#85、ADR 0085）: `prompt-wasi.wasm` が入力を待っているところを書き、新しいマシンに戻して続きを動かす。
@@ -634,7 +634,7 @@ class MachineRestoreTest {
             assertEquals(0L, m.memoryAccount.usedBytes)
             eventually(10_000, "ディスクを閉じない") { disk.retired.get() >= 1 }
             // runtimes に入れる前の表のプロセスも終わった状態になり、awaitTermination が返る（#671）。表は巻き戻さない
-            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
+            m.awaitTerminationOrFail("表のプロセスが終わっていない")
             m.lock.withLockValue {
                 assertEquals(0, m.kernel.processes.liveCount())
                 assertTrue(m.kernel.processes.size > 0, "表を巻き戻した")
@@ -681,7 +681,7 @@ class MachineRestoreTest {
             assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             // stopLocked が最後まで進み、表のプロセスがすべて終わっている
-            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
+            m.awaitTerminationOrFail("表のプロセスが終わっていない")
             m.lock.withLockValue {
                 assertNotNull(m.runtimes[parentPid], "親が runtimes にない")
                 assertNull(m.runtimes[childPid], "子が runtimes に入っている")
@@ -734,7 +734,7 @@ class MachineRestoreTest {
             assertFalse(m.isSettlingForSave)
             assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
-            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
+            m.awaitTerminationOrFail("表のプロセスが終わっていない")
             m.lock.withLockValue {
                 assertNotNull(m.runtimes[childPid], "子が runtimes にない")
                 assertNull(m.runtimes[parentPid], "親が runtimes に入っている")
@@ -1084,7 +1084,7 @@ class MachineRestoreTest {
                 h.scheduler.tick()
                 m.state == MachineState.STOPPED
             }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             repeat(20) {
                 h.scheduler.tick()
                 Thread.sleep(5)

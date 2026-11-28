@@ -19,7 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.time.Timer
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** wasi-libc でビルドした poll_wasi.c（実際の Endive）を、p1 の層とカーネルの上で動かす（#72） */
 class WasiP1PollProgramTest {

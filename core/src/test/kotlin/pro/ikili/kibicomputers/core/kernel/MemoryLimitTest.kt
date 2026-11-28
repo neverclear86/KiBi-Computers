@@ -23,7 +23,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 線形メモリの上限（#39・#407）: 初めて書き込んだ 4 KiB の区画を、プロセスごとの上限とコンピューター全体の RAM で数える。

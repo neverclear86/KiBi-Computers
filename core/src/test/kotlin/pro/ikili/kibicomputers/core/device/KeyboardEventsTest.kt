@@ -18,7 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import java.time.Duration
 import java.util.UUID
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** キーの押下・離しのイベント `key-pressed`・`key-released`（#326、ADR 0326） */
 class KeyboardEventsTest {

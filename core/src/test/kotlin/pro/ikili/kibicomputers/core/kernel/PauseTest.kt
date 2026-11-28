@@ -8,7 +8,7 @@ import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.time.Duration
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 class PauseTest {
     private val limit = Duration.ofSeconds(30)

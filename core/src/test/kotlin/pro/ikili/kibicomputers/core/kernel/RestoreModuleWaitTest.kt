@@ -43,7 +43,7 @@ import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 復元の前段が、モジュールの読み込みを起動用のスレッドを持たずに待つこと（#577）。
@@ -407,10 +407,10 @@ class RestoreModuleWaitTest {
                 val restoring = saved.map { id -> h.machine(fuelPerTick = 10_000_000).also { assertTrue(it.restore(request(id, store, finished))) } }
                 eventually(10_000, "復元が読み込みを待たない") { h.restoresParked(loading = 2) }
 
-                val started = System.nanoTime()
+                // 読み込みは門で止めたまま（finally まで開けない）なので、close が読み込みを待つなら停止は終わらず、保険のタイムアウトが落とす。
+                // 経過時間の上限で合否を決めない（#980）
                 h.scheduler.close()
-                assertTrue(h.scheduler.awaitTermination(5_000), "読み込みを待つ復元が残っている")
-                assertTrue(Duration.ofNanos(System.nanoTime() - started) < Duration.ofSeconds(5))
+                h.scheduler.awaitTerminationOrFail("読み込みを待つ復元が残っている")
                 assertTrue(restoring.none { it.isRestoring })
                 assertTrue(restoring.all { it.lock.withLockValue { it.kernel.processes.size } == 0 })
                 // 前段は completeRestore・restoreFellBack を通らずに抜けるので、登録を外すのは close() が呼ぶ stop() だけ

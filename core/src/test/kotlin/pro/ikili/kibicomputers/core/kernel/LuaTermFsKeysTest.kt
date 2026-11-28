@@ -42,7 +42,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.P1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * Lua の term・colors・colours・keys・fs（#724。ADR 0724）を、実際の Endive と標準 OS のイメージの `/bin/lua`、カーネルで確かめる。

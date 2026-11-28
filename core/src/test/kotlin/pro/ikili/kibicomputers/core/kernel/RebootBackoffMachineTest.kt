@@ -17,7 +17,7 @@ import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 再起動を繰り返すマシンの、起動し直すまでの待ち（#635、ADR 0635）。tick は手で進める */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
@@ -115,7 +115,7 @@ class RebootBackoffMachineTest {
             e.tickUntilRunning()
             e.block()
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -140,7 +140,7 @@ class RebootBackoffMachineTest {
         val due = rebootAndAwaitDeferral()
         assertTrue(due >= posted + 3, "2回目は 3 tick 待つ: posted=$posted due=$due")
         // 待つ間: プロセスもスレッドもなく STOPPED だが、再起動の途中
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertEquals(MachineState.STOPPED, m.state)
         assertTrue(m.isRebootPending)
         assertTrue(m.isRunningBootingOrRebooting)
@@ -169,7 +169,7 @@ class RebootBackoffMachineTest {
     fun `起動の途中と、rebootを受け付けて止まり切る前は、保存を待つ価値がある`() = env {
         // アンロード・停止の待ち（#635）が、tick を進めずに解ける TRANSIENT を待たなくならないことを確かめる
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         // 起動の途中（init を作る前）: 起動のスレッドが進めば解ける
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -248,7 +248,7 @@ class RebootBackoffMachineTest {
             h.scheduler.hooks.beforeUnregister = null
             gate.countDown()
         }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         repeat(5) { h.scheduler.tick() }
         assertEquals(MachineState.CRASHED, m.state)
         assertFalse(m.isSettlingForSave)

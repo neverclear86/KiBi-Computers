@@ -22,7 +22,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 起動部品のプログラムだけで起動した台（#99、ADR 0099）の保存と復元: 根（`source` が `firmware`）を、復元の求めの設定の

@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
-import org.junit.jupiter.api.assertTimeoutPreemptively
+import pro.ikili.kibicomputers.core.testing.bodyTimeout
 import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
@@ -54,16 +54,18 @@ class FairPermitPoolTest {
 
         fun awaitRuns(n: Int) = failOnInterrupt({ "仕事が動かない: $order" }) { ran.acquire(n) }
 
-        override fun close() {
+        override fun close() = withInterruptCleared {
             executor.alwaysFail = false
             executor.failuresLeft.set(0)
-            workers.shutdown()
-            workers.awaitTermination(5_000)
-            executor.shutdownNow()
+            try {
+                shutdownWorkersOrFail(workers, executor)
+            } finally {
+                executor.shutdownNow()
+            }
         }
     }
 
-    private fun timeout(block: () -> Unit) = assertTimeoutPreemptively(Duration.ofSeconds(30), block)
+    private fun timeout(block: () -> Unit) = bodyTimeout(Duration.ofSeconds(30), block)
 
     @Test
     fun `待ち手の多い組がいても、ほかの組は1件ごとに順番が回ってくる`() = timeout {

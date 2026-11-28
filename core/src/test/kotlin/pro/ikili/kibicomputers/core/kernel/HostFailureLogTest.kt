@@ -25,7 +25,7 @@ import java.util.logging.Handler
 import java.util.logging.Level
 import java.util.logging.LogRecord
 import java.util.logging.Logger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `Machine.safely` が捨てる接続層の例外をログに出す（#674、ADR 0044）: 1台・1種類で最初の1回は WARNING、2回目からは DEBUG。

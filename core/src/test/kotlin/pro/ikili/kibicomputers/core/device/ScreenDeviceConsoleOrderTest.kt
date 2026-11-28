@@ -19,7 +19,7 @@ import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * TTY の出力の後に書いたカーネルのメッセージが、TTY の出力より後に出ること（#435、#381）。

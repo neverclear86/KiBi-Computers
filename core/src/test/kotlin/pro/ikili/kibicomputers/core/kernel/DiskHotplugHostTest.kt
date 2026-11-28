@@ -28,7 +28,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * ディスクの挿し抜きとマウントを、本番と同じ経路で確かめる（#56、ADR 0056）。[DiskHotplugTest] は開き方をテストのフック

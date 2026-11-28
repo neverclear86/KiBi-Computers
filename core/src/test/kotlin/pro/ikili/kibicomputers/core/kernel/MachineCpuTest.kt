@@ -13,7 +13,7 @@ import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * [MachineCpu] の予約（[MachineCpu.reserve]・[MachineCpu.acquire]・[MachineCpu.cancelReservation]）を直接確かめる（#742、#737）。

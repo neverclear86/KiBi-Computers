@@ -12,7 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * Lua のアロケーターの包み（kibi_wasi.c の kibi_lua_realloc）を、Lua を通さずに直接呼んで確かめる（#802。lua_alloc_wasi.c）。

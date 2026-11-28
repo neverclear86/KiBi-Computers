@@ -31,7 +31,7 @@ import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 独自拡張 `kibi:computer/access`（#110。ADR 0110）の p1 の import を、kibi_access.c（実際の Endive）とカーネルで確かめる。

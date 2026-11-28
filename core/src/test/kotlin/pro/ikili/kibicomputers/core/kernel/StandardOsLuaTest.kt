@@ -15,7 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 標準 OS のイメージの `/bin/lua`（#603）: イメージ（読み取り専用の `/`）に、書ける `/home`・`/tmp` を重ねた形

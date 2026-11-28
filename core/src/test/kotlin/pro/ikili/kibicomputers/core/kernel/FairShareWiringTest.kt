@@ -4,7 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.assertTimeoutPreemptively
+import pro.ikili.kibicomputers.core.testing.bodyTimeout
 import pro.ikili.kibicomputers.core.config.ConfigEntry
 import pro.ikili.kibicomputers.core.config.ConfigSource
 import pro.ikili.kibicomputers.core.config.ConfigValues
@@ -35,7 +35,7 @@ class FairShareWiringTest {
 
     private fun env(owner: UUID?): MachineEnvironment = MachineEnvironment.builder().fairnessKey(owner).build()
 
-    private fun timeout(block: () -> Unit) = assertTimeoutPreemptively(Duration.ofSeconds(60), block)
+    private fun timeout(block: () -> Unit) = bodyTimeout(Duration.ofSeconds(60), block)
 
     /** 許可がすべて返り、表に組が残っていない */
     private fun MachineScheduler.assertPermitsSettled(total: Int) {
@@ -73,7 +73,7 @@ class FairShareWiringTest {
             assertEquals(listOf(1, 0, 0), seen.get(), "並んだときの組（a）が借りる")
             h.scheduler.assertPermitsSettled(1)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -113,7 +113,7 @@ class FairShareWiringTest {
             }
             for (m in listOf(m1, m2, m3)) {
                 m.stop()
-                assertTrue(m.awaitTermination(5_000))
+                m.awaitTerminationOrFail()
             }
         }
     }
@@ -140,7 +140,7 @@ class FairShareWiringTest {
             h.scheduler.assertPermitsSettled(2)
             eventually(10_000, "ブロッキング型の枠が戻らない") { h.scheduler.blockingGroupCount == 0 }
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 

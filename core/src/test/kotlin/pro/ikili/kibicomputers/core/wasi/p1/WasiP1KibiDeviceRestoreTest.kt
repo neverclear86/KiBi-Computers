@@ -53,7 +53,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 待機点型の p1 の `invoke`（#77、ADR 0077）が、メインスレッドのメソッドの結果を待っている間に保存して戻す。

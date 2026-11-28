@@ -11,7 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * [Machine.describeProcesses]（#636 の切り分けのログ）が、プレイヤーが決められる argv[0] をそのままログに出さないこと。

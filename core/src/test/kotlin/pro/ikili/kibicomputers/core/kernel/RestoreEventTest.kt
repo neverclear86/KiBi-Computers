@@ -39,7 +39,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 復元のイベント `restored`（#87、ADR 0087）: 成功した復元で、戻したキューに1件ずつ届き、値は実時間・ゲーム内時間の飛び。

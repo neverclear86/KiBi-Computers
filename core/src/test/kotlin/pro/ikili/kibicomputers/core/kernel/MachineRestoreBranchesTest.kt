@@ -69,7 +69,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 復元（#85、ADR 0085）の主な分岐（#578、#590）: 差分の世代から戻す、RUNNABLE のプロセス（燃料待ち・イベントで起きたが燃料がない・
@@ -833,7 +833,7 @@ class MachineRestoreBranchesTest {
             assertEquals(ProcessState.KILLED, m.lock.withLockValue { rt.process.state })
             assertTrue(m.lock.withLockValue { rt.instances.isEmpty() }, "stopLocked がインスタンスを閉じていない")
             // 全部 runtimes に入った後の失敗でも、表のプロセスは終わり、awaitTermination が返る（#671）
-            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
+            m.awaitTerminationOrFail("表のプロセスが終わっていない")
             assertTrue(during >= 10_000, "戻す途中で RAM を数えていない（$during）")
             // インスタンスの RAM は 1 回だけ返る。インスタンスはプロセスの勘定（rt.memory）を通して返すので、二重に返すとプロセスの勘定が
             // 負になった時点で check が投げ、マシンとサーバー全体の勘定には届かない（例外は closeQuietly が捨てる）。そのためプロセスの勘定で見る。

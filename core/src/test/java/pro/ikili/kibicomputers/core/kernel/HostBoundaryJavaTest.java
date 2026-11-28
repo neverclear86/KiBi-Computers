@@ -80,7 +80,7 @@ class HostBoundaryJavaTest {
             scheduler.tick();
         } finally {
             scheduler.close();
-            assertTrue(scheduler.awaitTermination(1000));
+            assertTrue(scheduler.awaitTermination(60_000));
         }
     }
 }

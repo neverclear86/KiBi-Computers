@@ -60,7 +60,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `kibi:*` の p2 の振る舞い（#685。ADR 0685）。コンポーネントのプロセスの中から、ホストの関数の本体を直接呼んで確かめる

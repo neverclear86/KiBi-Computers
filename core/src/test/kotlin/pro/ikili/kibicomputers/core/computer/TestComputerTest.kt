@@ -19,7 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** テスト用コンピューターの仮の結線（#307）: 同梱イメージ testboot（init は Lua の REPL。#315）からの起動と、画面・キーボードのデバイス（[ScreenDevice]・[KeyboardDevice]。#65） */
 class TestComputerTest {

@@ -24,7 +24,7 @@ import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** サーバー全体の RAM の上限（#362）: 各マシンの勘定は、スケジューラの全体の勘定を親に持つ */
 class TotalMemoryLimitTest {

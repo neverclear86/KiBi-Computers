@@ -13,6 +13,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.VOID
+import pro.ikili.kibicomputers.core.kernel.awaitTerminationOrFail
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.eventually
@@ -39,7 +40,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 独自拡張 `kibi:computer/power`（#306。ADR 0306）の p1 の import を、kibi_power.c（実際の Endive）とカーネルで確かめる。
@@ -145,7 +146,7 @@ class WasiP1PowerTest {
             val m = h.machine(host = host)
             Env(h, m, host).block()
             m.stop()
-            assertTrue(m.awaitTermination(10_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -157,7 +158,7 @@ class WasiP1PowerTest {
         boot()
         val rt = spawnUnderInit(mode, "shutdown")
         tickUntil("止まらない: ${host.console}") { m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(10_000))
+        m.awaitTerminationOrFail()
         tickFor(50)
         assertEquals(ProcessState.KILLED, rt.process.state)
         assertFalse(rt.lastError is WasmTrapException, "${rt.lastError}")
@@ -195,7 +196,7 @@ class WasiP1PowerTest {
         val rt = spawnUnderInit(mode, "reboot")
         // ホスト関数の中では待たない: 期限よりずっと前に、プロセスは KILLED で終わり、マシンは STOPPED の再起動の途中になる
         tickUntil("止まらない: ${host.log}") { rt.process.state == ProcessState.KILLED && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(10_000))
+        m.awaitTerminationOrFail()
         assertTrue(m.isRebootPending)
         assertTrue(m.deferredRebootDueTick > h.scheduler.now, "まだ期限の前")
         assertEquals(0, host.reboots.get())
@@ -252,7 +253,7 @@ class WasiP1PowerTest {
         boot()
         val rt = spawnUnderInit(mode, "realloc-shutdown")
         tickUntil("止まらない: ${host.console}") { m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(10_000))
+        m.awaitTerminationOrFail()
         tickFor(50)
         assertEquals(ProcessState.KILLED, rt.process.state)
         assertFalse(rt.lastError is WasmTrapException, "${rt.lastError}")

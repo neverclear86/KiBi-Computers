@@ -41,7 +41,7 @@ import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 接続数の上限は保存しない（#66、ADR 0066）。保存したときは2つつないでいたマシンを、上限1のマシンに実際に保存から戻し、

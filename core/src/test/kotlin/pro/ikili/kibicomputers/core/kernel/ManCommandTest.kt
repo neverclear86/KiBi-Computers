@@ -19,7 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `/bin/man` と同梱の man ページ（#106）。ページを探す順・言語のフォールバック・`-k`・折り返しは `/bin/sh -c` から、

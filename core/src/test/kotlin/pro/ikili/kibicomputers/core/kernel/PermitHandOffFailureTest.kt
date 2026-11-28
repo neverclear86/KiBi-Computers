@@ -22,7 +22,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 許可を次へ渡した後に、ワーカーへ渡せなかったとき（#870）。許可は取り残しの列で持ったまま、後で渡し直す */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
@@ -85,11 +85,10 @@ internal class PermitHandOffFailureTest {
             closeActions += action
         }
 
-        override fun close() {
+        override fun close() = withInterruptCleared {
             closeActions.forEach { it() }
             executor.alwaysFail = false
-            workers.shutdown()
-            workers.awaitTermination(5_000)
+            shutdownWorkersOrFail(workers, executor)
         }
     }
 
@@ -531,7 +530,7 @@ internal class PermitHandOffFailureTest {
             assertEquals(0, permits.availablePermits(), "許可は取り残した step が持っている")
             m2.stop()
             h.tickUntilTrue("KILLED にならない") { m2.processState(waiter) == ProcessState.KILLED }
-            assertTrue(m2.awaitTermination(5_000), "止まり切らない")
+            m2.awaitTerminationOrFail("止まり切らない")
             executor.alwaysFail = false
             h.tickUntilTrue("許可が戻らない") { permits.strandedTasks == 0 && permits.availablePermits() == 1 }
             // 動き出した step は止められていると知って許可を返すだけ。二重に返らない
@@ -624,7 +623,7 @@ internal class PermitHandOffFailureTest {
             assertEquals(f.b, f.m.cpu.currentOwner?.pid)
             f.m.stop()
             h.tickUntilTrue("KILLED にならない") { f.m.processState(f.b) == ProcessState.KILLED }
-            assertTrue(f.m.awaitTermination(5_000), "止まり切らない")
+            f.m.awaitTerminationOrFail("止まり切らない")
             assertNull(f.m.cpu.currentOwner, "止めたら CPU は次へ渡る")
             executor.alwaysFail = false
             h.tickUntilTrue("許可が戻らない") { permits.strandedTasks == 0 && permits.availablePermits() == total }
@@ -704,7 +703,7 @@ internal class PermitHandOffFailureTest {
             h.tickUntilTrue("CPU と許可が戻らない") { m.cpu.currentOwner == null && permits.availablePermits() == total }
             assertEquals(0, permits.strandedTasks)
             // 登録（registeredThreads）の数が合っている。外し損ねていれば、プロセスが終わっても待ち終わらない
-            assertTrue(m.awaitTermination(5_000), "登録したスレッドが残っている")
+            m.awaitTerminationOrFail("登録したスレッドが残っている")
             h.scheduler.hooks.beforeUnregister = null
         }
     }

@@ -20,7 +20,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** exec とモジュールの置き場（#82、#551）: 作るときの種のファイルは、exec の put で中身を確かめ、壊れていれば書き直す */
 class MachineModuleStoreTest {

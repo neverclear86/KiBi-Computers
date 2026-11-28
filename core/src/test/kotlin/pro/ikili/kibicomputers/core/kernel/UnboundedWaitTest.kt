@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.assertTimeoutPreemptively
 import org.opentest4j.AssertionFailedError
+import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
@@ -17,6 +18,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
 
 /** テストの期限なしの待ち（#916。TestDrivers.kt の eventually・awaitOrFail など）と、Harness の後始末の振る舞い */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
@@ -54,12 +56,15 @@ class UnboundedWaitTest {
      * 標準出力に出た行（[block] の間）。[failOnInterrupt]・[Harness.close] の報告（[SLOW_WAIT_MARKER] の行）をわざと出すテストは、
      * これで捕まえる（通った回にも core の `test` タスクがその行をコンソールに写し、本当の遅れ・止まりの印を埋もれさせるため）
      */
-    private fun capturedLines(block: () -> Unit): List<String> {
+    private fun capturedLines(block: () -> Unit): List<String> = capturedLinesWith { block() }
+
+    /** [capturedLines] で、[block] が捕まえている出力そのもの（途中の行を読む別スレッドの同期に使う）も受け取る */
+    private fun capturedLinesWith(block: (ByteArrayOutputStream) -> Unit): List<String> {
         val out = ByteArrayOutputStream()
         val old = System.out
         System.setOut(PrintStream(out, true, "UTF-8"))
         try {
-            block()
+            block(out)
         } finally {
             System.setOut(old)
         }
@@ -355,5 +360,160 @@ class UnboundedWaitTest {
         }
         val lines = out.toString("UTF-8").lines().filter { it.startsWith("$SLOW_WAIT_MARKER: ") }
         assertTrue(lines.any { it.contains("先に切れた待ち") }, lines.toString())
+    }
+
+    @Test
+    fun `awaitRepeatedlyは、閾値を過ぎても落ちずに1回だけ報告して、終わるまで繰り返す`() {
+        // 終わる条件は回数で決める（経過時間の上限だと、テストのスレッドが止まったときに 1 回目で終わって、繰り返しも報告も見えなくなる）
+        var calls = 0
+        val lines = capturedLines {
+            awaitRepeatedly({ "まだ終わらない相手" }, reportAfterMillis = 1) { millis ->
+                calls++
+                Thread.sleep(minOf(millis, 10))
+                calls >= 3
+            }
+        }
+        assertTrue(calls > 1, "繰り返す: $calls")
+        assertEquals(1, lines.size, lines.toString())
+        assertTrue(lines[0].startsWith("$SLOW_WAIT_MARKER: ") && lines[0].endsWith("まだ終わらない相手"), lines[0])
+        // 終わっていれば、報告せずにそのまま返る
+        assertEquals(emptyList<String>(), capturedLines { awaitRepeatedly({ "使わない" }, reportAfterMillis = 1) { true } })
+    }
+
+    @Test
+    fun `awaitRepeatedlyは、割り込まれたら説明を付けて落ち、割り込みを握りつぶすAPIでも空回りしない`() {
+        val never = CountDownLatch(1)
+        // 投げる API（Machine.awaitTermination など）と、握りつぶしてフラグを立て直し false を返す API（SaveWriter.close など）
+        val cases = listOf<Pair<String, (Long) -> Boolean>>(
+            "投げる相手" to { millis -> never.await(millis, TimeUnit.MILLISECONDS) },
+            "握りつぶす相手" to { millis ->
+                try {
+                    never.await(millis, TimeUnit.MILLISECONDS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
+                }
+            },
+        )
+        capturedLines {
+            for ((message, timedWait) in cases) {
+                try {
+                    val e = assertThrows<AssertionError> { interruptedWhileWaiting { awaitRepeatedly({ message }, timedWait = timedWait) } }
+                    assertTrue(e.message!!.contains(message), e.message)
+                    assertTrue(e.cause is InterruptedException, message)
+                    assertTrue(Thread.currentThread().isInterrupted, "$message: フラグを立て直す")
+                } finally {
+                    Thread.interrupted()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `awaitRepeatedlyは、待たずにfalseを返すAPIでもCPUを回し続けない`() {
+        // 閉じていない MachineScheduler.awaitTermination のように、その場で false を返す相手。各回の後に寝るので、呼ぶ回数は時間で抑えられる
+        // 時間は最初の呼び出しから測る（呼び出しの前にテストのスレッドが止まっても、1 回目で終わらない）
+        var first = 0L
+        var calls = 0
+        capturedLines {
+            awaitRepeatedly({ "その場で返る相手" }) {
+                if (++calls == 1) first = System.nanoTime()
+                System.nanoTime() - first > 100_000_000L
+            }
+        }
+        assertTrue(calls in 2..1_000, "呼んだ回数: $calls")
+    }
+
+    @Test
+    fun `awaitRepeatedlyは、割り込みのフラグが立ったまま呼ばれたら、期限つきで待ってフラグを戻す`() {
+        val gate = CountDownLatch(1)
+        val ender = Thread {
+            Thread.sleep(100)
+            gate.countDown()
+        }
+        ender.start()
+        try {
+            Thread.currentThread().interrupt()
+            awaitRepeatedly({ "門" }) { gate.await(it, TimeUnit.MILLISECONDS) }
+            assertEquals(0L, gate.count, "その場で投げずに待つ")
+            assertTrue(Thread.currentThread().isInterrupted, "フラグを戻す")
+            // 待ち切れなくても投げずに報告して返す（元の失敗の説明を置き換えない）
+            val lines = capturedLines { awaitRepeatedly({ "終わらない相手" }) { false } }
+            assertTrue(lines.isNotEmpty() && lines[0].startsWith("$SLOW_WAIT_MARKER: "), lines.toString())
+            assertTrue(Thread.currentThread().isInterrupted, "フラグを戻す")
+        } finally {
+            Thread.interrupted()
+            ender.joinOrFail()
+        }
+    }
+
+    @Test
+    fun `awaitTerminationOrFailとshutdownOrFailは、止めたマシンとスケジューラの終わりを待つ`() {
+        val h = Harness()
+        val m = h.machine()
+        m.spawnTest(h.program(emptyModule()), runDriver())
+        h.tickUntilTrue("止まらない") { m.state == MachineState.STOPPED }
+        m.awaitTerminationOrFail()
+        h.close()
+        h.scheduler.awaitTerminationOrFail()
+        val manager = MachineManager<String>()
+        manager.shutdownOrFail()
+        manager.shutdownOrFail() // 2 回呼んでもよい
+    }
+
+    @Test
+    fun `awaitAcquirableは、生きている持ち主が放すまで待ち、遅れは持ち主のスタックを付けて報告する`() {
+        val lock = ReentrantLock()
+        val held = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val owner = Thread({
+            lock.lock()
+            try {
+                held.countDown()
+                release.await()
+            } finally {
+                lock.unlock()
+            }
+        }, "UnboundedWaitTest-owner")
+        owner.start()
+        try {
+            held.awaitOrFail()
+            assertEquals("UnboundedWaitTest-owner", lockOwnerName(lock))
+            // 放す役は、遅れの報告が出てから放す（時間で決めると、テストのスレッドが止まったときに、報告の前に放して取れてしまう）
+            val lines = capturedLinesWith { out ->
+                val releaser = Thread {
+                    while (!out.toString("UTF-8").contains(SLOW_WAIT_MARKER)) Thread.sleep(5)
+                    release.countDown()
+                }
+                releaser.start()
+                try {
+                    lock.awaitAcquirable("持ち主が放さない", reportAfterMillis = 1)
+                } finally {
+                    release.countDown()
+                    releaser.joinOrFail()
+                }
+            }
+            assertFalse(lock.isLocked, "取れたらすぐ放す")
+            assertTrue(lines.isNotEmpty() && lines.all { it.startsWith("$SLOW_WAIT_MARKER: ") }, lines.toString())
+            assertTrue(lines[0].contains("持ち主が放さない"), lines[0])
+            assertTrue(lines.any { it.contains("UnboundedWaitTest-owner") }, lines.toString())
+            assertEquals(null, lockOwnerName(lock))
+            // 空いていれば、報告せずにすぐ返る
+            assertEquals(emptyList<String>(), capturedLines { lock.awaitAcquirable(reportAfterMillis = 1) })
+        } finally {
+            release.countDown()
+            owner.joinOrFail()
+        }
+    }
+
+    @Test
+    fun `awaitAcquirableは、持ち主がロックを持ったまま死んでいれば、停止としてすぐ落ちる`() {
+        val lock = ReentrantLock()
+        val owner = Thread({ lock.lock() }, "UnboundedWaitTest-dead-owner")
+        owner.start()
+        owner.joinOrFail()
+        val e = assertThrows<AssertionError> { lock.awaitAcquirable("持ったまま死んだ", reportAfterMillis = 1) }
+        assertTrue(e.message!!.contains("停止") && e.message!!.contains("UnboundedWaitTest-dead-owner"), e.message)
+        assertTrue(e.message!!.contains("持ったまま死んだ"), e.message)
     }
 }

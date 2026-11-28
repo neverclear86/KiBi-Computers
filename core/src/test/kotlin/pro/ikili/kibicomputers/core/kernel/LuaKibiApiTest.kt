@@ -28,7 +28,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * Lua 向けの KiBi API（#94。ADR 0094）の peripheral と os の拡張を、実際の Endive と `lua.wasm`、カーネルで確かめる。

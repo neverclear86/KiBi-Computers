@@ -18,12 +18,13 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.eventually
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.runDriver
+import pro.ikili.kibicomputers.core.kernel.shutdownOrFail
 import pro.ikili.kibicomputers.core.kernel.spawnTest
 import pro.ikili.kibicomputers.core.kernel.spinForever
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** サーバー側のマシン管理（#120）: 一覧・生成・破棄・tick・例外の扱い */
 class MachineManagerTest {
@@ -247,7 +248,7 @@ class MachineManagerTest {
             val m = manager.attach("a", Recording(), config)
             val pid = h.spin(m)
             h.tickUntil(manager) { m.stateOf(pid) in RUNNING_STATES }
-            assertTrue(manager.shutdown(10_000))
+            manager.shutdownOrFail()
             assertTrue(manager.isClosed)
             assertEquals(0, manager.size)
             assertEquals(ProcessState.KILLED, m.stateOf(pid))

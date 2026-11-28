@@ -27,7 +27,7 @@ import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import java.time.Duration
 import java.util.UUID
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * p1 のコマンドの待機点保存の中身（#82）: `prompt-wasi.wasm` が入力を待っているところで写しを取り、`PROCESS_ABI` 節の p1 の層を読む。

@@ -15,7 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 会話的な `sh` の行の編集で、Esc のキーだけ（続きのないエスケープシーケンス）を、続きを待たずに区切ることを確かめる（#769）。

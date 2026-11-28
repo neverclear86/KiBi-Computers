@@ -26,7 +26,7 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2WitTool
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import pro.ikili.kibicomputers.core.wasi.p2.StreamEntry
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * p2 のコマンド（コンポーネント）を、待機点への変換（#757。ADR 0757）をかけて `Machine.exec` で動かす。

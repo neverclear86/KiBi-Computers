@@ -37,7 +37,7 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2WitTool
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import java.time.Duration
 import java.util.concurrent.Executor
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * コンポーネント（layer 1）を `exec` で動かす（#687）。読み込みは `ProgramCache` で全マシンが共有し（計画は不変）、

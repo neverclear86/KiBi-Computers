@@ -29,7 +29,7 @@ import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 全プロセスのメモリ合計の管理（#48。ADR 0048）: インスタンスを作る間に RAM の上限（プロセス・マシン・サーバー全体）で
@@ -95,7 +95,7 @@ class SpawnMemoryLimitTest {
             h.tickUntil("収まる子が終わらない") { m.stateOf(ok).isTerminal }
             assertState(ProcessState.EXITED, m, ok)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -108,7 +108,7 @@ class SpawnMemoryLimitTest {
             h.awaitCrash(m, host, pid, "kibi: big (pid $pid) crashed: cannot instantiate module (out of memory, RAM limit 128 KiB)")
             assertEquals(0L, m.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -122,7 +122,7 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, m.memoryAccount.usedBytes)
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -144,7 +144,7 @@ class SpawnMemoryLimitTest {
             h.awaitCrash(m, host, pid, "kibi: w (pid $pid) crashed: out of memory (server memory limit reached)")
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -177,7 +177,7 @@ class SpawnMemoryLimitTest {
             h.awaitCrash(m, host, pid, "kibi: child (pid $pid) crashed: cannot instantiate module (out of memory, RAM limit 64 KiB)")
             assertEquals(filled, m.memoryAccount.usedBytes, "子の分は残らず、/tmp の分だけが残る")
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -191,7 +191,7 @@ class SpawnMemoryLimitTest {
             h.awaitCrash(m, host, pid, "kibi: nolink (pid $pid) crashed: cannot instantiate module")
             assertFalse(host.console.contains("out of memory"), host.console.toString())
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -221,7 +221,7 @@ class SpawnMemoryLimitTest {
             assertTrue(caught.get() is WasmLinkException)
             assertEquals(0L, m.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -248,7 +248,7 @@ class SpawnMemoryLimitTest {
             h.awaitCrash(m, host, pid, "kibi: unrelated (pid $pid) crashed: cannot instantiate module")
             assertFalse(host.console.contains("out of memory"), host.console.toString())
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -277,7 +277,7 @@ class SpawnMemoryLimitTest {
                 host.console.toString(),
             )
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -320,7 +320,7 @@ class SpawnMemoryLimitTest {
                 host.console.toString(),
             )
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -388,7 +388,7 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, m.memoryAccount.usedBytes, "作りかけの分も RAM に残らない")
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -402,7 +402,7 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, m.memoryAccount.usedBytes)
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -421,7 +421,7 @@ class SpawnMemoryLimitTest {
             assertFalse(host.console.contains("cannot instantiate module (out of memory"), host.console.toString())
             assertTrue(host.console.contains("cannot instantiate module (memory.grow was refused: out of memory, RAM limit 64 KiB)"), host.console.toString())
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -473,7 +473,7 @@ class SpawnMemoryLimitTest {
             assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.OUT_OF_MEMORY, "$e")
             assertEquals(0L, m.memoryAccount.usedBytes, "どの core インスタンスの分も、固定費も返る")
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -495,7 +495,7 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, m.memoryAccount.usedBytes)
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -534,7 +534,7 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, m.memoryAccount.usedBytes, "固定費もプロセスの終わりに返る")
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -557,7 +557,7 @@ class SpawnMemoryLimitTest {
             assertTrue(m.rt(pid).lastError is WasmLinkException, "${m.rt(pid).lastError}")
             assertEquals(0L, m.memoryAccount.usedBytes, "数えた固定費は返る")
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -586,7 +586,7 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             assertFalse(m.rt(pid).lastError is WasmTrapException)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -617,7 +617,7 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, m.memoryAccount.usedBytes, "断った分は RAM に残らない")
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 }

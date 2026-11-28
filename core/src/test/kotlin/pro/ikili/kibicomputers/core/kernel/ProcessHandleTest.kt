@@ -26,7 +26,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 子のハンドル（`kibi:process` の `process` resource。#74）: fd への置き方、status・kill・閉じたときの親なし、pid の使い回し */
 class ProcessHandleTest {

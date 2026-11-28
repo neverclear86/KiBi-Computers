@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import java.util.concurrent.locks.ReentrantLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * ゲストの深い再帰でスタックが尽きる位置が、カーネルのロック（マシンのロック・CPU・許可）の途中に落ちても、
@@ -498,8 +498,8 @@ class StackExhaustionLockTest {
             awaitLockReleased(ticker, "マシンのロックが放される", m.lock) { "${m.lock}、${stopping()}" }
         } finally {
             stopWaker.set(true)
-            waker?.let { t -> awaitInCleanup({ "起こし役が終わらない" }, 5_000) { t.join(it); !t.isAlive } }
-            contenderThread?.let { t -> awaitInCleanup({ "取り合い役が終わらない" }, 5_000) { t.join(it); !t.isAlive } }
+            waker?.let { t -> awaitInCleanup({ "起こし役が終わらない" }, stackHeadroomWait(5_000)) { t.join(it); !t.isAlive } }
+            contenderThread?.let { t -> awaitInCleanup({ "取り合い役が終わらない" }, stackHeadroomWait(5_000)) { t.join(it); !t.isAlive } }
             ticker.close()
             println("#858 $kind $body $patterns: ${tally.describe()}、本体を呼んだ回数 ${bodyCalls.get()}、ディスクの操作 ${diskOps.get()} 回")
             h.close()
@@ -634,8 +634,7 @@ class StackExhaustionLockTest {
             }
             m.spawnTest(h.program(emptyModule()), leaker)
             h.tickUntilTrue("マシンが CRASHED にならない") { m.state == MachineState.CRASHED }
-            assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが放されていない: ${m.lock}")
-            m.lock.unlock()
+            m.lock.awaitAcquirable("マシンのロックが放されていない")
             val before = progress.get()
             h.tickUntilTrue("ほかの台が止まった") { progress.get() > before + 2 }
             assertEquals(MachineState.RUNNING, other.state)
@@ -683,11 +682,9 @@ class StackExhaustionLockTest {
             } else {
                 assertNotEquals(MachineState.CRASHED, m.state)
             }
-            assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが放されていない: ${m.lock}")
-            m.lock.unlock()
+            m.lock.awaitAcquirable("マシンのロックが放されていない")
             for (inner in listOf(innerLock(m.cpu), innerLock(h.scheduler.permits))) {
-                assertTrue(inner.tryLock(5, TimeUnit.SECONDS), "中のロックが放されていない: $inner")
-                inner.unlock()
+                inner.awaitAcquirable("中のロックが放されていない")
             }
             assertEquals(null, m.cpu.currentOwner, "CPU が返っていない")
             eventually(message = "許可が戻らない: ${h.scheduler.permits.availablePermits()}") { h.scheduler.permits.availablePermits() == permits }
@@ -802,7 +799,7 @@ class StackExhaustionLockTest {
                     false
                 }
             }
-            assertTrue(m.lock.tryLock(10, TimeUnit.SECONDS), "マシンのロックが放されていない: ${m.lock}")
+            assertTrue(m.lock.tryLock(stackHeadroomWait(10_000), TimeUnit.MILLISECONDS), "マシンのロックが放されていない: ${m.lock}")
             val observed = try {
                 m.state
             } finally {
@@ -860,7 +857,7 @@ class StackExhaustionLockTest {
                 releaseFinish.countDown()
             }
             val rt = m.spawnRt(h.program(emptyModule()), driver)
-            // 期限なしで待つ（#916。止まったときは、外側の assertTimeoutPreemptively の 30 秒で落ちる）
+            // 期限なしで待つ（#916。止まったときは、外側の本体の期限（`bodyTimeout`。下限 2 分）で落ちる）
             atFirst.awaitOrFail("最初の step が終わらない")
             // 起こすと、次の step が別のワーカーで始まり、終わって（EXITED）CPU を返す前で止まる
             m.lock.withLockValue { stream.write(ByteArray(1), 0, 1, m.wakeSink) }

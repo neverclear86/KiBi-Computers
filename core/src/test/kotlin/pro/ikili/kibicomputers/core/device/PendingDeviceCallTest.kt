@@ -11,7 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import java.time.Duration
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 待たずに積んだ呼び出し（#65）の保存の写しと、戻したときの積み直し */
 class PendingDeviceCallTest {

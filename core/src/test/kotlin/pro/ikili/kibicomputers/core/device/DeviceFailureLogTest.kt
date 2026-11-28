@@ -18,7 +18,7 @@ import java.util.logging.Handler
 import java.util.logging.Level
 import java.util.logging.LogRecord
 import java.util.logging.Logger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** デバイスのメソッドの失敗のログを間引く（#679、ADR 0065 の「追記（#679）」） */
 class DeviceFailureLogTest {

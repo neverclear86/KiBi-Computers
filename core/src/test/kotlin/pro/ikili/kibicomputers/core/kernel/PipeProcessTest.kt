@@ -18,7 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** パイプでつないだプロセスどうしの読み書き（#59）: いっぱいで書き手が待ち、書き手が終わると読み手が EOF、読み手が終わると書き手が PIPE */
 class PipeProcessTest {

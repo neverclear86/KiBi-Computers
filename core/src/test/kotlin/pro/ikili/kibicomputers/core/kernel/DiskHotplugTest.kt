@@ -41,7 +41,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * ディスクの抜き差しと自動マウント・予約（#56、ADR 0056）。開き方はテストのフック（[KernelTestHooks.bootVolumes]）で差し替え、

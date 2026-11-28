@@ -17,7 +17,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 標準 OS のビルド（#98）: 同梱イメージ `os`（`os/bin` の Zig のプログラム）と、共通ライブラリ `kibi`（`os/lib/kibi`）を、

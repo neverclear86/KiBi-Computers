@@ -35,7 +35,7 @@ import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * コンフィグでマシンごとの上限を下げた後に、下げる前に保存した台を戻す（#719、ADR 0719）。上限は保存しないので、今の設定で戻す。

@@ -25,7 +25,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** `FdIo.pollLocked`（#72）: fd の待ちの判定 */
 class FdPollTest {

@@ -23,7 +23,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 独自拡張 `kibi:kernel/timers` の意味の部分（[KibiTimers]。#426）。時計とタイマーは手で進める */
 class KibiTimersTest {

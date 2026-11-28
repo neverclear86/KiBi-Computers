@@ -19,7 +19,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 許可を待つ間はスレッドを持たない（#350）。同時に動ける台が許可の数より多くても、ワーカーのスレッドは許可の数＋定数に収まる。

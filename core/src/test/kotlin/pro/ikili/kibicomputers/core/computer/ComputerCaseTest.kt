@@ -22,6 +22,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.kernel.awaitOrFail
+import pro.ikili.kibicomputers.core.kernel.awaitTerminationOrFail
 import pro.ikili.kibicomputers.core.kernel.failOnInterrupt
 import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
@@ -716,7 +717,7 @@ class ComputerCaseTest {
         machine.rebootDebt = 4 * RebootBackoff.DEFAULT.decayTicks
         assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
         tickUntil("待ちに入らない: ${events.states}") { machine.isRebootDeferred }
-        assertTrue(machine.awaitTermination(5_000))
+        machine.awaitTerminationOrFail()
         // 状態の通知は次の tick で配る。待ち（40 tick）の間に STOPPED まで届く
         tickUntil("STOPPED が届かない: ${events.states}") { events.states.size >= 3 }
         assertTrue(machine.isRebootDeferred, "STOPPED が届いた時点でも、まだ待っている")
@@ -811,7 +812,7 @@ class ComputerCaseTest {
         val case = ComputerCase<String>(CaseTier.BASIC, events)
         val machine = bootedCase(case, withDisk(case.tier), "disk-a")
         machine.stop()
-        assertTrue(machine.awaitTermination(5_000))
+        machine.awaitTerminationOrFail()
         assertEquals(MachineState.STOPPED, machine.state)
         assertTrue(case.poweredOn, "知らせの前")
         assertTrue(case.settleStoppedMachine())
@@ -832,7 +833,7 @@ class ComputerCaseTest {
         assertFalse(case.settleStoppedMachine(), "動いている")
         assertSame(machine, case.machine)
         assertTrue(machine.reboot())
-        assertTrue(machine.awaitTermination(5_000))
+        machine.awaitTerminationOrFail()
         assertTrue(machine.isRebootPending)
         assertFalse(case.settleStoppedMachine(), "再起動の途中")
         assertTrue(case.poweredOn)
@@ -952,7 +953,7 @@ class ComputerCaseTest {
         val case = ComputerCase<String>(CaseTier.BASIC, States())
         val machine = bootedCase(case, withDisk(case.tier), "disk-a")
         machine.stop()
-        assertTrue(machine.awaitTermination(5_000))
+        machine.awaitTerminationOrFail()
         assertTrue(case.settleStoppedMachine())
         repeat(3) { manager.tick() }
         assertTrue(managerErrors.isEmpty(), "$managerErrors")
@@ -1013,7 +1014,7 @@ class ComputerCaseTest {
         } finally {
             held.release()
         }
-        assertTrue(machine.awaitTermination(5_000))
+        machine.awaitTerminationOrFail()
         val delivered = events.states.size
         repeat(5) { manager.tick() }
         assertEquals(delivered, events.states.size, "外した後の知らせが届いた: ${events.states}")

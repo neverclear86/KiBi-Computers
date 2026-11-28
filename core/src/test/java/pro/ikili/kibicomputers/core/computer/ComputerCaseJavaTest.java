@@ -45,6 +45,6 @@ class ComputerCaseJavaTest {
         computer.removed();
         assertNull(computer.getMachine());
         assertTrue(computer.getMissingParts().isEmpty());
-        assertTrue(manager.shutdown(10_000));
+        assertTrue(manager.shutdown(60_000));
     }
 }

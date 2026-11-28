@@ -32,7 +32,7 @@ import pro.ikili.kibicomputers.core.kernel.process.crashReason
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** コンポーネントのプロセス（#263）: カーネルの中でリンクし、core インスタンスをまたいで動かす。読み込みの途中の失敗（#692）も確かめる */
 class ComponentProcessTest {
@@ -555,8 +555,7 @@ class ComponentProcessTest {
             h.tickUntilTrue("spin が動かない") { spin.get() > 0 }
             for (i in 0 until 12) {
                 h.deepRecursionCrashesOnlyItself(m, if (i % 2 == 0) ProcessKind.BLOCKING else ProcessKind.WAIT_POINT, spin)
-                assertTrue(m.lock.tryLock(5, java.util.concurrent.TimeUnit.SECONDS), "$i 回目の後にマシンのロックが取れない: ${m.lock}")
-                m.lock.unlock()
+                m.lock.awaitAcquirable("$i 回目の後にマシンのロックが取れない")
             }
             m.stop()
             h.tickUntilTrue("止まらない") { m.state == MachineState.STOPPED }

@@ -28,7 +28,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 実行ファイルの読み込み（コンパイル）を待つ起動・プロセスと、停止・取り消し（#344） */
 class CompileWaitTest {
@@ -194,10 +194,10 @@ class CompileWaitTest {
         assertEquals(1, loading.size, "読み込むスレッドは 1 本")
         assertTrue(booting.all { it.isBooting })
 
-        val started = System.nanoTime()
+        // 読み込みは門で止めたまま（テストの finally まで開けない）なので、close が読み込みを待つなら停止は終わらず、保険のタイムアウトが落とす。
+        // 経過時間の上限で合否を決めない（#980）
         h.scheduler.close()
-        assertTrue(h.scheduler.awaitTermination(5_000), "読み込みを待つものが残っている")
-        assertTrue(Duration.ofNanos(System.nanoTime() - started) < Duration.ofSeconds(5))
+        h.scheduler.awaitTerminationOrFail("読み込みを待つものが残っている")
         eventually { booting.none { it.isBooting } }
         assertEquals(0, h.scheduler.programs.loadingCount)
         // 止めた起動は失敗を知らせない。プロセスは止められて終わる
@@ -249,7 +249,7 @@ class CompileWaitTest {
         tickUntil { m.stateOf(child).isTerminal }
         assertEquals(ProcessState.EXITED, m.stateOf(child))
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -264,7 +264,7 @@ class CompileWaitTest {
         assertEquals(ProcessState.EXITED, m.stateOf(pid))
         assertEquals(Errno.NOEXEC, (out.get() as FsException).errno)
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -289,7 +289,7 @@ class CompileWaitTest {
         gate.countDown()
         eventually { h.scheduler.programs.loadingCount == 0 }
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -318,8 +318,8 @@ class CompileWaitTest {
         assertTrue(otherOut.get() is Int)
         m.stop()
         other.stop()
-        assertTrue(m.awaitTermination(5_000))
-        assertTrue(other.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
+        other.awaitTerminationOrFail()
     }
 
     @Test
@@ -365,7 +365,7 @@ class CompileWaitTest {
         eventually { programs.pendingGroupCount == 0 }
         for (machine in listOf(m, booting, other)) {
             machine.stop()
-            assertTrue(machine.awaitTermination(5_000))
+            machine.awaitTerminationOrFail()
         }
     }
 
@@ -389,7 +389,7 @@ class CompileWaitTest {
         assertEquals(1L, h.scheduler.programs.loads.get())
         assertEquals(1, loading.size)
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
     @Test
     fun `持ち主の台が止まったら相乗りされた読み込みは数から外れ、次の起動のinitが通る`() = env {
@@ -429,8 +429,8 @@ class CompileWaitTest {
         assertEquals(0, programs.pendingOf(b.id))
         a.stop()
         b.stop()
-        assertTrue(a.awaitTermination(5_000))
-        assertTrue(b.awaitTermination(5_000))
+        a.awaitTerminationOrFail()
+        b.awaitTerminationOrFail()
     }
 
     @Test
@@ -452,8 +452,8 @@ class CompileWaitTest {
         assertEquals(1, loading.size)
         first.stop()
         second.stop()
-        assertTrue(first.awaitTermination(5_000))
-        assertTrue(second.awaitTermination(5_000))
+        first.awaitTerminationOrFail()
+        second.awaitTerminationOrFail()
     }
 
     @Test
@@ -486,7 +486,7 @@ class CompileWaitTest {
         repeat(5) { h.scheduler.tick() }
         assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -517,7 +517,7 @@ class CompileWaitTest {
         assertEquals(MachineState.RUNNING, m.state)
         assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test

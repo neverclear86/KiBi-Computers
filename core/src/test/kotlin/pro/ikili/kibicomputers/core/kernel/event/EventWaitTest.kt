@@ -34,7 +34,7 @@ import pro.ikili.kibicomputers.core.kernel.withLockValue
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** スケジューラの上でイベントキューを待つ（#63）。 */
 class EventWaitTest {

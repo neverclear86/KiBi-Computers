@@ -11,7 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 標準 OS の `/sbin/init`（#100）を、起動の手順（#49）で pid 1 として動かして確かめる。
@@ -117,7 +117,7 @@ class InitTest {
                 Thread.sleep(1)
                 m.state == MachineState.STOPPED
             }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             synchronized(host.timed) { host.timed.toList() }
         }
     }

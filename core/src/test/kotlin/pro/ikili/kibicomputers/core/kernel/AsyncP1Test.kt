@@ -36,7 +36,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 読み込み時の待機点への変換（#329）をかけた p1 のコマンドを、実際の Endive と `Machine.exec` で動かす。

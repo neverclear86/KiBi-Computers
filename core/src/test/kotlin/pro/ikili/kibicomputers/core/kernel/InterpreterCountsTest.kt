@@ -21,7 +21,7 @@ import java.util.logging.Handler
 import java.util.logging.Level
 import java.util.logging.LogRecord
 import java.util.logging.Logger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * インタプリタで動くコードを持つプログラムの数え口（#931、ADR 0088 の「追記（#931）」）: プロセスを作るたびに台とスケジューラに数え、

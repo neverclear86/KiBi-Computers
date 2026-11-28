@@ -8,7 +8,7 @@ import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.kernel.Harness
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** スピーカーのデバイス（#65、ADR 0065）: 丸め、配っていない分の上限、tick の中で鳴らす */
 class SpeakerDeviceTest {

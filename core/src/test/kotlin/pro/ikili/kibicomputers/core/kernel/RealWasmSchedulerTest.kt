@@ -12,7 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import java.time.Duration
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 実際の Endive で、燃料を計測しない読み込み（[SharedPrograms.load]。挿入なし）の WASM を動かす。
@@ -65,7 +65,7 @@ class RealWasmSchedulerTest {
             eventually { h.scheduler.activeProcesses == 1 }
             assertThrows<TimeoutException> { h.scheduler.pauseAll(100) }
             m.stop()
-            assertTrue(m.awaitTermination(10_000))
+            m.awaitTerminationOrFail()
             assertState(ProcessState.KILLED, m, pid)
         }
     }

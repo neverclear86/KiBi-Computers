@@ -14,7 +14,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** シバン（`#!/bin/lua`）付きの Lua スクリプトを、exec で直接起動する（#93）。実際の Endive と `lua.wasm` で動かす */
 class LuaShebangTest {

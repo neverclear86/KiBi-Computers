@@ -26,7 +26,7 @@ import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.UUID
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 復号する前にモジュールの参照だけを読む [SnapshotDecoder.moduleSources]・[P1SectionCodec.readModuleSource]（#577、#587）。

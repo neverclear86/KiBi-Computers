@@ -16,7 +16,9 @@ import java.util.OptionalLong
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
+import pro.ikili.kibicomputers.core.kernel.closeOrFail
+import pro.ikili.kibicomputers.core.kernel.flushOrFail
 
 /** 仕事を溜め、テストが手で1つずつ進める [SaveExecutor]（入れた順に走る） */
 internal class ManualSaveExecutor : SaveExecutor {
@@ -504,7 +506,7 @@ class MachineSaveStoreAsyncTest {
     fun `finishedCountは、閉じた後に断られた仕事も1つにつき1回だけ数える`() {
         val identity = store.assignNewId(p)!!
         val written = store.submit(identity, p, src(), null)
-        assertTrue(store.close(1000))
+        store.closeOrFail()
         store.pollCompleted()
         val start = store.finishedCount
         store.submit(written.identity, p, src(), null)
@@ -551,7 +553,7 @@ class MachineSaveStoreAsyncTest {
     @Test
     fun `閉じた後の予約は失敗の完了で返る`() {
         val identity = store.assignNewId(p)!!
-        assertTrue(store.close(1000))
+        store.closeOrFail()
         val pending = store.submit(identity, p, src(10), null)
         val completion = store.pollCompleted().single()
         assertSame(pending, completion.pending)
@@ -621,7 +623,7 @@ class MachineSaveStoreAsyncTest {
             assertNull(OwnerRecord.read(s.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME)), "列が止まっている間は何も書かない")
             assertFalse(s.awaitRestorable(identity.id, 0), "世代の書き込みが残っている間は、復元を待たせる")
             gate.countDown()
-            assertTrue(s.flush(10_000))
+            s.flushOrFail()
             assertTrue(Files.exists(s.generationFile(identity.id, 1)), "前の世代の書き込みも済む")
             assertEquals(OwnerRecord(1, q), OwnerRecord.read(s.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME)), "引き取りの owner.bin が後に書かれる")
             assertEquals(1, s.pollCompleted().size, "owner.bin だけの仕事の完了は返さない")

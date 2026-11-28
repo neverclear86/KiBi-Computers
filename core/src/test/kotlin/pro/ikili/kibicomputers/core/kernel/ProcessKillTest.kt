@@ -21,7 +21,7 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 強制終了（最小限のシグナル）と Ctrl+C（#46、ADR 0046） */
 class ProcessKillTest {
@@ -76,7 +76,7 @@ class ProcessKillTest {
             assertFalse(m.stateOf(other).isTerminal, "ほかのプロセスは止まらない")
             assertEquals(MachineState.RUNNING, m.state)
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -210,7 +210,7 @@ class ProcessKillTest {
             assertEquals(KillResult.DELIVERED, m.kill(pid, KillSignal.KILL))
             h.tickUntilTrue { m.stateOf(pid).isTerminal }
             assertEquals(ExitStatus(pid, ExitReason.KILLED, 0, KillSignal.KILL), m.exitStatusOf(pid))
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -241,7 +241,7 @@ class ProcessKillTest {
             h.tickUntilTrue { m.stateOf(pid).isTerminal }
             assertTrue(thrown.get() is ProcessKilledException)
             assertEquals(ExitStatus(pid, ExitReason.KILLED, 0, KillSignal.TERMINATE), m.exitStatusOf(pid))
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -266,7 +266,7 @@ class ProcessKillTest {
             h.tickUntilTrue { true }
             assertFalse(m.stateOf(bystander).isTerminal, "前のプロセスでないものは止まらない")
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 }
