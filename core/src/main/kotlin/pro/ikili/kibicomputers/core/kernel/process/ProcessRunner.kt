@@ -500,6 +500,8 @@ internal class ProcessRunner(private val machine: Machine) {
                 if (!rt.process.state.isTerminal) machine.cpu.enqueueThreadless(rt)
             }
             machine.clearPendingScheduleLocked(rt)
+            // 燃料待ちを起こすのがこのスレッドで止まっていたら、続きを起こす（#956）。止められたときも終えた後に呼ぶ（終わった待ち手は列から外して飛ばす）
+            machine.fuelWaiterThreadDetachedLocked(rt)
             if (rt.process.kind == ProcessKind.BLOCKING) {
                 scheduler.dedicatedThreads.remove(Thread.currentThread())
             }

@@ -2898,18 +2898,31 @@ public class Machine private constructor(
      * [addFuelWaiterLocked]）。スレッドを持たないプロセスはその順で CPU の待ち行列に並び、スレッドを持つ待ち手もその順で位置を予約する
      * （[MachineCpu.reserve]。起こされたスレッドが着くまでの間も、待つ者に数える。#742、#737）。
      * 起こすたびに先頭をずらさないのは、ずらすと tick をまたぐ順番が実行の様子（巻き戻して譲るたびに起こす回数）で変わり、プロセスが
-     * 1 tick のスライスの数より多いときに配分が偏るため（#47、ADR 0047）
+     * 1 tick のスライスの数より多いときに配分が偏るため（#47、ADR 0047）。
+     *
+     * スレッドを持たない待ち手で、燃料待ちに入った step のスレッドがまだ外れていないものに来たら、そこで止める（#956）。その待ち手から後ろは
+     * 列に残し、スレッドが外れたら（[fuelWaiterThreadDetachedLocked]）続きを起こす（その tick の燃料が残っていれば。尽きていれば列の前に残り、次の tick に先に起こされる）。止めずに起こすと、その待ち手が CPU の待ち行列に
+     * 入るのはスレッドが外れてから（[ProcessRuntime.pendingSchedule]）になり、列で後ろにいる待ち手（スライスを使い切った側）に先を越されて、
+     * tick の境目の順がスレッドの外れ方でぶれ、同じ側が続けて得をした
      */
     internal fun wakeFuelWaitersLocked(): Int {
         if (fuelWaiters.isEmpty() || scheduler.isPausedFor(this)) return 0
         val hasFuel = fuelAccount.estimate(scheduler.now) > 0
         var woken = 0
+        fuelWakeBlockedBy = null
         for (rt in fuelWaiters.toList()) {
             if (rt.process.state.isTerminal) {
                 fuelWaiters.remove(rt)
                 continue
             }
             if (!hasFuel && !rt.process.unmetered) continue
+            if (rt.fuelWaitThreadless && rt.thread != null) {
+                // 燃料待ちに入った step のスレッドがまだ外れていない（#956）: ここで起こすと、CPU の待ち行列に入るのはスレッドが外れてから
+                // （pendingSchedule）になり、列で後ろの待ち手に先を越される。この待ち手から後ろは列に残し、スレッドが外れたら続きを起こす
+                // （[fuelWaiterThreadDetachedLocked]）
+                fuelWakeBlockedBy = rt
+                break
+            }
             fuelWaiters.remove(rt)
             rt.fuelWaitBehindCpu = false
             woken++
@@ -2927,6 +2940,22 @@ public class Machine private constructor(
             }
         }
         return woken
+    }
+
+    /**
+     * 燃料待ちを起こすのを止めた待ち手（[wakeFuelWaitersLocked]。スレッドを持たない待ち手で、燃料待ちに入った step のスレッドがまだ外れていなかったもの。
+     * #956）。実行時だけ（保存しない）。カーネルロックの中で読み書きする
+     */
+    private var fuelWakeBlockedBy: ProcessRuntime? = null
+
+    /**
+     * step のスレッドが [rt] から外れた（`rt.thread = null` の直後。カーネルロックの中で呼ぶ）。[rt] で燃料待ちを起こすのを止めていたら、
+     * 続きを列の順に起こす（#956）。止めている間も待ち手は燃料待ちの列に残る（スライスを使い切った側は、待つ者がいると見て譲る）
+     */
+    internal fun fuelWaiterThreadDetachedLocked(rt: ProcessRuntime) {
+        if (fuelWakeBlockedBy !== rt) return
+        fuelWakeBlockedBy = null
+        wakeFuelWaitersLocked()
     }
 
     /** ディスパッチャーから: 燃料待ちを起こし、（起こした数, まだ残っているか）を返す */
