@@ -432,7 +432,7 @@ internal object ComponentValidationCost {
          * 型を付けたコンポーネントの export の確認での、[target] のたどれるインスタンス型の explicit な resource の表の写しを数える（#964 のレビュー）。
          * wasmparser のコンポーネントの部分型の確認（`SubtypeCx::component_type`）は、確かめるたびに import・export の
          * インスタンス型を `remap_component_instance_type_id` で写し直す（表を丸ごと写す）。写し直しの大きさ（[Info.local]）は
-         * 型の確認の大きさ（[check]）に入っているので、表の件数だけを足す。引けなければ、それまでの最大
+         * 型を付けた export の確認の大きさ（[checkAscribed]。渡す側と付けた型の両方）に入っているので、表の件数だけを足す。引けなければ、それまでの最大
          */
         private fun remapExplicit(target: Info?) {
             val n = if (target == null) {

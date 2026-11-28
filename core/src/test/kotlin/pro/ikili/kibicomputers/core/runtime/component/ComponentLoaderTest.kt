@@ -1705,7 +1705,7 @@ class ComponentLoaderTest {
         assertTrue(e.remapCost >= 10L * 100 * 100) { "${e.remapCost}" }
         // 型の確認は、渡す側（空のコンポーネント）の大きさだけ（受ける側を足すと、写し直しと二重に数える）。型のたどり（#955）は別に数える
         assertTrue(e.cost - e.remapCost - e.scanCost <= 1_000L * 2) { "${e.cost} - ${e.remapCost} - ${e.scanCost}" }
-        // この形の見積もり（約 30 万）は既定の上限に収まり、実際の検証も通る（検証に通らない形を測っているのではない）
+        // この形の見積もり（約 20 万）は既定の上限に収まり、実際の検証も通る（検証に通らない形を測っているのではない）
         assertTrue(e.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${e.cost}" }
         assertDoesNotThrow { ComponentLoader.load(bytes) }
 
