@@ -270,6 +270,15 @@ internal object Asyncify {
         return Prepared(wasm, module, originalFunc, fuelSites)
     }
 
+    /**
+     * [wasm] の `call_indirect`・`call_ref` を、参照が取られうる関数で絞れるか（テスト用。#338）。絞れないときは、その理由。
+     * 読めないときも黙って型だけの判定に戻る（変換の結果は正しいまま、絞り込みだけが効かなくなる）ので、テストで形ごとに確かめる
+     */
+    internal fun indirectNarrowing(wasm: ByteArray): IndirectNarrowing {
+        val module = parse(wasm)
+        return Transformer(wasm, module, emptySet(), null, { it }, {}, emptySet()).indirectNarrowing()
+    }
+
     /** 予約した名前をすでに使っていたら断る（プレイヤーが退避した値や状態を自分で書き換えられてしまう） */
     private fun checkReserved(module: WasmModule) {
         val imports = module.importSection()
@@ -284,6 +293,24 @@ internal object Asyncify {
             if (exports.getExport(i).name() == WasmAsync.STATE_EXPORT) throw WasmLoadException("${WasmAsync.STATE_EXPORT} は予約された export")
         }
     }
+}
+
+/** 関数の参照を運べない参照型（i31ref と、null だけの none・nofunc・noextern・noexn。`Transformer.foreignFuncRefs`） */
+private val NO_FUNC_REFS = setOf(0x6C, 0x71, 0x72, 0x73, 0x74)
+
+/** [Asyncify.indirectNarrowing] の結果（#338） */
+internal enum class IndirectNarrowing {
+    /** 参照が取られうる関数で絞れる */
+    NARROWED,
+
+    /** 初期値の式を持つテーブルがあるので、すべての関数を取られうるとみなす */
+    TABLE_INIT_EXPR,
+
+    /** 要素・グローバル・テーブルのセクションを読めなかったので、すべての関数を取られうるとみなす */
+    UNREADABLE,
+
+    /** 関数の番号の範囲を超えた参照があるので、すべての関数を取られうるとみなす */
+    OUT_OF_RANGE,
 }
 
 private const val UNWINDING = 1
@@ -621,11 +648,15 @@ private class Transformer(
      * import・export したテーブルがある（`table.get`・`table.copy` で、import も export もしていないテーブルに移せる）、
      * funcref のグローバルを import・export している、import・export した関数の引数・結果に funcref がある（`table.set` で入れられる）、
      * funcref を運ぶタグがある（例外の値で渡せる）。型を追えない参照型（[BOT]）は funcref かもしれないので、同じく `true` にする。
+     * funcref 以外の参照型（anyref・eqref・structref・arrayref・externref・exnref）も、funcref のフィールドを持つ struct・array
+     * （externref は `any.convert_extern` で戻したもの、exnref は `try_table` で取り出した例外の値）を運べる（`ref.cast` → `struct.get` →
+     * `table.set` で、import も export もしていないテーブルに入れられる）ので `true` にする（#338。参照が取られない関数を外したので、
+     * 外から入る参照はここで全部拾う必要がある）。中身を持てない i31ref と、null だけの型（none・nofunc・noextern・noexn）だけは外す。
      * 参照が入りうるかだけを見る（テーブルへの命令の流れは追わない）ので、実際には入らなくても `true` になることがある
      * （そのときは止まりうるとみなす関数が増えるだけで、変換は正しい）
      */
     private val foreignFuncRefs: Boolean by lazy {
-        fun mayHoldFunc(t: Int) = t == FUNCREF || t == BOT
+        fun mayHoldFunc(t: Int) = t == BOT || (isRef(t) && t !in NO_FUNC_REFS)
         fun sigMayHoldFunc(s: Sig) = s.params.any(::mayHoldFunc) || s.results.any(::mayHoldFunc)
         if (sharedTables.any { it }) return@lazy true
         if (tagSigs.any(::sigMayHoldFunc)) return@lazy true
@@ -717,9 +748,13 @@ private class Transformer(
      * 要素セグメント（能動・パッシブ・宣言のすべての形の、関数の番号の並びと式の `ref.func`）、グローバルの初期値の `ref.func`、
      * 関数の本体の `ref.func`（Endive の検証が「宣言済みの関数だけ」を確かめていると決めつけず、すべて集める）、export した関数
      * （ほかのモジュールが import して、共有するテーブルや関数の参照に入れられる）。import した関数も、同じ規則で入る。
+     * ここで集めるのは、このモジュールの中で作る参照だけ。コンポーネントでほかのモジュールから入る関数の参照（このモジュールが import していて
+     * 参照を取っていない関数のものも含む）は、外の型（[externallyMaySuspend]）で止まりうるとみなす。入りうる経路は [foreignFuncRefs] が
+     * 型で網羅する（p1 は外の型が空で、ホストは関数の参照を作らない）。
      * 初期値の式を持つテーブル（関数参照の提案）があるとき、または要素・グローバル・テーブルのセクションを読めなければ `null`（すべての関数を取られうるとみなす。前と同じ判定。読めないものは、変換の写しが同じく断る）
      */
     private fun referencedFuncs(bodies: List<List<AnnotatedInstruction>>): BooleanArray? {
+        narrowing = IndirectNarrowing.NARROWED
         val referenced = BooleanArray(funcSigs.size)
         var outOfRange = false
         fun mark(idx: Long): Long {
@@ -738,7 +773,10 @@ private class Transformer(
                 when (s.id) {
                     // 初期値の式を持つテーブル（関数参照の提案の `0x40 0x00` の形）は、式の `ref.func` を追わず、すべてを取られうるとみなす
                     4 -> repeat(r.leb().toInt()) {
-                        if (r.u8() == 0x40) return null
+                        if (r.u8() == 0x40) {
+                            narrowing = IndirectNarrowing.TABLE_INIT_EXPR
+                            return null
+                        }
                         r.pos--
                         r.copyValType(Sink())
                         val flags = r.u8()
@@ -755,9 +793,23 @@ private class Transformer(
                 }
             }
         } catch (e: Exception) {
+            narrowing = IndirectNarrowing.UNREADABLE
             return null
         }
-        return if (outOfRange) null else referenced
+        if (outOfRange) {
+            narrowing = IndirectNarrowing.OUT_OF_RANGE
+            return null
+        }
+        return referenced
+    }
+
+    /** 最後の [referencedFuncs] の結果の形（テスト用。#338） */
+    private var narrowing = IndirectNarrowing.NARROWED
+
+    /** 参照が取られうる関数で絞れるか、絞れないならその理由（テスト用。#338。[Asyncify.indirectNarrowing]） */
+    fun indirectNarrowing(): IndirectNarrowing {
+        referencedFuncs(bodies())
+        return narrowing
     }
 
     fun run(): Asyncify.Result {

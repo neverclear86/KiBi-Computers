@@ -21,18 +21,19 @@ class AsyncifyIndirectTest {
 
     /**
      * 止まりうる関数 `$f`（`() -> i32`）と、同じ型の止まらない `$g` を持つモジュール。`run` は `call_indirect (type $v_i)` で表の 0 番を呼ぶ。
-     * [refs] は `$f` の参照を取る（かもしれない）ものの宣言
+     * [refs] は `$f` の参照を取る（かもしれない）ものの宣言。[tables] は表の宣言（`run` は 0 番の表を呼ぶ）
      */
     private fun module(
         refs: String,
         table: String = "(elem (i32.const 0) \$g)",
         call: String = "(call_indirect (type \$v_i) (i32.const 0))",
+        tables: String = "(table 2 funcref)",
     ) = WitTool.wat(
         """
         (module
           (type ${'$'}v_i (func (result i32)))
           (import "w" "wait" (func ${'$'}wait (result i32)))
-          (table 2 funcref)
+          $tables
           $table
           $refs
           (func ${'$'}f (type ${'$'}v_i) (call ${'$'}wait))
@@ -60,6 +61,24 @@ class AsyncifyIndirectTest {
         """.trimIndent(),
     )
 
+    /** セクション [id] の中身（なければ `null`） */
+    private fun section(wasm: ByteArray, id: Int): ByteArray? {
+        var pos = 8
+        while (pos < wasm.size) {
+            val sid = wasm[pos++].toInt()
+            var size = 0
+            var shift = 0
+            do {
+                val b = wasm[pos++].toInt() and 0xFF
+                size = size or ((b and 0x7F) shl shift)
+                shift += 7
+            } while (b and 0x80 != 0)
+            if (sid == id) return wasm.copyOfRange(pos, pos + size)
+            pos += size
+        }
+        return null
+    }
+
     /** 要素セクションの最初の要素セグメントの flag（要素セグメントが 1 つだけのモジュールで、その形を確かめる） */
     private fun firstElemFlag(wasm: ByteArray): Int {
         var pos = 8
@@ -82,6 +101,7 @@ class AsyncifyIndirectTest {
     @Test
     fun `型が同じでも、参照の取られない止まりうる関数があるだけでは、call_indirectは止まりうるとみなさない`() {
         val wasm = module("")
+        assertEquals(IndirectNarrowing.NARROWED, Asyncify.indirectNarrowing(wasm))
         assertEquals(emptySet<String>(), exports(wasm))
         // 変換するのは $f だけ（run は番号の付け替えだけ）
         assertEquals(1, Asyncify.transform(wasm, setOf("w.wait")).instrumented)
@@ -169,7 +189,79 @@ class AsyncifyIndirectTest {
     @Test
     fun `初期値の式を持つテーブルがあれば、型だけで判定する`() {
         val wasm = module("(table 1 funcref (ref.func \$f))")
+        // 読めずに戻ったのではなく、初期値の式（0x40）を見つけて戻った
+        assertEquals(IndirectNarrowing.TABLE_INIT_EXPR, Asyncify.indirectNarrowing(wasm))
         assertEquals(setOf("run"), exports(wasm))
+    }
+
+    /**
+     * テーブルのセクションの読み（上限の LEB・型付きの要素型の型の番号）を通る形でも、絞り込みが効く。
+     * 読みを誤ると黙って型だけの判定に戻る（変換は正しいまま、絞り込みだけが無効になる）ので、形ごとに確かめる。
+     * `bytes` は、テーブルのセクションにあるはずのバイトの並び（wat が思った形で書き出したか）
+     */
+    @Test
+    fun `上限つき・型付きの要素型・複数のテーブルでも、参照の取られない止まりうる関数で絞る`() {
+        val typedElem = "(elem (table 0) (i32.const 0) (ref null \$v_i) (ref.func \$g))"
+        val plainElem = "(elem (i32.const 0) \$g)"
+
+        class Form(val tables: String, val elem: String, val bytes: List<Int>)
+        val forms = linkedMapOf(
+            // clang・wasm-ld がふつうに出す、上限つきの funcref（flag 1、min 2、max 2）
+            "上限つきの funcref" to Form("(table 2 2 funcref)", plainElem, listOf(0x70, 0x01, 0x02, 0x02)),
+            // 型付きの要素型（0x63 と型の番号 0）
+            "型付きの要素型" to Form("(table 2 (ref null \$v_i))", typedElem, listOf(0x63, 0x00, 0x00, 0x02)),
+            "上限つきの型付きの要素型" to Form("(table 2 3 (ref null \$v_i))", typedElem, listOf(0x63, 0x00, 0x01, 0x02, 0x03)),
+            // 後ろに externref の表（上限が 2 バイトの LEB）が続く
+            "複数のテーブル" to Form("(table 2 funcref) (table 1 300 externref)", plainElem, listOf(0x6F, 0x01, 0x01, 0xAC, 0x02)),
+        )
+        for ((name, form) in forms) {
+            val wasm = module("", table = form.elem, tables = form.tables)
+            val tableSection = section(wasm, 4)!!.map { it.toInt() and 0xFF }
+            assertTrue(java.util.Collections.indexOfSubList(tableSection, form.bytes) >= 0, "$name: テーブルのセクションが $tableSection")
+            assertEquals(IndirectNarrowing.NARROWED, Asyncify.indirectNarrowing(wasm), name)
+            assertEquals(emptySet<String>(), exports(wasm), name)
+            // 型付きの参照型のテーブルを持つモジュールは、止まりうる関数があると変換が断る（型付きの参照型に未対応）ので、解析だけを見る
+            if (form.bytes[0] != 0x63) {
+                val result = Asyncify.transform(wasm, setOf("w.wait"))
+                assertEquals(1, result.instrumented, name)
+                assertEquals(7L, run(result.bytes), name)
+            }
+            // 同じ形で $f の参照を取れば、止まりうる
+            assertEquals(setOf("run"), exports(module("(elem declare func \$f)", table = form.elem, tables = form.tables)), name)
+        }
+    }
+
+    /**
+     * 閉じたテーブルへの `call_indirect` に外の型（#757）を当てるかは、外の関数の参照が入りうるか（`foreignFuncRefs`）で決まる。
+     * funcref のフィールドを持つ struct・array は anyref などで受け取れて、`ref.cast` → `struct.get` → `table.set` で閉じたテーブルに
+     * 入れられるので、funcref 以外の参照型の引数・結果・グローバルも、入りうるとみなす（#338。参照の取られない止まりうる関数を外したので、
+     * 同じ型の止まりうる関数がモジュールにあっても、外から入る参照はこちらで拾う）
+     */
+    @Test
+    fun `funcrefを運べる参照型をimport・exportしていれば、閉じたテーブルにも外の型を当てる`() {
+        val external = setOf(Asyncify.Signature(emptyList(), listOf(0x7F)))
+        fun closed(extra: String) = WitTool.wat(
+            """
+            (module
+              (type ${'$'}v_i (func (result i32)))
+              (import "w" "wait" (func ${'$'}wait (result i32)))
+              $extra
+              (table 1 funcref)
+              (func (export "run") (result i32) (call_indirect (type ${'$'}v_i) (i32.const 0))))
+            """.trimIndent(),
+        )
+        fun exports(wasm: ByteArray) = Asyncify.prepare(wasm).analyze(setOf("w.wait"), external).suspendableExports
+        // 何も入らない閉じたテーブル（参照の取られない止まりうる import $wait は同じ型だが、表には入らない）
+        assertEquals(emptySet<String>(), exports(closed("")))
+        for (t in listOf("anyref", "eqref", "structref", "arrayref", "externref", "funcref")) {
+            assertEquals(setOf("run"), exports(closed("(import \"x\" \"get\" (func (result $t)))")), "import の結果 $t")
+            assertEquals(setOf("run"), exports(closed("(func (export \"set\") (param $t))")), "export の引数 $t")
+            assertEquals(setOf("run"), exports(closed("(import \"x\" \"g\" (global $t))")), "import のグローバル $t")
+        }
+        // 中身を持てない i31ref と、null だけの型は入りえない
+        for (t in listOf("i31ref", "nullref", "nullfuncref", "nullexternref")) {
+            assertEquals(emptySet<String>(), exports(closed("(func (export \"set\") (param $t))")), "export の引数 $t")
+        }
     }
 
     /** 止まりうる関数の、参照が取られない呼び出しの鎖の先に、参照が取られる関数がある形。鎖の途中の型で絞らない（参照が取られるのは鎖の先頭） */
