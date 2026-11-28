@@ -523,7 +523,13 @@ class ComponentStackExhaustionLockTest {
      *
      * 回ごとに、[edgeSweep] と同じ確かめ（終わった回は結果が期待値、尽きた回はプロセスだけが `call stack exhausted` で終わり、位置がロックの
      * 途中でなく、ロック・同じ台・別の台が動き続ける）に加えて、尽きた回の後に退避した値（`asyncStack`）が残らないことを見る。
-     * [BATCH] 回ごとに、詰め物のない `wind` が巻き戻し・巻き直しを経て期待値で終わること（同じ台で次のプロセスが正しく動く）も見る
+     * [BATCH] 回ごとに、詰め物のない `wind` が巻き戻し・巻き直しを経て期待値で終わること（同じ台で次のプロセスが正しく動く）も見る。
+     *
+     * 1 回目の通りで燃料切れの巻き戻しが 1 度も起きずに終わる回がある（#983）: 同じ台の競争相手が CPU を待っておらず、tick も進まない
+     * うちに `wind` が終わると、燃料切れのたびにその場でスライスを足す（`renewSliceLocked`。ADR 0047 の本番の振る舞い）。その回は
+     * 巻き直しの通りがなく、足す詰め物が効かないので、`kA`・`kB` の探索では条件を満たさない回として同じ値で回し直す（値ごとに
+     * [NO_UNWIND_RETRIES] 回まで）。回し直しが尽きたときや、倍々が上限に当たったときは、境目から探し直す（[WINDOW_ATTEMPTS] 回まで）。
+     * 回し直した回数と探し直した回数は、`#903 component rewind:` の行に出す
      */
     private fun rewindSweep(rounds: Int) {
         val kind = ProcessKind.WAIT_POINT
@@ -536,10 +542,17 @@ class ComponentStackExhaustionLockTest {
         var width = 0
         var stride = 0
         val windows = mutableListOf<String>()
+        var noUnwindRetries = 0
+        var windowRedos = 0
+        // 最近の回（探し直しが尽きたときの説明に付ける）
+        val recent = ArrayDeque<String>()
         overdraftsExpected = false
         onMachines(kind, tally) { r ->
-            /** 1 回目の通りを [pad] 段、巻き直しの通りを [pad] + [extra] 段の詰め物で `wind` を動かし、尽きた区画（終わったら `null`）を返す */
-            fun run(pad: Int, extra: Int): String? {
+            /**
+             * 1 回目の通りを [pad] 段、巻き直しの通りを [pad] + [extra] 段の詰め物で `wind` を動かし、尽きた区画（終わったら `null`）と、
+             * 燃料切れで巻き戻したかを返す
+             */
+            fun run(pad: Int, extra: Int): Outcome {
                 val d = driver(kind, "wind", pad, resumeExtra = extra)
                 val rt = r.m.spawnRt(program, d)
                 awaitEnd(r, rt, "pad $pad + $extra")
@@ -549,11 +562,32 @@ class ComponentStackExhaustionLockTest {
                     assertEquals(expectedWind, d.result.get(), "巻き直しの余裕を減らして終わった回の結果が違う（pad $pad + $extra、巻き戻し ${d.unwinds.get()} 回）")
                 } else {
                     assertCrashedBySoe(rt, r.m, "pad $pad + $extra")
+                    // 巻き戻し・巻き直しの途中で尽きても、退避した値はプロセスの終わりで捨てられる。
+                    // finishLocked はロックの中で状態を終わりにしてから、同じロックのまま退避した値を捨てるので、状態が終わりに見えた
+                    // 直後は捨てる前のことがある（冷えた JIT では幅が広い。#984 の直列の組で 2 回続けて当たった）。ロックを取ってから見る
+                    // （テストのスレッドが待ち行列に入らないよう、checkAlive と同じく tryLock で取る）。
+                    // 巻き戻し・巻き直しの印（`fuelUnwound`・`rewindingForFuel`。ワーカーが書く素のフィールド）も、同じロックの中でまとめて読む
+                    var asyncLeft = false
+                    var unwoundFlag = false
+                    var rewindingFlag = false
+                    awaitOrClassify(r.ticker, "退避した値を見るロックが取れる（pad $pad + $extra）", { describe(r, rt) }) {
+                        r.m.lock.tryLock(HEADROOM_LOCK_PROBE_MILLIS, TimeUnit.MILLISECONDS).also { locked ->
+                            if (locked) {
+                                try {
+                                    asyncLeft = rt.process.asyncStack?.isEmpty == false
+                                    unwoundFlag = rt.fuelUnwound
+                                    rewindingFlag = rt.rewindingForFuel
+                                } finally {
+                                    r.m.lock.unlock()
+                                }
+                            }
+                        }
+                    }
                     val inCall = d.rewindCallEntered
                     tag = when {
-                        rt.fuelUnwound -> "巻き戻しの最中"
-                        rt.rewindingForFuel && inCall -> "巻き直しの最中"
-                        rt.rewindingForFuel -> "巻き直しの前"
+                        unwoundFlag -> "巻き戻しの最中"
+                        rewindingFlag && inCall -> "巻き直しの最中"
+                        rewindingFlag -> "巻き直しの前"
                         d.unwinds.get() > 0 -> "巻き直した後"
                         else -> "最初の通り"
                     }
@@ -565,32 +599,22 @@ class ComponentStackExhaustionLockTest {
                         if (position != SoePositions.Position.PROBE) inRewindPastProbe++
                     }
                     if (position.isLock) throw AssertionError("スタックがロックを取る・放す途中で尽きた（pad $pad + $extra、$tag）: ${describe(r, rt)}")
-                    // 巻き戻し・巻き直しの途中で尽きても、退避した値はプロセスの終わりで捨てられる。
-                    // finishLocked はロックの中で状態を終わりにしてから、同じロックのまま退避した値を捨てるので、状態が終わりに見えた
-                    // 直後は捨てる前のことがある（冷えた JIT では幅が広い。#984 の直列の組で 2 回続けて当たった）。ロックを取ってから見る
-                    // （テストのスレッドが待ち行列に入らないよう、checkAlive と同じく tryLock で取る）
-                    var asyncLeft = false
-                    awaitOrClassify(r.ticker, "退避した値を見るロックが取れる（pad $pad + $extra）", { describe(r, rt) }) {
-                        r.m.lock.tryLock(HEADROOM_LOCK_PROBE_MILLIS, TimeUnit.MILLISECONDS).also { locked ->
-                            if (locked) {
-                                try {
-                                    asyncLeft = rt.process.asyncStack?.isEmpty == false
-                                } finally {
-                                    r.m.lock.unlock()
-                                }
-                            }
-                        }
-                    }
                     assertTrue(!asyncLeft, "尽きた後に退避した値が残った（pad $pad + $extra、$tag）")
                 }
                 checkAlive(r, "pad $pad + $extra", rt)
-                return tag
+                val outcome = Outcome(tag, d.unwinds.get() > 0)
+                if (recent.size == RECENT_OUTCOMES) recent.removeFirst()
+                recent.addLast("$pad+$extra→${outcome.tag ?: "終わった"}/巻き戻し ${d.unwinds.get()}")
+                return outcome
             }
             // 詰め物の再帰を JIT のコンパイルに乗せてから探す（[edgeSweep] と同じ）
             val warmEnd = System.nanoTime() + 500_000_000L
             while (System.nanoTime() < warmEnd) padThen(2000) { 0 }
 
-            /** [predicate] が真になる最小の値（[start] では偽とみなし、倍々で真を見つけて二分で縮める） */
+            /**
+             * [predicate] が真になる最小の値（[start] では偽とみなし、倍々で真を見つけて二分で縮める）。倍々が上限に当たったら、
+             * 探し直しを求める（[Redo]。`findWindow` が境目から探し直す）
+             */
             fun search(start: Int, predicate: (Int) -> Boolean): Int {
                 var lo = start
                 var step = 64
@@ -599,7 +623,7 @@ class ComponentStackExhaustionLockTest {
                     lo = hi
                     step *= 2
                     hi = start + step
-                    check(step < (1 shl 20)) { "詰め物を増やしても尽きない" }
+                    if (step >= (1 shl 20)) throw Redo("詰め物を ${start + step / 2} 段まで増やしても条件を満たさない")
                 }
                 while (hi - lo > 1) {
                     val mid = (lo + hi) / 2
@@ -608,10 +632,10 @@ class ComponentStackExhaustionLockTest {
                 return hi
             }
 
-            /** 1 回目の通りの詰め物と、`kA`・`kB` を探す */
-            fun findWindow(): Triple<Int, Int, Int> {
-                // 両方の通りが同じ詰め物のときの境目（[edgeSweep] の境目）
-                val edge = search(-1) { run(it, 0) != null }
+            /** 1 回目の通りの詰め物と、`kA`・`kB` を 1 回探す。探し直しが要れば [Redo] を投げる */
+            fun findWindowOnce(): Triple<Int, Int, Int> {
+                // 両方の通りが同じ詰め物のときの境目（[edgeSweep] の境目）。巻き戻さずに終わった回も、尽きなかったことは正しい
+                val edge = search(-1) { run(it, 0).tag != null }
                 // 境目は回ごとに揺れ、探している間に JIT でフレームが大きく戻ると、境目の手前のつもりの 1 回目の通りが尽きる
                 // （どれだけ足しても「最初の通り」で、kA が見つからない）。事前の確かめを通った後の kA・kB の探索の途中で起きることも
                 // あるので、探索の述語は 1 回目の通りで尽きた回で探索を打ち切り（真を返して倍々を止める）、1 回目の詰め物を倍々で手前に
@@ -620,17 +644,30 @@ class ComponentStackExhaustionLockTest {
                 while (true) {
                     val start = maxOf(0, edge - margin)
                     // 1 回目の通りで尽きる詰め物では、巻き直しの通りまで届かない。足さなくても 1 回目の通りで尽きるなら下げる
-                    if (start > 0 && run(start, 0) == "最初の通り") {
+                    if (start > 0 && run(start, 0).tag == "最初の通り") {
                         margin *= 2
                         continue
                     }
                     var firstPassCrashed = false
 
-                    /** 1 回目の通りで尽きた回は印を立てて探索を打ち切る。それ以外は [target] で決める */
+                    /**
+                     * 1 回目の通りで尽きた回は印を立てて探索を打ち切る。それ以外は [target] で決める。
+                     *
+                     * 巻き戻さずに終わった回（#983）は、条件を満たさない回として同じ値で回し直す: 同じ台の競争相手が CPU を待っておらず、
+                     * tick も進まないうちに `wind` が終わると、燃料切れのたびにその場でスライスを足して（`renewSliceLocked`。ADR 0047）
+                     * 巻き戻さないので、巻き直しの通りがなく、巻き直しの通りでだけ足す詰め物（[extra]）が効かない。それを「尽きなかった」
+                     * とすると、倍々が上限まで偽で続き、二分探索の段でも窓がずれる。回し直す前に、`run` の終わりの `checkAlive` が、
+                     * 同じ台の spin が進んだ（CPU を取り合う相手が動いている）ことを確かめている
+                     */
                     fun probe(extra: Int, target: (String?) -> Boolean): Boolean {
-                        val tag = run(start, extra)
-                        if (tag == "最初の通り") firstPassCrashed = true
-                        return firstPassCrashed || target(tag)
+                        repeat(NO_UNWIND_RETRIES) {
+                            val o = run(start, extra)
+                            if (o.tag == "最初の通り") firstPassCrashed = true
+                            if (firstPassCrashed) return true
+                            if (o.tag != null || o.unwound) return target(o.tag)
+                            noUnwindRetries++
+                        }
+                        throw Redo("1 回目 $start、足す詰め物 $extra 段で、$NO_UNWIND_RETRIES 回続けて巻き戻さずに終わった")
                     }
                     // 1 回目の通りで尽きた回は、巻き直しの通りが尽きたことにしない
                     val kA = search(-1) { probe(it) { tag -> tag != null } }
@@ -646,12 +683,37 @@ class ComponentStackExhaustionLockTest {
                 }
             }
 
+            /**
+             * 1 回目の通りの詰め物と、`kA`・`kB` を探す。倍々が上限に当たったときや、同じ値で巻き戻さずに終わる回が続いたとき（[Redo]）は、
+             * 境目から探し直す（最大 [WINDOW_ATTEMPTS] 回。尽きたら、探し直した理由・最近の回・スケジューラーの数え口を付けて落とす）
+             */
+            fun findWindow(): Triple<Int, Int, Int> {
+                val reasons = mutableListOf<String>()
+                val renewals0 = r.h.scheduler.fuelSliceRenewals.get()
+                val yields0 = r.h.scheduler.fuelYields.get()
+                val unwinds0 = r.h.scheduler.fuelUnwinds.get()
+                repeat(WINDOW_ATTEMPTS) {
+                    try {
+                        return findWindowOnce()
+                    } catch (e: Redo) {
+                        reasons += e.message!!
+                        windowRedos++
+                    }
+                }
+                throw AssertionError(
+                    "窓を $WINDOW_ATTEMPTS 回探し直しても見つからない: [${reasons.joinToString(" / ")}]、" +
+                        "最近の回 [${recent.joinToString(", ")}]、この間にその場で足した ${r.h.scheduler.fuelSliceRenewals.get() - renewals0} 回、" +
+                        "譲った ${r.h.scheduler.fuelYields.get() - yields0} 回、巻き戻した ${r.h.scheduler.fuelUnwinds.get() - unwinds0} 回、" +
+                        describe(r, null),
+                )
+            }
+
             val count = stackHeadroomRounds(rounds)
             var window = findWindow()
             for (i in 0 until count) {
                 if (i > 0 && i % BATCH == 0) {
                     // 同じ台の次のプロセスが、詰め物なしで巻き戻し・巻き直しを経て正しく終わる
-                    assertEquals(null, run(0, 0), "詰め物のない wind が尽きた")
+                    assertEquals(null, run(0, 0).tag, "詰め物のない wind が尽きた")
                     // 回すうちに JIT でフレームが小さくなると境目が動くので、探し直す
                     window = findWindow()
                 }
@@ -667,7 +729,8 @@ class ComponentStackExhaustionLockTest {
         println(
             "#903 component rewind: 終わった $exited 回、巻き直しの通りで尽きた $secondPass 回、うち巻き直しの最中 $inRewind 回" +
                 "（入口の確かめの外 $inRewindPastProbe 回）、巻き戻しの最中 $inUnwind 回、窓の幅 $width 段、刻み $stride 段、" +
-                "窓 [${windows.joinToString(" / ")}]、${tally.describe()}",
+                "窓 [${windows.joinToString(" / ")}]、巻き戻さずに終わって回し直した $noUnwindRetries 回、窓を探し直した $windowRedos 回、" +
+                "${tally.describe()}",
         )
         assertTrue(secondPass > 0, "巻き直しの通りで 1 度も尽きなかった")
         assertTrue(inRewind > 0, "巻き直しの最中（`LinkedComponent.call` の中）で 1 度も尽きなかった")
@@ -689,7 +752,22 @@ class ComponentStackExhaustionLockTest {
 
         /** [rewindSweep] が、1 回目の通りの詰め物を、両方の通りが同じ詰め物のときの境目から何段手前に置くか */
         const val REWIND_START_MARGIN = 64
+
+        /** [rewindSweep] が、同じ値で巻き戻さずに終わった回を回し直す上限（回） */
+        const val NO_UNWIND_RETRIES = 8
+
+        /** [rewindSweep] が、窓を境目から探し直す上限（回） */
+        const val WINDOW_ATTEMPTS = 8
+
+        /** [rewindSweep] が、探し直しが尽きたときの説明に付ける最近の回の数 */
+        const val RECENT_OUTCOMES = 48
     }
+
+    /** [rewindSweep] の 1 回の結果: 尽きた区画（終わったら `null`）と、燃料切れで巻き戻したか */
+    private class Outcome(val tag: String?, val unwound: Boolean)
+
+    /** [rewindSweep] の窓の探索が、境目から探し直すことを求める（失敗ではない。理由を [message] に持つ） */
+    private class Redo(message: String) : RuntimeException(message)
 
     @Test
     fun `BLOCKINGのコンポーネントでcanonのliftとlowerの中からロックを取る深い再帰を繰り返しても、ロック・CPU・許可は壊れない`() =
