@@ -71,6 +71,13 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 class ComponentStackExhaustionLockTest {
     private val d = "$"
 
+    /**
+     * `wait` の中（プロセスのスレッド）で呼ぶもの（[rewindSweep] が、`wind` の巻き戻しを確実に起こすために使う。#983）。
+     * 設定するのはテストのスレッドで、呼ぶのはプロセスのスレッドなので `@Volatile`
+     */
+    @Volatile
+    private var onWait: (() -> Unit)? = null
+
     /** ホストの関数を呼んだ回数（どちらも呼ばれていることを確かめる） */
     private val echoCalls = AtomicInteger()
     private val pidCalls = AtomicInteger()
@@ -81,6 +88,7 @@ class ComponentStackExhaustionLockTest {
             "test:host/k",
             "wait" to HostFunction(LinkTesting.fn(emptyList(), null), HostWait.UNWIND) { _, _ ->
                 waitCalls.incrementAndGet()
+                onWait?.invoke()
                 null
             },
             "pid" to HostFunction(LinkTesting.fn(emptyList(), CanonType.U32)) { call, _ ->
@@ -527,9 +535,14 @@ class ComponentStackExhaustionLockTest {
      *
      * 1 回目の通りで燃料切れの巻き戻しが 1 度も起きずに終わる回がある（#983）: 同じ台の競争相手が CPU を待っておらず、tick も進まない
      * うちに `wind` が終わると、燃料切れのたびにその場でスライスを足す（`renewSliceLocked`。ADR 0047 の本番の振る舞い）。その回は
-     * 巻き直しの通りがなく、足す詰め物が効かないので、`kA`・`kB` の探索では条件を満たさない回として同じ値で回し直す（値ごとに
-     * [NO_UNWIND_RETRIES] 回まで）。回し直しが尽きたときや、倍々が上限に当たったときは、境目から探し直す（[WINDOW_ATTEMPTS] 回まで）。
-     * 回し直した回数と探し直した回数は、`#903 component rewind:` の行に出す
+     * 巻き直しの通りがなく、足す詰め物が効かない。この形は、同じ値で回し直しても起きなくなる保証がない（競争相手の遅れも tick の
+     * 遅れも、負荷が続く間は続く）ので、回し直しに頼らず、起きないようにする: `wind` の最初の `wait`（手持ちを渡された後、最初の
+     * 燃料切れより前）の中で、プロセスのスレッドから tick を 1 回進める（[onWait]）。`renewSliceLocked` は、手持ちを渡した後に tick が進んで
+     * いれば、競争相手の有無によらずその場で足さない（許可を回す）ので、最初の燃料切れで必ず巻き戻す（譲る）。
+     * 念のための備えは残す: それでも巻き戻さずに終わった回は、`kA`・`kB` の探索では条件を満たさない回として同じ値で回し直し（値ごとに
+     * [NO_UNWIND_RETRIES] 回まで）、回し直しが尽きたときや、倍々が上限に当たったときは、境目から探し直す（[WINDOW_ATTEMPTS] 回まで）。
+     * 巻き戻さずに終わった回数・回し直した回数・探し直した回数は、`#983 回し直し:` の行に毎回出す（CI のログに写る。備えが働けば、
+     * 見立てが当たっていないか、tick で足りない形があるということなので、数が見えることが、見立ての確かめになる）
      */
     private fun rewindSweep(rounds: Int) {
         val kind = ProcessKind.WAIT_POINT
@@ -544,10 +557,21 @@ class ComponentStackExhaustionLockTest {
         val windows = mutableListOf<String>()
         var noUnwindRetries = 0
         var windowRedos = 0
+        // 巻き戻さずに終わった回の数（回し直しの前。tick を進めても起きたかを見る）と、wait の中で tick を進めた回数
+        var noUnwindRuns = 0
+        val forcedTicks = AtomicInteger()
         // 最近の回（探し直しが尽きたときの説明に付ける）
         val recent = ArrayDeque<String>()
         overdraftsExpected = false
+        val renewals0 = AtomicLong()
+        val renewals = AtomicLong()
         onMachines(kind, tally) { r ->
+            renewals0.set(r.h.scheduler.fuelSliceRenewals.get())
+            // 手持ちを渡された後の最初の `wait` で tick を進め、最初の燃料切れで必ず巻き戻させる（KDoc。#983）
+            onWait = {
+                forcedTicks.incrementAndGet()
+                r.ticker.tickNow()
+            }
             /**
              * 1 回目の通りを [pad] 段、巻き直しの通りを [pad] + [extra] 段の詰め物で `wind` を動かし、尽きた区画（終わったら `null`）と、
              * 燃料切れで巻き戻したかを返す
@@ -603,6 +627,7 @@ class ComponentStackExhaustionLockTest {
                 }
                 checkAlive(r, "pad $pad + $extra", rt)
                 val outcome = Outcome(tag, d.unwinds.get() > 0)
+                if (!outcome.unwound && tag == null) noUnwindRuns++
                 if (recent.size == RECENT_OUTCOMES) recent.removeFirst()
                 recent.addLast("$pad+$extra→${outcome.tag ?: "終わった"}/巻き戻し ${d.unwinds.get()}")
                 return outcome
@@ -656,8 +681,8 @@ class ComponentStackExhaustionLockTest {
                      * 巻き戻さずに終わった回（#983）は、条件を満たさない回として同じ値で回し直す: 同じ台の競争相手が CPU を待っておらず、
                      * tick も進まないうちに `wind` が終わると、燃料切れのたびにその場でスライスを足して（`renewSliceLocked`。ADR 0047）
                      * 巻き戻さないので、巻き直しの通りがなく、巻き直しの通りでだけ足す詰め物（[extra]）が効かない。それを「尽きなかった」
-                     * とすると、倍々が上限まで偽で続き、二分探索の段でも窓がずれる。回し直す前に、`run` の終わりの `checkAlive` が、
-                     * 同じ台の spin が進んだ（CPU を取り合う相手が動いている）ことを確かめている
+                     * とすると、倍々が上限まで偽で続き、二分探索の段でも窓がずれる。今は `wait` の中で tick を進めて、この形を起こさない
+                     * ようにしている（[onWait]）ので、ここは念のための備え（回し直しで通る保証はないので、尽きたら探し直しに回る）
                      */
                     fun probe(extra: Int, target: (String?) -> Boolean): Boolean {
                         repeat(NO_UNWIND_RETRIES) {
@@ -725,7 +750,13 @@ class ComponentStackExhaustionLockTest {
                 val offset = if (width <= count) i % width else (i.toLong() * width / count).toInt()
                 run(start, lo + offset)
             }
+            renewals.set(r.h.scheduler.fuelSliceRenewals.get() - renewals0.get())
+            onWait = null
         }
+        println(
+            "#983 回し直し: 巻き戻さずに終わった $noUnwindRuns 回、回し直した $noUnwindRetries 回、窓を探し直した $windowRedos 回、" +
+                "wait の中で tick を進めた ${forcedTicks.get()} 回、その場でスライスを足した ${renewals.get()} 回",
+        )
         println(
             "#903 component rewind: 終わった $exited 回、巻き直しの通りで尽きた $secondPass 回、うち巻き直しの最中 $inRewind 回" +
                 "（入口の確かめの外 $inRewindPastProbe 回）、巻き戻しの最中 $inUnwind 回、窓の幅 $width 段、刻み $stride 段、" +

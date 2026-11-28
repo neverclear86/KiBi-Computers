@@ -4,6 +4,7 @@ import org.junit.jupiter.api.fail
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
@@ -53,6 +54,23 @@ internal class HeadroomTicker(private val h: Harness) : AutoCloseable {
             running.get(HEADROOM_TICK_WAIT_MILLIS, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             // 終わらない tick は、見分けが様子（describe）に出す
+        } catch (e: ExecutionException) {
+            throw e.cause ?: e
+        }
+    }
+
+    /**
+     * tick を 1 回、[tick] とは別に回し、[HEADROOM_TICK_WAIT_MILLIS] まで終わりを待つ。どのスレッドからも呼べる（[tick] の `pending` を触らない。
+     * ホストの関数の中（プロセスのスレッド）から、「手持ちを渡した後に tick が進んだ」状態を確実に作るのに使う。#983）。
+     * 閉じた後は何もしない
+     */
+    fun tickNow() {
+        try {
+            executor.submit { h.scheduler.tick() }.get(HEADROOM_TICK_WAIT_MILLIS, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            // 終わらない tick は、見分けが様子（describe）に出す
+        } catch (_: RejectedExecutionException) {
+            // 閉じた後
         } catch (e: ExecutionException) {
             throw e.cause ?: e
         }
