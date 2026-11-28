@@ -29,7 +29,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** プロセスの生成: 実行ファイルの読み込み、引数・環境変数・作業ディレクトリ、fd の引き継ぎ、親子関係（#45） */
 class ProcessSpawnTest {
@@ -120,7 +120,7 @@ class ProcessSpawnTest {
             assertEquals(Seen(c2, parent, emptyList(), mapOf("B" to "2"), "/home/user"), replaced.get())
             assertEquals(Seen(c3, parent, emptyList(), emptyMap(), "/tmp"), absolute.get())
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -189,7 +189,7 @@ class ProcessSpawnTest {
             val orphan = m.spawn(program, m.waiter(), SpawnOptions(fds = mapOf(3 to StdioSource.Inherit)))
             assertEquals(setOf(0, 1, 2), m.lock.withLockValue { m.kernel.processes[orphan]!!.handles.entries().keys })
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -228,7 +228,7 @@ class ProcessSpawnTest {
             assertEquals(Seen(child.get(), parent, listOf("hi", "there"), mapOf("K" to "V"), "/bin"), seen.last())
             assertEquals(listOf(child.get()), m.children(parent))
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -280,7 +280,7 @@ class ProcessSpawnTest {
             h.tickUntil { m.stateOf(done).isTerminal }
             assertThrows<IllegalArgumentException> { m.spawn(program, m.waiter(), SpawnOptions(), done) }
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -341,7 +341,7 @@ class ProcessSpawnTest {
                 assertEquals(null, handles[4])
             }
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             h.tickUntil("終わったプロセスのディレクトリが表に残る") {
                 m.lock.withLockValue { (0 until m.kernel.objects.nextObjectId).none { m.kernel.objects[it] is OpenFile } }
             }
@@ -372,7 +372,7 @@ class ProcessSpawnTest {
             }
             assertEquals(processes, m.processCount())
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -396,7 +396,7 @@ class ProcessSpawnTest {
             }
             assertEquals(processes, m.processCount())
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 

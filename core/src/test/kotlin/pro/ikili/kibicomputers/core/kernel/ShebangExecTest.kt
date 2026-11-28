@@ -18,7 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** シバン付きのスクリプトの exec（#93）。インタプリタは偽のランタイムの WASM */
 class ShebangExecTest {

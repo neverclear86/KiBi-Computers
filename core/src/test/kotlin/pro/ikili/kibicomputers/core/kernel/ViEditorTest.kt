@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `/bin/vi`（#104）を、カーネルの TTY の上で動かして確かめる。コンソールの出力は端末の解釈（`AnsiTerminal`）に通し、

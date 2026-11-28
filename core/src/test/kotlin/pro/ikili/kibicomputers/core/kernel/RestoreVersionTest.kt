@@ -47,7 +47,7 @@ import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
 import java.util.UUID
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 保存データの版の比較（#88、ADR 0088）: 外枠の MOD のバージョンが今のものと違えば、中身を解釈せずに冷えた起動（`MOD_VERSION`）にする。

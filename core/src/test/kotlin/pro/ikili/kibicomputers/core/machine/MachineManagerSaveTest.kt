@@ -22,7 +22,7 @@ import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** マシン管理の、待機点保存の手順（止める・取り出す・外す。#81） */
 class MachineManagerSaveTest {

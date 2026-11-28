@@ -27,7 +27,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * メインスレッドで行うカーネルの処理の、サーバー全体の tick ごとの予算（#356、ADR 0356）。

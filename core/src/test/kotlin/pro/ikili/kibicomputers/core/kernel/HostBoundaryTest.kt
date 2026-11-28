@@ -12,7 +12,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** カーネルと接続層の境界（#44）: 環境、通知（状態・コンソール・接続層への処理）、メインスレッドでのホスト呼び出し */
 class HostBoundaryTest {
@@ -273,7 +273,7 @@ class HostBoundaryTest {
             }
             h.scheduler.tick()
             assertFalse(ran)
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             assertEquals(ProcessState.KILLED, m.stateOf(waiting))
         }
     }
@@ -289,7 +289,7 @@ class HostBoundaryTest {
             )
             eventually { m.stateOf(pid) == ProcessState.WAITING_HOST }
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             assertEquals(ProcessState.KILLED, m.stateOf(pid))
             assertEquals(0, m.pendingHostCalls)
             assertEquals(h.scheduler.config.maxConcurrentMachines, h.scheduler.permits.availablePermits())

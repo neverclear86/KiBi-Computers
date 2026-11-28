@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.call
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * p2 のコマンドの規則（`wasi:cli/run` の export の数と型。終了コード）と、版の違う import をまたぐ resource（#267。ADR 0267）

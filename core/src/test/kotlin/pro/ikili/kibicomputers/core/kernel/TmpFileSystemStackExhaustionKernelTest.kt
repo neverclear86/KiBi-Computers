@@ -28,7 +28,7 @@ import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * カーネルのプロセスの中で、スタックの底の近くからホストの関数の本体が `/tmp` を変えても、RAM の勘定（マシン・サーバー全体）と
@@ -215,7 +215,7 @@ class TmpFileSystemStackExhaustionKernelTest {
                     // 片付けが終わってから勘定を読む。ロックの中では数値を写すだけにする。
                     // ロックが取れなくても（スタックが尽きた後にロックが残る形）、その回の診断の行と、ほかの失敗の原因を先に出すため、
                     // 取れたかどうかの確かめは勘定を比べる直前に置く（取れなかったときの値はロックの外で読んだもの）
-                    val locked = m.lock.tryLock(5, TimeUnit.SECONDS)
+                    val locked = m.lock.tryLock(stackHeadroomWait(5_000), TimeUnit.MILLISECONDS)
                     val tmpAfter: Long
                     val processAfter: Long
                     val machineAfter: Long

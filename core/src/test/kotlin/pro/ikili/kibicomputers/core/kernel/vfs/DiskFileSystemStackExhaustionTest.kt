@@ -6,8 +6,10 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.fail
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.SoePositions
+import pro.ikili.kibicomputers.core.kernel.awaitAcquirable
 import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import pro.ikili.kibicomputers.core.kernel.stackHeadroomRounds
+import pro.ikili.kibicomputers.core.kernel.stackHeadroomWait
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
@@ -133,15 +135,14 @@ class DiskFileSystemStackExhaustionTest {
             }
         }, "DiskFileSystemStackExhaustionTest", 192L * 1024)
         t.start()
-        t.join(60_000)
+        t.join(stackHeadroomWait(60_000))
         check(!t.isAlive) { "操作が終わらない（リースのロックが残ったか）: ${t.stackTrace.take(12).joinToString(" <- ")}" }
         return result
     }
 
     /** 食い違いがなく、リースのロックが取れること */
     private fun verify(fs: DiskFileSystem, what: String, soe: Throwable?) {
-        assertTrue(fs.ioLockForTest.tryLock(5, TimeUnit.SECONDS), "リースのロックが取れない（$what）: ${fs.ioLockForTest}")
-        fs.ioLockForTest.unlock()
+        fs.ioLockForTest.awaitAcquirable("リースのロックが取れない（$what）")
         val problems = fs.consistencyProblemsForTest()
         if (problems.isNotEmpty()) {
             fail("尽きた後にディスクの状態がホストと食い違った（$what）: $problems\nSOE: ${soe?.stackTrace?.take(14)?.joinToString(" <- ")}")

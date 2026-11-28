@@ -10,7 +10,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ReapResult
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 親が終わったときの子と、親のないゾンビ・プロセスの上限（#46、ADR 0046） */
 class OrphanTest {
@@ -33,7 +33,7 @@ class OrphanTest {
             h.tickUntilTrue { m.stateOf(child.get()).isTerminal }
             assertEquals(ProcessState.EXITED, m.stateOf(child.get()))
             assertEquals(4, m.exitStatusOf(child.get())!!.code)
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -56,7 +56,7 @@ class OrphanTest {
             h.tickUntilTrue { m.stateOf(parent).isTerminal }
             assertNull(m.processState(child.get()))
             m.lock.withLockValue { assertNull(m.kernel.objects[childObject.get()]) }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -75,7 +75,7 @@ class OrphanTest {
             assertEquals(ProcessState.EXITED, m.stateOf(pids[1]))
             assertEquals(8, m.tableSize())
             h.tickUntilTrue { m.stateOf(next).isTerminal }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -94,7 +94,7 @@ class OrphanTest {
             })
             h.tickUntilTrue { m.stateOf(parent).isTerminal }
             assertEquals(listOf<Any>(ResourceLimitException::class.java, ReapResult.Reaped::class.java, "spawned"), results.toList())
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             // 親が終わったので、刈り取らなかった子のゾンビは残らない
             assertTrue(m.children(parent).isEmpty())
         }

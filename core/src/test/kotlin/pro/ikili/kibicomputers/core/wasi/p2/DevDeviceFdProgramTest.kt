@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `/dev/device/<address>` を開いた fd の種類・`isatty`・`fstat`（#865・#885。ADR 0054「fd とパスで種類が違う」、ADR 0267「descriptor の種類」）。

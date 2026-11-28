@@ -23,7 +23,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 前借り（#477）の間の燃料切れの処理の速い道（#887）。前借りを続けてよいと分かっている間は、カーネルロックを取らずに負の残りを返し、

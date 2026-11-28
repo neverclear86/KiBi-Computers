@@ -5,7 +5,7 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
-import org.junit.jupiter.api.assertTimeoutPreemptively
+import pro.ikili.kibicomputers.core.testing.bodyTimeout
 import pro.ikili.kibicomputers.core.config.ConfigEntry
 import pro.ikili.kibicomputers.core.config.ConfigSource
 import pro.ikili.kibicomputers.core.config.ConfigValues
@@ -36,7 +36,7 @@ class FairShareBlockingTest {
         }
     }
 
-    private fun timeout(block: () -> Unit) = assertTimeoutPreemptively(Duration.ofSeconds(30), block)
+    private fun timeout(block: () -> Unit) = bodyTimeout(Duration.ofSeconds(30), block)
 
     @Test
     fun `マシンの組は環境の鍵から決まり、差し替えられる。持ち主なしは1つの組`() = timeout {
@@ -79,12 +79,12 @@ class FairShareBlockingTest {
             // 動いている間に持ち主が変わっても、終わったら予約した組（a）に返す
             m1.updateFairnessKey(ownerB)
             m1.stop()
-            assertTrue(m1.awaitTermination(5_000))
+            m1.awaitTerminationOrFail()
             assertEquals(0, h.scheduler.blockingOf(a))
             assertEquals(1, h.scheduler.blockingOf(b))
             for (m in listOf(m2, m3)) {
                 m.stop()
-                assertTrue(m.awaitTermination(5_000))
+                m.awaitTerminationOrFail()
             }
             assertEquals(0, h.scheduler.blockingGroupCount, "0 になった組は消える")
         }
@@ -103,7 +103,7 @@ class FairShareBlockingTest {
             assertThrows<ResourceLimitException> { last.spawn(program, last.waiter()) }
             for (m in machines) {
                 m.stop()
-                assertTrue(m.awaitTermination(5_000))
+                m.awaitTerminationOrFail()
             }
         }
     }
@@ -120,7 +120,7 @@ class FairShareBlockingTest {
             assertThrows<ResourceLimitException> { m2.spawn(program, m2.waiter()) }
             for (m in listOf(m1, m2)) {
                 m.stop()
-                assertTrue(m.awaitTermination(5_000))
+                m.awaitTerminationOrFail()
             }
             assertEquals(0, h.scheduler.blockingGroupCount)
         }
@@ -147,7 +147,7 @@ class FairShareBlockingTest {
             assertThrows<ResourceLimitException> { m2.spawn(program, m2.waiter()) }
             assertEquals(0, h.scheduler.blockingOf(FairShareGroup.of(ownerB)))
             m1.stop()
-            assertTrue(m1.awaitTermination(5_000))
+            m1.awaitTerminationOrFail()
             assertEquals(0, h.scheduler.blockingGroupCount)
         }
     }

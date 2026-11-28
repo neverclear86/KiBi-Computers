@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 本物の WASI p1 の `path_open`・`fd_close` を、スタックが尽きる深さで動かした後に、ディスクの開いたままの枠が返ることを確かめる（#858）。

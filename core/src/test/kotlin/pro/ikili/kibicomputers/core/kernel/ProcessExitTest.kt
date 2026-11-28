@@ -16,7 +16,7 @@ import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 終了の記録と終了待ち（刈り取り）（#46、ADR 0046） */
 class ProcessExitTest {
@@ -46,7 +46,7 @@ class ProcessExitTest {
                 assertNull(m.runtime(s.pid))
             }
             m.lock.withLockValue { for (id in objectIds) assertNull(m.kernel.objects[id], "ProcessObject も外れる") }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -71,7 +71,7 @@ class ProcessExitTest {
             h.tickUntilTrue { result.get() != null }
             assertEquals(ReapResult.Reaped(ExitStatus(childPid.get(), ExitReason.EXITED, 5, null)), result.get())
             h.tickUntilTrue { m.stateOf(parent).isTerminal }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -103,7 +103,7 @@ class ProcessExitTest {
             gate.open()
             h.tickUntilTrue { m.stateOf(parent).isTerminal }
             assertEquals(ReapResult.Reaped(ExitStatus(childPid.get(), ExitReason.EXITED, 7, null)), result.get())
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -138,7 +138,7 @@ class ProcessExitTest {
                 ),
                 results.toList(),
             )
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -174,7 +174,7 @@ class ProcessExitTest {
             )
             gate.open()
             h.tickUntilTrue { m.stateOf(parent).isTerminal && m.stateOf(stranger).isTerminal }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -191,7 +191,7 @@ class ProcessExitTest {
             })
             h.tickUntilTrue { result.get() != null }
             assertEquals(ReapResult.Reaped(ExitStatus(childPid.get(), ExitReason.CRASHED, 0, null)), result.get())
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -214,7 +214,7 @@ class ProcessExitTest {
             assertTrue(done.get())
             assertTrue(maxRetired.get() <= 8, "retiredThreads が増え続けている: ${maxRetired.get()}")
             assertTrue(m.retiredThreadCount <= 8, "retiredThreads: ${m.retiredThreadCount}")
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -226,7 +226,7 @@ class ProcessExitTest {
             val pid = m.spawnTest(program, gated(Gate(m)))
             h.tickUntilTrue { m.stateOf(pid) == ProcessState.WAITING_EVENT }
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             assertEquals(ExitStatus(pid, ExitReason.KILLED, 0, null), m.exitStatusOf(pid))
             assertNull(m.process(pid)!!.termSignal)
         }

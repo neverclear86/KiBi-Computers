@@ -46,7 +46,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 独自拡張 `kibi:device/bus`（#77）の p1 の import を、kibi_device.c（実際の Endive）とカーネルで確かめる。

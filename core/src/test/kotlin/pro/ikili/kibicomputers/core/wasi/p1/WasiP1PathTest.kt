@@ -30,7 +30,7 @@ import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * WASI p1 の path_*（#71）。ダミーのモジュールから import を直接呼び、VFS の中身で確かめる。

@@ -16,7 +16,7 @@ import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.api.device.DeviceMethods
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `parallel` の中で `os.sleep` と `os.pullEvent` のループで待つ Lua を多数台動かす（#95。ADR 0095）。

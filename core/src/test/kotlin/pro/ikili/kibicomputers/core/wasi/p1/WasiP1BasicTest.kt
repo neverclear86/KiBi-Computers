@@ -25,7 +25,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** WASI p1 の args・environ・clock・random・sched_yield・proc_exit（#69）。ダミーのモジュールから import を直接呼ぶ */
 class WasiP1BasicTest {

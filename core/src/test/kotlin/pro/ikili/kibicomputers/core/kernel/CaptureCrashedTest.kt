@@ -13,7 +13,7 @@ import pro.ikili.kibicomputers.core.runtime.FakeInstance
 import pro.ikili.kibicomputers.core.runtime.MemoryChunkCounts
 import java.time.Duration
 import java.util.UUID
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * CRASHED の台は写さない（#698）。知らせ（tick で配る）がケースに届く前に保存の経路が走っても、

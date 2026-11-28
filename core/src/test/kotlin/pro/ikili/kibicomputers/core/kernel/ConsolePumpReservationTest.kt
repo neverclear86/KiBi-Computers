@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * コンソールの出力の予約（`Machine.consolePumpsReserved`。#419）が、スタックが尽きても残らないことを確かめる（#890）。
@@ -177,8 +177,7 @@ internal class ConsolePumpReservationTest {
             r.assertCrashedAndDrained(rt)
             assertEquals(null, r.sink.armed.get(), "表示デバイスのロックを取りに行かなかった")
             // 表示デバイスのロックは壊れていない（取る前に投げた）
-            assertTrue(r.sink.lock.tryLock(5, TimeUnit.SECONDS))
-            r.sink.lock.unlock()
+            r.sink.lock.awaitAcquirable("表示デバイスのロックが取れない")
         }
     }
 
@@ -192,8 +191,7 @@ internal class ConsolePumpReservationTest {
             // 予約は pumpConsole で戻った後に、終わりの片付けでもう一度は戻らない（負にならない）
             assertEquals(0, r.m.consolePumpsReservedForTest)
             // 表示デバイスのロックは放されている
-            assertTrue(r.sink.lock.tryLock(5, TimeUnit.SECONDS))
-            r.sink.lock.unlock()
+            r.sink.lock.awaitAcquirable("表示デバイスのロックが取れない")
         }
     }
 

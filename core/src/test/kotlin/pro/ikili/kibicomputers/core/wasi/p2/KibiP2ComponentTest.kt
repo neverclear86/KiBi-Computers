@@ -19,6 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.ResolvedDisk
 import pro.ikili.kibicomputers.core.kernel.TestDriver
 import pro.ikili.kibicomputers.core.kernel.VOID
+import pro.ikili.kibicomputers.core.kernel.awaitTerminationOrFail
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.eventually
@@ -55,7 +56,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `kibi:*` の p2 を、実際のコンポーネント（WAT のコアモジュール + WIT の world から作る）から Canonical ABI の lift・lower を通して呼ぶ
@@ -717,7 +718,7 @@ class KibiP2ComponentTest {
             }
             assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
             assertFalse(rt.lastError is WasmTrapException, "${rt.lastError}")
-            assertTrue(m.awaitTermination(10_000))
+            m.awaitTerminationOrFail()
             m.stop()
         }
     }

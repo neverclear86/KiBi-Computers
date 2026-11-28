@@ -29,7 +29,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 標準入出力（fd 0/1/2）の割り当てとコンソール（#58） */
 class StdioTest {

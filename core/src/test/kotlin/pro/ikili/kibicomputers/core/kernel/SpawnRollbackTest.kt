@@ -19,7 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import java.time.Duration
 import java.util.concurrent.ExecutorService
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** spawn が表に足した後で失敗したときの巻き戻し（#629）。init の巻き戻しは [BootTest] で確かめる */
 internal class SpawnRollbackTest {
@@ -110,7 +110,7 @@ internal class SpawnRollbackTest {
                     parentGate.open()
                 }
                 h.tickUntilTrue("親が終わらない") { m.processState(parent)?.isTerminal == true }
-                assertTrue(m.awaitTermination(5_000))
+                m.awaitTerminationOrFail()
             }
         }
 
@@ -127,7 +127,7 @@ internal class SpawnRollbackTest {
                 assertEquals(MachineState.STOPPED, m.state)
                 assertEquals(emptyList<Int>(), m.lock.withLockValue { m.kernel.processes.all().map { it.pid } })
                 assertEquals(0, m.scheduler.blockingProcesses)
-                assertTrue(m.awaitTermination(1_000))
+                m.awaitTerminationOrFail()
             }
         }
 
@@ -170,7 +170,7 @@ internal class SpawnRollbackTest {
                 parentGate.open()
             }
             h.tickUntilTrue("親が終わらない") { m.processState(parent)?.isTerminal == true }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -232,7 +232,7 @@ internal class SpawnRollbackTest {
                     parentGate.open()
                 }
                 h.tickUntilTrue("親が終わらない") { m.processState(parent)?.isTerminal == true }
-                assertTrue(m.awaitTermination(5_000))
+                m.awaitTerminationOrFail()
             }
         }
 
@@ -265,7 +265,7 @@ internal class SpawnRollbackTest {
             }
             h.tickUntilTrue("許可が戻らない") { m.scheduler.permits.availablePermits() == 4 }
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 

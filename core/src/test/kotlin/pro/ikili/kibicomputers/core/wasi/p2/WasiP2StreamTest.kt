@@ -41,7 +41,7 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentCall
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * p2 の stream・pollable・exit の境界（#267。ADR 0267）。カーネルの中のコンポーネントのプロセスから、ホストの関数の本体を直接呼んで確かめる

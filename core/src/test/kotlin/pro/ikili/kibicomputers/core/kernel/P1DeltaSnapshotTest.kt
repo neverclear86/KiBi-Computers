@@ -33,7 +33,7 @@ import java.io.DataOutputStream
 import java.time.Duration
 import java.util.UUID
 import java.util.zip.CRC32C
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 本物の p1 のコマンド（`prompt-wasi.wasm`）で、全体 → 差分の世代を取り、基準と合わせて確かめる（#83、ADR 0083）。

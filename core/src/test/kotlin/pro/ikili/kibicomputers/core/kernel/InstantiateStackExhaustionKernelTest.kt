@@ -28,7 +28,7 @@ import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * カーネルのプロセスの中で、スタックの底の近くから `ctx.instantiate` を呼んでも、作りかけのメモリ・テーブルの勘定がずれず、
@@ -178,7 +178,7 @@ class InstantiateStackExhaustionKernelTest {
                         val label = "$via $k（$r 回目）"
                         // 終わりの片付け（finishLocked。作れた子を閉じて返す）はマシンのロックの中で、状態を CRASHED にしてから進むので、
                         // ほかのスレッドからマシンのロックを取って（取れることも確かめる）、片付けが終わってから勘定を読む
-                        assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$label）: ${m.lock}")
+                        assertTrue(m.lock.tryLock(stackHeadroomWait(5_000), TimeUnit.MILLISECONDS), "マシンのロックが取れない（$label）: ${m.lock}")
                         val processAfter: Long
                         val machineAfter: Long
                         val serverAfter: Long
@@ -294,7 +294,7 @@ class InstantiateStackExhaustionKernelTest {
                 h.scheduler.tick()
                 rt.process.state.isTerminal || m.state == MachineState.CRASHED
             }
-            assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない: ${m.lock}")
+            assertTrue(m.lock.tryLock(stackHeadroomWait(5_000), TimeUnit.MILLISECONDS), "マシンのロックが取れない: ${m.lock}")
             try {
                 out.failure?.let { throw AssertionError("想定外の失敗（深さ ${out.depth}）", it) }
                 // 唯一のプロセスが正常に終わったので、マシンは止まる（壊れていないこと）

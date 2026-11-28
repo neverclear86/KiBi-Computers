@@ -36,7 +36,7 @@ import java.util.Collections
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 同梱イメージ（`image:os`）の中身だけが変わったビルドで、動いている台を戻す場面（#670）。

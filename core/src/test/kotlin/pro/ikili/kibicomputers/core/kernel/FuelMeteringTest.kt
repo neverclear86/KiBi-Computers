@@ -25,7 +25,7 @@ import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** `Machine.exec` が燃料の計測コードを挿入し、燃料切れで中断して次の tick で再開する（#38）。実際の Endive で動かす */
 class FuelMeteringTest {
@@ -124,7 +124,7 @@ class FuelMeteringTest {
             // 手持ちを使い切っては待つので、マシンの燃料は 1 tick の配分を超えない
             assertTrue(m.lock.withLockValue { m.kernel.fuel } <= 10_000)
             m.stop()
-            assertTrue(m.awaitTermination(10_000), "止まらない")
+            m.awaitTerminationOrFail("止まらない")
         }
     }
 
@@ -150,7 +150,7 @@ class FuelMeteringTest {
             h.ticks(10)
             assertFalse(m.stateOf(forever).isTerminal)
             m.stop()
-            assertTrue(m.awaitTermination(10_000), "止まらない")
+            m.awaitTerminationOrFail("止まらない")
         }
     }
 

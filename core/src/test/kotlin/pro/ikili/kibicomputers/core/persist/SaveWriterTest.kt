@@ -7,12 +7,14 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.awaitOrFail
+import pro.ikili.kibicomputers.core.kernel.closeOrFail
+import pro.ikili.kibicomputers.core.kernel.flushOrFail
 import java.time.Duration
 import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 書き込みのスレッド（`SaveWriter`。#84、ADR 0084） */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
@@ -31,7 +33,7 @@ class SaveWriterTest {
                     threads += Thread.currentThread().name
                 })
             }
-            assertTrue(writer.flush(10_000))
+            writer.flushOrFail()
             assertEquals((0 until 100).toList(), order.toList())
             assertEquals(setOf("test writer"), threads.toSet())
             assertNotEquals(Thread.currentThread().name, "test writer")
@@ -45,7 +47,7 @@ class SaveWriterTest {
             val done = CountDownLatch(1)
             assertTrue(writer.execute(id) { done.countDown() })
             done.awaitOrFail()
-            assertTrue(writer.flush(10_000))
+            writer.flushOrFail()
         }
     }
 
@@ -58,7 +60,7 @@ class SaveWriterTest {
         assertFalse(writer.close(50), "走っている仕事があれば止まりきらない")
         assertFalse(writer.execute(id) {}, "閉じた後は断る")
         gate.countDown()
-        assertTrue(writer.close(10_000))
+        writer.closeOrFail()
         assertTrue(writer.flush(0))
     }
 
@@ -70,7 +72,7 @@ class SaveWriterTest {
         writer.execute(id) { gate.await() }
         repeat(3) { i -> writer.execute(id) { ran += i } }
         gate.countDown()
-        assertTrue(writer.close(10_000))
+        writer.closeOrFail()
         assertEquals(listOf(0, 1, 2), ran.toList())
     }
 

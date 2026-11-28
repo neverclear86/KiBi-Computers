@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.persist.snapshot.KernelSectionCodec
 import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
 import java.time.Duration
 import java.util.UUID
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 写しの中身（#82）: `KERNEL` 節の往復、ABI 層の写し、保存できないものの判定 */
 class MachineSnapshotContentTest {

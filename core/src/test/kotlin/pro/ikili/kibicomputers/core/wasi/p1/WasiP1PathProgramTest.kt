@@ -25,7 +25,7 @@ import pro.ikili.kibicomputers.core.kernel.withLockValue
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** wasi-libc でビルドした path_wasi.c（実際の Endive）を、preopen の `/` を渡して動かす（#71） */
 class WasiP1PathProgramTest {

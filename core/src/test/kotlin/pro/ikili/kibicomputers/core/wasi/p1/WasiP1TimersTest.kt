@@ -25,7 +25,7 @@ import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 独自拡張 `kibi:kernel/timers`・`kibi:computer/clock`（#426）の p1 の import を、kibi_timers.c（実際の Endive）とカーネルで確かめる。

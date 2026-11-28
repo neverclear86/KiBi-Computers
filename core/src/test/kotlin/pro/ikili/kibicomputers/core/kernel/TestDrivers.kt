@@ -15,9 +15,12 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.machine.MachineManager
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.SaveExecutor
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.FakeWasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
@@ -33,6 +36,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
@@ -151,8 +155,12 @@ internal class Harness(
      * 理由をコメントに書く
      */
     sharePrograms: Boolean = true,
-    /** [close] が、スケジューラの終わりを 1 回目に待つ長さ（過ぎたら残った `KiBi-` スレッドに割り込んでもう 1 回待つ。#916） */
-    private val firstCloseWaitMillis: Long = 10_000,
+    /**
+     * [close] が、スケジューラの終わりを 1 回目に待つ長さ（過ぎたら残った `KiBi-` スレッドに割り込んでもう 1 回待つ。#916）。
+     * 期限なしにはしない（#980）: 止まった門のスレッドに割り込んで放すのは 1 回目の待ちが切れた後なので、期限なしだと漏れ 1 本が保険の
+     * タイムアウト（10 分）まで固まる。負荷の高い CI でも誤って落ちないよう、[assertNoKernelThreads] と同じ 30 秒にする
+     */
+    private val firstCloseWaitMillis: Long = 30_000,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
@@ -437,6 +445,120 @@ internal fun ExecutorService.awaitTerminationOrFail(message: String = "プール
 internal fun <T> Future<T>.getOrFail(message: String = "結果が届かない"): T = failOnInterrupt({ message }) { get() }
 
 /**
+ * 本番の API の期限つきの待ち [timedWait]（待つ上限のミリ秒を受け取り、終わったら `true`）を、終わるまで繰り返す（#980）。
+ *
+ * テストが本番の API に渡す上限（`awaitTermination(5_000)` など）で合否を決めないための形。本番の API の引数の意味は変えず、
+ * 最大 [API_WAIT_SLICE_MILLIS] ずつ待つのを繰り返す。[reportAfterMillis] を過ぎたら [describe] を [SLOW_WAIT_MARKER] の行で 1 回報告して、
+ * そのまま待ち続ける（[eventually] と同じ。止まったときは保険のタイムアウトか、本体を包む `assertTimeoutPreemptively` が落とす）。
+ * 割り込まれたら [failOnInterrupt] の説明で落ちる。割り込みを握りつぶして `false` を返す API（`SaveWriter.close`・[MachineSaveStore.close]。
+ * フラグは立て直す）でも、各回の後の `sleep` がフラグを見て落ちるので、空回りしない。前提がそろうまで待たずに `false` を返す API
+ * （閉じていない [MachineScheduler.awaitTermination]）でも、その `sleep` で CPU を回し続けない。
+ * 割り込みのフラグが立ったまま呼ばれたら（割り込まれた後の `finally` の後始末）、[cleanupWaitIfInterrupted] で期限つきで待って返す
+ */
+internal fun awaitRepeatedly(describe: () -> String, reportAfterMillis: Long = SLOW_API_WAIT_MILLIS, timedWait: (Long) -> Boolean) {
+    if (cleanupWaitIfInterrupted(describe, timedWait = timedWait)) return
+    val start = System.nanoTime()
+    var reported = false
+    while (!failOnInterrupt(describe) { timedWait(API_WAIT_SLICE_MILLIS) }) {
+        val elapsed = (System.nanoTime() - start) / 1_000_000
+        if (!reported && elapsed > reportAfterMillis) {
+            reported = true
+            reportSlowWait("$elapsed ms を超えた: ${describe()}")
+        }
+        failOnInterrupt(describe) { Thread.sleep(1) }
+    }
+}
+
+/** [awaitRepeatedly] が、本番の API に 1 回に渡す上限 */
+internal const val API_WAIT_SLICE_MILLIS = 1_000L
+
+/** [awaitRepeatedly] と [awaitAcquirable] が遅れを報告する閾値の既定 */
+internal const val SLOW_API_WAIT_MILLIS = 10_000L
+
+/** [Machine.awaitTermination] を、終わるまで待つ（#980。期限で合否を決めない。[awaitRepeatedly]） */
+internal fun Machine.awaitTerminationOrFail(message: String = "マシンのスレッドが終わらない") =
+    awaitRepeatedly({ "$message: $this" }) { awaitTermination(it) }
+
+/** [MachineScheduler.awaitTermination] を、終わるまで待つ（#980。[MachineScheduler.close] の後に呼ぶ。[awaitRepeatedly]） */
+internal fun MachineScheduler.awaitTerminationOrFail(message: String = "スケジューラのスレッドが終わらない") =
+    awaitRepeatedly({ "$message: $this" }) { awaitTermination(it) }
+
+/** [MachineManager.shutdown] を、終わるまで繰り返す（#980。`close` は 2 回呼んでもよい。[awaitRepeatedly]） */
+internal fun MachineManager<*>.shutdownOrFail(message: String = "MachineManager が止まらない") =
+    awaitRepeatedly({ "$message: $this" }) { shutdown(it) }
+
+/** [SaveExecutor.flush] を、終わるまで繰り返す（#980。[awaitRepeatedly]） */
+internal fun SaveExecutor.flushOrFail(message: String = "保存の仕事が終わらない") =
+    awaitRepeatedly({ "$message: $this" }) { flush(it) }
+
+/** [SaveExecutor.close] を、終わるまで繰り返す（#980。閉じるのは 2 回呼んでもよい。[awaitRepeatedly]） */
+internal fun SaveExecutor.closeOrFail(message: String = "保存のスレッドが止まらない") =
+    awaitRepeatedly({ "$message: $this" }) { close(it) }
+
+/** [MachineSaveStore.flush] を、終わるまで繰り返す（#980。[awaitRepeatedly]） */
+internal fun MachineSaveStore.flushOrFail(message: String = "保存の仕事が終わらない") =
+    awaitRepeatedly({ "$message: $this" }) { flush(it) }
+
+/** [MachineSaveStore.close] を、終わるまで繰り返す（#980。閉じるのは 2 回呼んでもよい。[awaitRepeatedly]） */
+internal fun MachineSaveStore.closeOrFail(message: String = "保存の置き場が止まらない") =
+    awaitRepeatedly({ "$message: $this" }) { close(it) }
+
+/**
+ * テストのスレッドがこのロックを取れるまで待ち、取れたらすぐ放す（#980。`assertTrue(lock.tryLock(5, SECONDS))` の短い期限で合否を決めない形）。
+ *
+ * 最大 [LOCK_PROBE_MILLIS] ずつ取りに行くのを繰り返す（待ち行列に残り続けない）。[reportAfterMillis] を過ぎたら、持ち主のスレッドを 1 回調べる:
+ * 持ち主がもう生きていなければ（持ったまま死んだ。もう誰も放さない）、停止として [message] と持ち主を付けてその場で落とす。
+ * 生きていれば、遅れとして [SLOW_WAIT_MARKER] の行で 1 回報告して（持ち主のスタックも付ける）、待ち続ける。
+ * 持ち主は `ReentrantLock.toString()` の `Locked by thread <名前>` から読む（`getOwner` は protected で、java.base は反射に開いていない）。
+ * 割り込まれたら [failOnInterrupt] の説明で落ちる。割り込みのフラグが立ったまま呼ばれたら、[cleanupWaitIfInterrupted] で期限つきで待って返す
+ */
+internal fun ReentrantLock.awaitAcquirable(message: String = "ロックが取れない", reportAfterMillis: Long = SLOW_API_WAIT_MILLIS) {
+    val describe = { "$message: $this" }
+    val probe = { millis: Long -> tryLock(millis, TimeUnit.MILLISECONDS).also { if (it) unlock() } }
+    if (cleanupWaitIfInterrupted(describe, timedWait = probe)) return
+    val start = System.nanoTime()
+    var checked = false
+    while (!failOnInterrupt(describe) { probe(LOCK_PROBE_MILLIS) }) {
+        val elapsed = (System.nanoTime() - start) / 1_000_000
+        if (checked || elapsed <= reportAfterMillis) continue
+        checked = true
+        val owner = lockOwnerName(this)
+        val ownerThreads = if (owner == null) emptyList() else Thread.getAllStackTraces().keys.filter { it.name == owner && it.isAlive }
+        if (owner != null && ownerThreads.isEmpty()) {
+            fail("停止: 持ち主のスレッド $owner が、ロックを持ったまま終わっている: ${describe()}")
+        }
+        val stacks = ownerThreads.joinToString("\n") { t -> "  ${t.name}\n" + t.stackTrace.take(12).joinToString("\n") { "    at $it" } }
+        reportSlowWait("$elapsed ms を超えた: ${describe()}" + if (stacks.isEmpty()) "" else "\n持ち主:\n$stacks")
+    }
+}
+
+/**
+ * テストが作った [WorkerPool]（[executor] を差し替えたもの）を止めて、ワーカーのスレッドが終わるまで待つ（#980。`Fixture.close` が使う）。
+ *
+ * 期限なしにはしない（[Harness.close] と同じ。#916）: 止まった門のワーカーに割り込んで放すのは待ちが切れた後なので、期限なしだと
+ * 漏れ 1 本が保険のタイムアウト（10 分）まで固まる。最大 [KERNEL_THREADS_EXIT_MILLIS] 待ち、終わらなければ残ったワーカーに割り込んで
+ * （[ExecutorService.shutdownNow]）もう 1 回待ち、1 回目で終わらなかったことを失敗として残す（黙って抜けると、`KiBi-` のスレッドが残って、
+ * 後に続くテストの [assertNoKernelThreads] を巻き込む）。割り込まれた後の後始末でも待てるよう、フラグを下ろしてから待つ
+ */
+internal fun shutdownWorkersOrFail(workers: WorkerPool, executor: ExecutorService) = withInterruptCleared {
+    workers.shutdown()
+    val ended = workers.awaitTermination(KERNEL_THREADS_EXIT_MILLIS)
+    if (!ended) {
+        reportSlowWait("ワーカーが $KERNEL_THREADS_EXIT_MILLIS ms で終わらない。残ったワーカーに割り込む: ${kernelThreadNames()}")
+        executor.shutdownNow()
+        workers.awaitTermination(CLEANUP_WAIT_MILLIS)
+    }
+    assertTrue(ended, "ワーカーが終わらない: ${kernelThreadNames()}")
+}
+
+/** [ReentrantLock.awaitAcquirable] が 1 回に取りに行く上限 */
+internal const val LOCK_PROBE_MILLIS = 200L
+
+/** [lock] の `toString()` の `Locked by thread <名前>` から、持ち主のスレッドの名前を読む（空いていれば `null`） */
+internal fun lockOwnerName(lock: ReentrantLock): String? =
+    lock.toString().substringAfter("[Locked by thread ", "").takeIf { it.isNotEmpty() }?.removeSuffix("]")
+
+/**
  * init が CPU を取って動き出し、専用スレッドの登録を済ませた（`register()` の後・`unregister()` の前）か。
  *
  * RUNNING が見えても、init の専用スレッドはまだ `register()` の前のことがある。その間に reboot・stop・写しの kill が入ると、
@@ -509,7 +631,7 @@ internal fun assertNoKernelThreads(timeoutMillis: Long = KERNEL_THREADS_EXIT_MIL
 }
 
 /** [assertNoKernelThreads] が、スレッドが終わるのを待つ上限 */
-private const val KERNEL_THREADS_EXIT_MILLIS = 30_000L
+internal const val KERNEL_THREADS_EXIT_MILLIS = 30_000L
 
 /** 名前が [prefix] で始まる、生きているスレッドの名前（[JVM_WIDE_THREAD_NAMES] を除く） */
 internal fun kernelThreadNames(prefix: String = "KiBi-"): List<String> =

@@ -22,7 +22,7 @@ import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.KernelStateCopy
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 保存の写し（`KernelStateCopy`）の深さと、写しの中で殺す手順のテスト（#81、ADR 0081） */
 class KernelStateCopyTest {

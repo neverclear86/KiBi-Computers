@@ -38,7 +38,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 標準 OS の `sh`・`nano` が、保存から戻ったとき（`restored` イベント。#87、ADR 0087）に、キーを待たずに画面を描き直すことを確かめる。

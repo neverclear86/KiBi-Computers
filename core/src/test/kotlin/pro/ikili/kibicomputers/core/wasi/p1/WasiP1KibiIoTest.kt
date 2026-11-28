@@ -24,7 +24,7 @@ import pro.ikili.kibicomputers.core.kernel.rt
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 独自拡張 `kibi:io/fd`・`kibi:io/pipe`（#75）の p1 の import を、kibi_io.c（実際の Endive）とカーネルで確かめる */
 class WasiP1KibiIoTest {

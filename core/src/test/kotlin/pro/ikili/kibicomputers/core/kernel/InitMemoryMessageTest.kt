@@ -19,7 +19,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.P1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.time.Duration
 import java.util.Collections
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * init（`/sbin/init`、pid 1）のメモリ不足の表示（#414）。init 以外のプロセスの表示は `WrittenMemoryTest`・`MemoryLimitTest`・
@@ -93,7 +93,7 @@ class InitMemoryMessageTest {
                 Thread.sleep(1)
                 host.console.contains("kibi: init ") && m.state == MachineState.STOPPED
             }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             val (state, exitCode) = m.lock.withLockValue { m.kernel.processes[1]!!.let { it.state to it.exitCode } }
             assertEquals(0L, m.memoryAccount.usedBytes, "RAM が戻らない")
             Result(host.console.toString(), state, exitCode, results.toList())

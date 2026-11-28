@@ -50,7 +50,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 起動シーケンス（/sbin/init）と停止・再起動（#49） */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
@@ -174,7 +174,7 @@ class BootTest {
             val m = h.machine(host = host, environment = environment)
             Env(h, m, host, disks).block()
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -418,7 +418,7 @@ class BootTest {
             host.log.clear()
             assertTrue(m.boot(bootDisks("d$i")))
             tickUntil("$message が出ない") { host.console.contains(message) && m.state == MachineState.STOPPED }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             assertEquals("kibi: booting from disk d$i\n$message\n", host.console.toString())
             assertEquals(listOf("state:RUNNING", "state:STOPPED"), host.states())
             assertEquals(listOf(1), pids(), "前の起動のゾンビは残らず、pid は 1 から")
@@ -513,7 +513,7 @@ class BootTest {
         assertEquals(MachineState.RUNNING, m.state)
         assertTrue(!m.stateOf(1).isTerminal, "init は動き続ける")
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -524,7 +524,7 @@ class BootTest {
         assertTrue(m.reboot())
         m.stop()
         tickUntil { m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         tickFor(100)
         assertEquals(0, host.reboots.get())
         assertEquals(MachineState.STOPPED, m.state)
@@ -581,7 +581,7 @@ class BootTest {
         disks.withInit("d", exe(exitingInit(0)))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertFalse(m.isRunningBootingOrRebooting, "ゲスト（init）が止めたマシン")
         // STOPPED でプロセスもスレッドもないので、すぐ通知を積む（配るのは次の tick）
         assertTrue(m.reboot())
@@ -601,7 +601,7 @@ class BootTest {
         disks.withInit("d", exe(exitingInit(0)))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         val seen = ArrayList<Boolean>()
         val stuck = AtomicBoolean()
         h.scheduler.hooks.duringRebootPost = { machine ->
@@ -627,7 +627,7 @@ class BootTest {
         disks.withInit("d", exe(exitingInit(0)))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertTrue(m.reboot())
         m.lock.withLockValue { m.stopLocked(IllegalStateException("テストの不整合")) }
         assertEquals(MachineState.CRASHED, m.state)
@@ -702,7 +702,7 @@ class BootTest {
         // pid 1 の ProcessObject と preopen（ROOT_PREOPEN）の OpenFile も残らない。ディレクトリの OpenFile は
         // ファイルシステムに開いたことを知らせないので、漏れてもマウントの取り外しでは見つからない
         assertEquals(0 to 0, leftoverObjects())
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -733,7 +733,7 @@ class BootTest {
             assertEquals(0, m.lock.withLockValue { m.kernel.initPid }, "$stage#$nth")
             assertTrue(m.lock.withLockValue { m.runtimes.isEmpty() }, "$stage#$nth")
             assertEquals(0 to 0, leftoverObjects(), "$stage#$nth: オブジェクト表に残る")
-            assertTrue(m.awaitTermination(5_000), "$stage#$nth")
+            m.awaitTerminationOrFail("$stage#$nth")
         }
         // 巻き戻した後も、起動すると pid 1 の init が動き、ディレクトリが1つ開いている
         assertTrue(m.boot(bootDisks("d")))
@@ -888,7 +888,7 @@ class BootTest {
 
         val second = m.spawnRt(h.program(emptyModule()), asker(false), SpawnOptions(), parentPid = 1)
         tickUntil { m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         tickFor(50)
         assertFalse(returned.get(), "受け付けたら戻らない")
         assertEquals(1, host.reboots.get())
@@ -933,7 +933,7 @@ class BootTest {
         }
         val rt = m.spawnRt(h.program(emptyModule()), asker, SpawnOptions(), parentPid = 1)
         tickUntil { m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         tickFor(100)
         assertEquals(0, host.reboots.get(), "止めたマシンは再起動しない: ${host.log}")
         assertEquals(MachineState.STOPPED, m.state)
@@ -960,7 +960,7 @@ class BootTest {
         disks.withInit("d", exe(selfPowerInit))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { host.reboots.get() == 1 && asks.get() == 2 && m.state == MachineState.STOPPED && !m.isRebootPending && !m.isBooting }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         tickFor(50)
         assertEquals(1, host.reboots.get())
         assertEquals(listOf("state:RUNNING", "state:STOPPING", "state:STOPPED", "state:RUNNING", "state:STOPPING", "state:STOPPED"), host.states())
@@ -1134,7 +1134,7 @@ class BootTest {
         assertEquals(0, m.hostFiles.inUse)
         assertEquals("hi", Files.readString(diskDir.resolve("hello.txt")))
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         val e = assertThrows<FsException> { m.vfs.stat(VfsPath.parse("/hello.txt")) }
         assertEquals(Errno.IO, e.errno, "止めたら古いカーネルからの操作は断る")
         tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
@@ -1172,7 +1172,7 @@ class BootTest {
             tickUntil { b.state == MachineState.RUNNING && bHost.console.contains("booting") }
             aRelease.countDown()
             tickUntil("A の起動の手順が終わらない") { !m.isBooting }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             assertEquals(MachineState.STOPPED, m.state)
             assertTrue(host.failures.isEmpty(), "取り消された起動は失敗を知らせない: ${host.failures}")
             assertEquals(1, HostDiskLeases.usersOf(diskDir.toRealPath()), "A が断った分のリースは返す（持つのは B だけ）")
@@ -1224,7 +1224,7 @@ class BootTest {
             tickUntil { b.state == MachineState.RUNNING && bHost.console.contains("booting") }
             aRelease.countDown()
             tickUntil("A の起動の手順が終わらない") { !m.isBooting }
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             assertFalse(host.console.contains("/home not mounted"), "取り消された起動は home の失敗を書かない")
             assertEquals(1, HostDiskLeases.usersOf(homeDir.toRealPath()), "A が断った分のリースは返す（持つのは B だけ）")
             val f = b.vfs.open(VfsPath.parse("/home/hello.txt"), OpenOptions(read = true, write = true, create = true))
@@ -1258,7 +1258,7 @@ class BootTest {
             m.vfs.close(f)
         }
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     private fun Env.initPid(): Int = m.lock.withLockValue { m.kernel.initPid }
@@ -1287,7 +1287,7 @@ class BootTest {
 
         m.stop()
         tickUntil { m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertTrue(m.isAtWaitPoint, "stop() で止まったマシンは待機点")
     }
 
@@ -1320,7 +1320,7 @@ class BootTest {
         assertEquals(1, initPid(), "元の init は動いたまま")
         m.stop()
         tickUntil { m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -1328,13 +1328,13 @@ class BootTest {
         disks.withInit("d", exe(exitingInit(0)))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertTrue(m.reboot())
         val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
         assertEquals(pro.ikili.kibicomputers.core.persist.ColdBootReason.REBOOT_PENDING, copy.coldBootReason)
         assertEquals(emptyList<Int>(), copy.killedPids)
         tickUntil { host.reboots.get() == 1 && Regex("init exited").findAll(host.console).count() == 2 && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
     }
 
     @Test
@@ -1342,7 +1342,7 @@ class BootTest {
         disks.withInit("d", exe(exitingInit(0)))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertEquals(0, initPid())
         assertTrue(m.isAtWaitPoint)
     }
@@ -1352,14 +1352,14 @@ class BootTest {
         disks.withInit("d", exe(exitingInit(0)))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertTrue(m.isAtWaitPoint)
         // STOPPED でプロセスもスレッドもないので、すぐ通知を積む（配るのは次の tick）
         assertTrue(m.reboot())
         assertEquals(MachineState.STOPPED, m.state)
         assertFalse(m.isAtWaitPoint, "通知を配るまでは待機点にしない（ここで保存すると再起動が消える）")
         tickUntil { host.reboots.get() == 1 && Regex("init exited").findAll(host.console).count() == 2 && m.state == MachineState.STOPPED }
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         assertTrue(m.isAtWaitPoint, "再起動が済んで止まったマシンは待機点")
         assertEquals(0, initPid())
     }

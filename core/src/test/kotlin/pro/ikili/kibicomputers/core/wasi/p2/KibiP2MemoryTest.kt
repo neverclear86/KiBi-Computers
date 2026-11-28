@@ -34,7 +34,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * `kibi:computer/memory` の p2（#777。ADR 0777）: wasm-tools で WIT の world から作ったコンポーネントが、canon lower した `commit` を

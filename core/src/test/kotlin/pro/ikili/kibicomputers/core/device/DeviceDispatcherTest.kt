@@ -39,7 +39,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** デバイスの呼び出しの振り分け（#65、ADR 0065）: 直接 / メインスレッド / 後で返す、上限、失敗の変換、燃料 */
 class DeviceDispatcherTest {

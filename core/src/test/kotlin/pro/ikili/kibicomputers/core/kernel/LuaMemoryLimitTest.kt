@@ -15,7 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 同梱の Lua が、RAM の上限でトラップでなく `not enough memory` のエラーになる（#409）ことを、カーネルを通して確かめる */
 class LuaMemoryLimitTest {

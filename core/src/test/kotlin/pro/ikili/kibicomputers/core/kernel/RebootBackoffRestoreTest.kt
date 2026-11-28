@@ -29,7 +29,7 @@ import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 復元で戻した init の、再起動の借りを減らす「動いた tick 数」の数え始め（#635、ADR 0635） */
 class RebootBackoffRestoreTest {

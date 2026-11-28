@@ -20,7 +20,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * デバイス操作のコマンド `lsdev`・`devcall`（#108。ADR 0108）を、標準 OS のイメージを根にしたマシンで確かめる

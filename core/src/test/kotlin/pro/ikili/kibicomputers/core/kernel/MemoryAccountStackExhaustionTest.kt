@@ -8,7 +8,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.WrittenPagesMemory
 import run.endive.wasm.types.MemoryLimits
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * スタックの底の近くで、メモリの勘定（プロセス → マシン → サーバー全体の別々の CAS）に入ったとき、勘定がずれないことを確かめる（#856）。

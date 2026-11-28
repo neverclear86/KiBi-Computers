@@ -11,7 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineLimits
 import pro.ikili.kibicomputers.core.kernel.tty.TtyMode
 import java.time.Duration
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** キーボードのデバイス（#65、ADR 0065） */
 class KeyboardDeviceTest {

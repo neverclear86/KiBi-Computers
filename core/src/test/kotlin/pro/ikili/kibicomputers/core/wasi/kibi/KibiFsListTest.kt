@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** `kibi:fs/mounts` の `list-mounts`・`list-disks` の意味の層（[KibiFs]。#453、ADR 0453） */
 class KibiFsListTest {

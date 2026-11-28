@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * カーネルのプロセスの中で、スタックの底の近くからメモリの勘定に入っても、勘定がずれず、プロセスだけが終わることを確かめる（#856）。
@@ -172,7 +172,7 @@ class MemoryAccountStackExhaustionKernelTest {
                     // 進む（#1031）。ほかのスレッドからマシンのロックを取って（取れることも確かめる）、片付けが終わってから勘定を読む。
                     // ロックが取れなくても（スタックが尽きた後にロックが残る形）、その回の診断の行と、ほかの失敗の原因を先に出すため、
                     // 取れたかどうかの確かめは勘定を比べる直前に置く（取れなかったときの値はロックの外で読んだもの）
-                    val locked = m.lock.tryLock(5, TimeUnit.SECONDS)
+                    val locked = m.lock.tryLock(stackHeadroomWait(5_000), TimeUnit.MILLISECONDS)
                     val processAfter: Long
                     val machineAfter: Long
                     val serverAfter: Long

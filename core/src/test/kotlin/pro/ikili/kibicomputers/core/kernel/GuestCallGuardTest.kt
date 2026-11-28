@@ -27,7 +27,7 @@ import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * ホスト関数の中から呼んだゲスト（`callGuest`。`cabi_realloc`）の中で、止まって待つ口を使うとトラップになる（#430。ADR 0073）。

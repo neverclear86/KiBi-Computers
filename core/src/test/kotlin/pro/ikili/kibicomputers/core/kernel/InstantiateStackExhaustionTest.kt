@@ -14,7 +14,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * スタックの底の近くで、メモリとテーブルを持つモジュールからインスタンスを作っても（`ctx.instantiate` の道）、作りかけの分の勘定が

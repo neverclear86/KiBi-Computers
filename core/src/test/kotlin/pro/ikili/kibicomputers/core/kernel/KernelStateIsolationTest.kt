@@ -164,7 +164,7 @@ class KernelStateIsolationTest {
                 walk(machine.kernel, "kernel", IdentityHashMap())
             }
             machine.stop()
-            assertTrue(machine.awaitTermination(5_000))
+            machine.awaitTerminationOrFail()
         }
     }
 }

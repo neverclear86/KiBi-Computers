@@ -14,7 +14,7 @@ import pro.ikili.kibicomputers.core.kernel.tickUntilTrue
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** `list-processes` の件数ごとの燃料（[KibiProcess.list]。#452、ADR 0452）。表にあるプロセスの数に比例して引く */
 class KibiProcessListFuelTest {

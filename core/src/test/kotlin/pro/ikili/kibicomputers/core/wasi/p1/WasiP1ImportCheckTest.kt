@@ -24,7 +24,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmImportDescriptor
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** p1 のプロセスに許す import（#40） */
 class WasiP1ImportCheckTest {

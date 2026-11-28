@@ -37,7 +37,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** WASI p1 の `poll_oneoff`（#72）。ダミーのモジュールから import を直接呼び、メモリの中身で確かめる。時計は手で進める */
 class WasiP1PollTest {

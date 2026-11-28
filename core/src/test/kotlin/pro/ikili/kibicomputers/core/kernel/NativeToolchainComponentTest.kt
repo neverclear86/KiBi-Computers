@@ -20,7 +20,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * ネイティブのツールチェーンで作ったコンポーネントを `exec` で動かす（#775）。

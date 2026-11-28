@@ -14,7 +14,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 独自拡張 `kibi:computer/memory`（#408）の p1 の import を、WASM のプログラムから Endive とカーネルを通して確かめる */
 class KibiMemoryProgramTest {

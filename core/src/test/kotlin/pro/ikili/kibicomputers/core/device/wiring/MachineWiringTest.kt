@@ -13,7 +13,7 @@ import pro.ikili.kibicomputers.core.device.DeviceAddress
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 位置から引くデバイスの結線（#129、ADR 0129） */
 class MachineWiringTest {

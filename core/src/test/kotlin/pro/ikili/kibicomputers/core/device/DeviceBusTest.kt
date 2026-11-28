@@ -27,7 +27,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.withLock
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** マシンにつなぐデバイスの表（#65、ADR 0065） */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）

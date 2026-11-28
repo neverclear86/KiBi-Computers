@@ -29,7 +29,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.nio.file.Path
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 標準 OS の基本コマンド（#103）を、カーネルの上でシェル `/bin/sh` から動かして確かめる。

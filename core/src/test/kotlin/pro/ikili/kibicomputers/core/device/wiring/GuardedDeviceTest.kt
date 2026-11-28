@@ -17,7 +17,7 @@ import pro.ikili.kibicomputers.core.device.DeviceAddress
 import pro.ikili.kibicomputers.core.device.DeviceDispatcher
 import pro.ikili.kibicomputers.core.kernel.Harness
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 他 MOD のデバイスの包み（#153、ADR 0153） */
 class GuardedDeviceTest {

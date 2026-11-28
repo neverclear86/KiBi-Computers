@@ -21,7 +21,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class StopTest {
@@ -66,7 +66,7 @@ class StopTest {
             eventually { h.scheduler.activeProcesses >= 2 }
             val machines = listOf(m1, m2, m3)
             machines.forEach { it.stop() }
-            machines.forEach { assertTrue(it.awaitTermination(5_000), "$it") }
+            machines.forEach { it.awaitTerminationOrFail("$it") }
             for ((m, pid) in listOf(m1 to computing, m1 to cpuWaiting, m2 to unmetered, m3 to fuelWaiting, m3 to blocking, m3 to waitPoint, m3 to hostWaiting)) {
                 assertState(ProcessState.KILLED, m, pid)
             }
@@ -100,7 +100,7 @@ class StopTest {
                 }),
             )
             h.scheduler.tick()
-            assertTrue(fromHost.awaitTermination(5_000))
+            fromHost.awaitTerminationOrFail()
             assertState(ProcessState.KILLED, fromHost, pid)
 
             val tickThread = Thread.currentThread()
@@ -117,7 +117,7 @@ class StopTest {
             val p2 = fromCallback.spawnTest(h.program(spinForever()), runDriver())
             h.scheduler.tick()
             assertEquals("[true, true, true]", checked.get())
-            assertTrue(fromCallback.awaitTermination(5_000))
+            fromCallback.awaitTerminationOrFail()
             assertState(ProcessState.KILLED, fromCallback, p2)
         }
     }
@@ -170,7 +170,7 @@ class StopTest {
             // tick を止めて、燃料を使い切って待つところまで待つ（tick が進むと、待たずに譲って済むので、燃料待ちの状態が見えないことがある）
             eventually { m.stateOf(fuelWait) == ProcessState.WAITING_FUEL }
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             listOf(fuelWait, blocked, host).forEach { assertState(ProcessState.KILLED, m, it) }
             assertEquals(2, h.scheduler.permits.availablePermits())
             assertEquals(null, m.cpu.currentOwner)
@@ -208,7 +208,7 @@ class StopTest {
         val t0 = System.nanoTime()
         h.scheduler.close()
         assertTrue((System.nanoTime() - t0) / 1_000_000 < 1_000)
-        assertTrue(h.scheduler.awaitTermination(10_000))
+        h.scheduler.awaitTerminationOrFail()
         assertThrows<IllegalStateException> { h.machine() }
         assertNoKernelThreads()
     }

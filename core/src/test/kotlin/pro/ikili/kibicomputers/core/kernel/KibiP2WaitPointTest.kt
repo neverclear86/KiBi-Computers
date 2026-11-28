@@ -47,7 +47,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 待機点型（`WAIT_POINT`）の p2 のコマンドが、`kibi:device/bus` の `invoke` と `kibi:process` の `spawn`・`spawn-with-handles` を

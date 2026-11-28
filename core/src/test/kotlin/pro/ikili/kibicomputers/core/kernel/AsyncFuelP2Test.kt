@@ -30,7 +30,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * p2 のコマンド（コンポーネント）の、止まりうる関数の中の燃料切れも待ち点にする（#803。p1 の #339 に当たる。ADR 0757）。

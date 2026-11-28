@@ -18,7 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.tickUntilTrue
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 画面の大きさが変わったときの `tty-resize` のイベント（#427。ADR 0427） */
 class TtyResizeEventTest {

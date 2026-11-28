@@ -9,7 +9,7 @@ import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import pro.ikili.kibicomputers.core.persist.snapshot.TmpfsSectionCodec
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * スタックの底の近くで `/tmp`（[TmpFileSystem]）を変えても、RAM の勘定（マシン → サーバー全体の別々の CAS）と [TmpFileSystem.usedBytes]・

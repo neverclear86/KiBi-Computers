@@ -20,7 +20,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * カーネルの cwd を p1 の `PWD` で渡し、プログラムの起動処理（`kibi_cwd.c`）が wasi-libc の cwd を合わせる（#332、ADR 0332）。

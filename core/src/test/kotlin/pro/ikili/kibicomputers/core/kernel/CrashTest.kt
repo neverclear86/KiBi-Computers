@@ -17,7 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** トラップと例外のハンドリング（#41）: そのプロセスだけを CRASHED で終え、理由をコンソールに出す */
 class CrashTest {
@@ -71,7 +71,7 @@ class CrashTest {
             val m = h.machine(fuelPerTick = 100, host = host)
             Env(h, m, host).block()
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 
@@ -138,7 +138,7 @@ class CrashTest {
             Thread.sleep(1)
         }
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         h.scheduler.tick()
         assertState(ProcessState.KILLED, m, spinner)
         assertEquals("", host.console.toString())

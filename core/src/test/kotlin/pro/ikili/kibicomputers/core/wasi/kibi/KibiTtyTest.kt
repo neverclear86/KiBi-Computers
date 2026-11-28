@@ -26,7 +26,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 独自拡張 `kibi:io/tty` の意味の部分（[KibiTty]。#427）。プロセスの fd 0/1/2 はコンソールの TTY */
 class KibiTtyTest {

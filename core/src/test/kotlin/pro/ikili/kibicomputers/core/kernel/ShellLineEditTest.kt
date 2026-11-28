@@ -17,7 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.nio.charset.Charset
 import java.time.Duration
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 会話的な `/bin/sh` の行の編集・補完・履歴（#102）を、カーネルの TTY の上で動かして確かめる。

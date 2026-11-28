@@ -42,7 +42,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * ブロッキングするスタイルの Lua（コルーチンの上で待つもの）を丸ごと保存して戻す（#89）。

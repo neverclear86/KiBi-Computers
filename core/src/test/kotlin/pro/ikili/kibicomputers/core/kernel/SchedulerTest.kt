@@ -21,7 +21,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /** 同時に実行している数を数える */
 internal class ConcurrencyMeter {
@@ -249,7 +249,7 @@ class SchedulerTest {
             // 止めている途中の spawn は `stop中のspawnはIllegalStateException` が確かめる。
             // ここで状態を見てから spawn すると、その間に停止が終わって通ってしまう（#709）。
             m.stop()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
             assertEquals(MachineState.STOPPED, m.state)
         }
     }
@@ -276,7 +276,7 @@ class SchedulerTest {
             assertEquals(MachineState.STOPPING, m.state)
             assertThrows<IllegalStateException> { m.spawnTest(h.program(emptyModule()), runDriver()) }
             release.countDown()
-            assertTrue(m.awaitTermination(5_000))
+            m.awaitTerminationOrFail()
         }
     }
 

@@ -44,7 +44,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import pro.ikili.kibicomputers.core.testing.bodyTimeout as timeout
 
 /**
  * 写しの中で殺したプロセスの、復元の後の知らせ（#86、ADR 0086）。
@@ -298,7 +298,7 @@ class KilledOnSaveNoticeTest {
         release.countDown()
         h.scheduler.hooks.beforeInitExec = null
         m.stop()
-        assertTrue(m.awaitTermination(5_000))
+        m.awaitTerminationOrFail()
         m.close()
         return identity
     }
