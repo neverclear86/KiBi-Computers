@@ -13,7 +13,7 @@ internal class StackEdgeWalk(
     /** 最初の区間を探し直してやり直した回数 */
     val retries: Int,
 ) {
-    override fun toString(): String = "境目 $edge、最初の区間で尽きた $firstCrashed / $firstBatch 回（やり直し $retries 回）"
+    override fun toString(): String = "境目 $edge、最初の区間で境目の向こうだった $firstCrashed / $firstBatch 回（やり直し $retries 回）"
 }
 
 /**
