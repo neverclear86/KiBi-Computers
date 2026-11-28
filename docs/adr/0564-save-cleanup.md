@@ -234,10 +234,10 @@
   holder があって FULL でないチャンク（keeper で INACCESSIBLE に降りた `LevelChunk`、続くアンロード待ち）はケースがなくても「判定できない」、
   リージョンファイルのない位置は、リージョンファイルを作らずに「ない」、リージョンファイルのある所の IOWorker の書き込み待ちのケースは「ある」（ID が違う・種類が違うものは「ない」）、
   保存先に別の座標のリージョンファイルだけがあり、読み書きする側が既定の作りと確かめられないとき、台のディレクトリは残り「判定できない」に数えられ、リージョンファイルも作らない（書き込み待ちのケースも「ない」にならない。#899）、
-  GameTest のサーバーのチャンクの読み書きの経路に Mixin が当たっておらず、数える変換の記録もなく、既定の問いがファイル名で判定する（製品の jar の GameTest でも同じ）。入れ子のクラスの固定の一覧が実物の `declaredClasses` と一致して読み込め、確かめの対象に入る（#969）、
+  GameTest のサーバーのチャンクの読み書きの経路に Mixin が当たっておらず、数える変換の記録もなく、既定の問いがファイル名で判定する（製品の jar の GameTest でも同じ）。入れ子のクラスの固定の一覧が実物の `declaredClasses` と一致して読み込め、確かめの対象に入る（#969）。入れ子のクラスが `ClassNotFoundException`・`RuntimeException`・`LinkageError` で読み込めないと「クラス名: not found」が理由の先頭に入り、既定の作りでなくなる（`missingNestedClassMakesChunkStorageUntrusted`。#969）、
   Mixin の記録の判定（`mixinRecordsExplainMixinTransforms`。#969）: PLUGIN `mixin` のあるクラスで、アクセサーだけ（plugin のない config）なら数えず、合わせたメンバーのない Mixin を含む処理を書き換える Mixin・plugin のある config のアクセサー・
   記録が引けない・ない・空・読めない・説明できない `APP`・`DEC` は数える。PLUGIN `mixin` のないクラスでは記録を引かず（記録が例外を投げても数えない）、`ChunkMap` の PLUGIN `mixin` は数えない。入れ子のクラス・`ChunkStorage` も同じに見て、
-  入れ子の `RegionFile$ChunkBuffer` の印のない Mixin で既定の作りでなくなる。陽性の対照として、NeoForge 自身のアクセサーが当たる `BlockEntityType` の本物の記録に PLUGIN `mixin` があり、本物の Mixin の記録が
+  入れ子の `RegionFile$ChunkBuffer` の印のない Mixin で既定の作りでなくなる。本番の経路 `untrustedRegionStorage` でも、`ChunkMap` の PLUGIN `mixin` は説明できない Mixin の記録でも数えず（Mixin の記録を見る集合に `ChunkMap` を入れない配線）、読み書きの経路のクラスの PLUGIN `mixin` がアクセサーだけと説明できれば既定の作りのまま。陽性の対照として、NeoForge 自身のアクセサーが当たる `BlockEntityType` の本物の記録に PLUGIN `mixin` があり、本物の Mixin の記録が
   `BlockEntityTypeAccessor` をアクセサー・plugin なしとして返して数えない、
   実行時のクラス・インスタンス・印は本物のまま、記録の口に `RegionFileStorage` の PLUGIN `mixin:A` を、Mixin の記録の口に合わせたメンバーのない Mixin を足して本番の掃除を回すと、上の coremod と同じ2台が残る（`regionlessPositionIsKeptWhenEmptyMixinTransformsStorage`。#969）、
   変換の記録の判定（`transformAuditCountsCoremods`。#959）: 記録なし・許可した PLUGIN・REASON は数えず、TRANSFORMER・知らない PLUGIN（前方一致では許さない）・知らない種類・記録が引けない・読めない・

@@ -805,6 +805,17 @@ object SaveCleanupGameTests {
             nestedReasons.size == 1 && nestedReasons[0].startsWith("${chunkBuffer.name}: ") && "test.EmptyPluginMixin" in nestedReasons[0],
             "a mixin without merged members on the nested ChunkBuffer should make the chunk storage untrusted: $nestedReasons",
         )
+        // 既定の untrustedRegionStorage の経路が渡す、Mixin の記録を見る集合に ChunkMap が入らない（性能のための Mixin を数えない方針）。
+        // ChunkMap の PLUGIN mixin に、説明できない Mixin の記録（入っていれば数える）を返しても数えない
+        val chunkMapName = ChunkMap::class.java.name
+        val onChunkMap = TransformAudit { name -> audit!!.activities(name).let { if (name == chunkMapName) it.orEmpty() + MIXIN_PHASE else it } }
+        val chunkMapReasons = ChunkReferenceProbe.untrustedRegionStorage(helper.level.server, onChunkMap, empty)
+        helper.assertTrue(chunkMapReasons.isEmpty(), "a mixin on ChunkMap should not make the chunk storage untrusted: $chunkMapReasons")
+        // 既定の経路で、読み書きの経路のクラスの PLUGIN mixin がアクセサーだけと説明できれば数えない
+        val explainedNames = setOf(storage.name, chunkBuffer.name)
+        val onStorage = TransformAudit { name -> audit!!.activities(name).let { if (name in explainedNames) it.orEmpty() + MIXIN_PHASE else it } }
+        val accessorReasons = ChunkReferenceProbe.untrustedRegionStorage(helper.level.server, onStorage, ACCESSOR_ONLY)
+        helper.assertTrue(accessorReasons.isEmpty(), "accessor-only mixins on the chunk storage should keep it trusted: $accessorReasons")
         // 陽性の対照: NeoForge 自身のアクセサーの Mixin
         val registry = ChunkReferenceProbe.mixinRegistry()
         val blockEntityType = BlockEntityType::class.java.name
