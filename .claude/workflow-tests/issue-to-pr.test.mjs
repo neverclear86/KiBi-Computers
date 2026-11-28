@@ -442,6 +442,40 @@ for (const [name, m] of [
   })
 }
 
+test('ふつうのマージ: PR に needs-human が付いていた（labeled）ら、新しく聞かず、回し直しもしない（#1008）', async () => {
+  const r = await run({ merge: [fail('labeled', `PR #${PR} に needs-human が付いている（人の回答待ち）`)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 0)
+  assert.equal(r.count('cross-check'), 0)
+  assert.equal(r.count('ask'), 0)
+  assert.equal(r.count('stack-note'), 0)
+  assert.equal(r.result.questions.length, 0)
+  assert.equal(r.issue.question, null)
+  assert.match(r.issue.mergeReason, /needs-human が付いていた/)
+})
+
+test('ふつうのマージ: 回し直しのあとのマージの段階で needs-human が付いていた（labeled）ときも、新しく聞かない（#1008）', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [fail('labeled', '付いた')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.equal(r.count('cross-check'), 0)
+  assert.equal(r.count('ask'), 0)
+  assert.equal(r.result.questions.length, 0)
+  assert.match(r.issue.mergeReason, /needs-human が付いていた/)
+})
+
+test('ふつうのマージの指示は、取り込みの前と gh pr merge の直前に needs-human を確かめる（#1008）', async () => {
+  const r = await run()
+  const p = r.promptOf('merge')
+  const check = `gh pr view ${PR} --json labels`
+  const first = p.indexOf(check)
+  const second = p.indexOf(check, first + 1)
+  assert.ok(first >= 0 && first < p.indexOf('git merge origin/main'))
+  assert.ok(second > first && second < p.indexOf(`\`gh pr merge ${PR} --squash --delete-branch\``))
+  assert.match(p, /failedStep=labeled/)
+  assert.ok(r.schemaOf('merge').properties.failedStep.enum.includes('labeled'))
+})
+
 test('確かめが rerun で gradleStillRunning=true なら、merge-flaky-wait はせず、merge-rerun は Gradle を待たずに CI を待つ（#985）', async () => {
   const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, ...PENDING }], 'merge-rerun': [MERGED] })
   assert.equal(r.issue.status, 'merged')
@@ -994,6 +1028,52 @@ test('スタック: 下の段に needs-human があれば、取り込みも確�
   assert.ok(note)
   assert.match(note.prompt, /論点は PR #900 で扱う/)
   assert.equal(r.issue.stackPointer, 900)
+})
+
+test('スタック: 一番上の段（この流れの PR）だけに needs-human があっても、取り込みもマージもせず、新しく聞かない（#1008）', async () => {
+  const waiting = stackOf(LOWER, { ...TOP, needsHuman: true })
+  const r = await run({ 'stack-detect': [waiting], 'stack-check': [waiting] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.equal(r.count('cross-check'), 0)
+  assert.equal(r.count('ask'), 0)
+  assert.equal(r.result.questions.length, 0)
+  assert.equal(r.issue.stackPointer, PR)
+  // この実行にない下の段には、一番上の段を指す案内を付ける。論点の PR そのものには案内を付けない
+  const lower = r.promptsOf('stack-note').find(p => p.opts.label === 'stack-note:900')
+  assert.ok(lower)
+  assert.match(lower.prompt, new RegExp(`論点は PR #${PR} で扱う`))
+  assert.ok(!r.promptsOf('stack-note').some(p => p.opts.label === `stack-note:${PR}`))
+  assert.match(r.issue.mergeReason, new RegExp(`PR #${PR} に needs-human`))
+  assert.doesNotMatch(r.issue.mergeReason, /下の段/)
+})
+
+test('スタック: 両方の段に needs-human があれば、一番下の段を指し、新しく聞かない（#1008）', async () => {
+  const waiting = stackOf({ ...LOWER, needsHuman: true }, { ...TOP, needsHuman: true })
+  const r = await run({ 'stack-detect': [waiting], 'stack-check': [waiting] })
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('ask'), 0)
+  assert.equal(r.issue.stackPointer, 900)
+  assert.match(r.issue.mergeReason, /PR #900・PR #906/)
+})
+
+test('スタック: gh stack merge の直前に needs-human が付いていたら（labeled）、新しく聞かずに付いた段を指す（#1008）', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2], 'stack-merge': [fail('labeled', 'PR #900 に needs-human', { labeledPr: 900 })] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('cross-check'), 0)
+  assert.equal(r.count('ask'), 0)
+  assert.equal(r.result.questions.length, 0)
+  assert.equal(r.issue.stackPointer, 900)
+  // スタックのマージの指示は、gh stack merge の前に全段のラベルを見る
+  const p = r.promptOf('stack-merge')
+  assert.ok(p.indexOf('--json labels') >= 0 && p.indexOf('--json labels') < p.indexOf(`\`gh stack merge ${PR} --yes --squash\` を 1 回だけ実行する`))
+})
+
+test('スタック: labeled の labeledPr がスタックの段でなければ、一番上の段を指す（#1008）', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2], 'stack-merge': [fail('labeled', '付いていた', { labeledPr: null })] })
+  assert.equal(r.count('ask'), 0)
+  assert.equal(r.issue.stackPointer, PR)
 })
 
 test('スタック: 下の段が MERGED（部分マージのあと）なら、取り込まずに 1 回だけ聞く', async () => {
