@@ -6,6 +6,8 @@ import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.component.ComponentLimits
+import pro.ikili.kibicomputers.core.runtime.component.ComponentLoader
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 
@@ -96,6 +98,105 @@ class GcValidationWorkTest {
         val limits = ModuleLimits(maxGcValidationWork = 6)
         assertDoesNotThrow { ModulePrescan.check(module(4), limits, null) }
         assertMessage(rejects(module(5), limits), "検証の手間")
+    }
+
+    @Test
+    fun `要素セグメントの式のstruct_newとarray_new_fixedも数える`() {
+        fun module(fields: Int) = wat(
+            """
+            (module
+              (type %s (struct ${"(field i32) ".repeat(fields)}))
+              (table 2 (ref null %s))
+              (elem (table 0) (offset (i32.const 0)) (ref null %s) (item (struct.new_default %s)) (item (struct.new_default %s))))
+            """.trimIndent(),
+        )
+        val limits = ModuleLimits(maxGcValidationWork = 6)
+        assertDoesNotThrow { ModulePrescan.check(module(3), limits, null) }
+        assertMessage(rejects(module(4), limits), "検証の手間")
+        // 要素の式が array.new_fixed のとき（1 つの要素の数の上限も、要素の式に効く）
+        val arrays = wat(
+            """
+            (module
+              (type %a (array i32))
+              (table 1 (ref null %a))
+              (elem (table 0) (offset (i32.const 0)) (ref null %a) (item (array.new_fixed %a 3 (i32.const 1) (i32.const 2) (i32.const 3)))))
+            """.trimIndent(),
+        )
+        assertDoesNotThrow { ModulePrescan.check(arrays, ModuleLimits(maxArrayNewFixed = 3, maxGcValidationWork = 3), null) }
+        assertMessage(rejects(arrays, ModuleLimits(maxArrayNewFixed = 2)), "array.new_fixed の要素の数 3", "上限 2")
+        assertMessage(rejects(arrays, ModuleLimits(maxGcValidationWork = 2)), "検証の手間")
+    }
+
+    @Test
+    fun `コンポーネントの中のcoreモジュールにもGCの検証の手間の上限が効く`() {
+        val component = wat(
+            """
+            (component
+              (core module %m
+                (type %s (struct ${"(field i32) ".repeat(10)}))
+                (func (export "f") ${"(drop (struct.new_default %s)) ".repeat(4)})))
+            """.trimIndent(),
+        )
+        // コンポーネントの検証は、中の core モジュールの GC を（今は）断る。構造の確認（ModulePrescan）はその前なので、予算の側が先に効く
+        val passed = assertThrows<WasmLoadException> {
+            ComponentLoader.load(component, ComponentLimits(moduleLimits = ModuleLimits(maxGcValidationWork = 40)))
+        }
+        assertTrue(!passed.message!!.contains("検証の手間"), passed.message)
+        val e = assertThrows<WasmLoadException> {
+            ComponentLoader.load(component, ComponentLimits(moduleLimits = ModuleLimits(maxGcValidationWork = 39)))
+        }
+        assertMessage(e, "検証の手間", "上限 39")
+        val tooWide = assertThrows<WasmLoadException> {
+            ComponentLoader.load(component, ComponentLimits(moduleLimits = ModuleLimits(maxStructFields = 9)))
+        }
+        assertMessage(tooWide, "フィールドの数 10", "上限 9")
+    }
+
+    /**
+     * 型のセクションを、Endive が受け付ける最短でない符号化で書いたモジュール: struct の型の形 `0x5F` を `0xDF 0x00`、フィールドの型 i32 と
+     * 関数の型の引数の i32 を `0xFF 0x00` で書く（10 フィールド）。本体は `struct.new_default` を [count] 回。[trailing] は型のセクションの末尾に足す 0 のバイト数
+     */
+    private fun nonMinimalTypes(count: Int, trailing: Int = 0): ByteArray {
+        val fields = 10
+        val struct = byteArrayOf(0xDF.toByte(), 0x00, fields.toByte()) + ByteArray(fields * 3) { if (it % 3 == 0) 0xFF.toByte() else 0 }
+        val func = byteArrayOf(0x60, 0x01, 0xFF.toByte(), 0x00, 0x00)
+        val types = byteArrayOf(2) + struct + func + ByteArray(trailing)
+        val newDefaults = (0 until count).flatMap { listOf(0xFB.toByte(), 0x01, 0x00, 0x1A) }.toByteArray()
+        val body = byteArrayOf(0x00) + newDefaults + byteArrayOf(0x0B)
+        val code = byteArrayOf(1, body.size.toByte()) + body
+        fun section(id: Int, content: ByteArray) = byteArrayOf(id.toByte(), content.size.toByte()) + content
+        val header = byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00)
+        return header + section(1, types) + section(3, byteArrayOf(1, 1)) + section(10, code)
+    }
+
+    @Test
+    fun `型のセクションの最短でない符号化を、Endiveと同じに読んで上限を当てる`() {
+        // Endive はこの読み方で通す（struct の型は 10 フィールド）
+        assertDoesNotThrow { Program.loadMetered(runtime, nonMinimalTypes(3), ModuleLimits.DEFAULT) }
+        // 型の形・フィールドの型・関数の型の引数のどれも、読み間違えない（読み間違えると、型の並びがずれて上限が効かない）
+        assertDoesNotThrow { ModulePrescan.check(nonMinimalTypes(3), ModuleLimits(maxGcValidationWork = 30), null) }
+        assertMessage(rejects(nonMinimalTypes(4), ModuleLimits(maxGcValidationWork = 30)), "検証の手間", "上限 30")
+        assertMessage(rejects(nonMinimalTypes(1), ModuleLimits(maxStructFields = 9)), "フィールドの数 10", "上限 9")
+        assertMessage(
+            assertThrows<WasmLoadException> { Program.loadMetered(runtime, nonMinimalTypes(4), ModuleLimits(maxGcValidationWork = 30)) },
+            "検証の手間",
+        )
+    }
+
+    @Test
+    fun `型のセクションに読み残しがあれば断る`() {
+        assertDoesNotThrow { ModulePrescan.check(nonMinimalTypes(1), ModuleLimits.DEFAULT, null) }
+        assertMessage(rejects(nonMinimalTypes(1, trailing = 1), ModuleLimits.DEFAULT), "型のセクションの大きさに合わない", "1 バイトが読み残される")
+    }
+
+    @Test
+    fun `型のセクションが2つあれば断る`() {
+        val one = nonMinimalTypes(1)
+        // ヘッダーのあとの型のセクション（id 1）を、もう 1 つ続ける
+        val sectionLength = 2 + one[9].toInt()
+        val typeSection = one.copyOfRange(8, 8 + sectionLength)
+        val twice = one.copyOfRange(0, 8 + sectionLength) + typeSection + one.copyOfRange(8 + sectionLength, one.size)
+        assertMessage(rejects(twice, ModuleLimits.DEFAULT), "型のセクションが 2 つある")
     }
 
     @Test

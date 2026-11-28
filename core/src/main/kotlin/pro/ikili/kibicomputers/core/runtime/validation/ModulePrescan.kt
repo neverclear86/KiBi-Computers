@@ -8,6 +8,7 @@ import run.endive.wasm.types.GlobalSection
 import run.endive.wasm.types.Instruction
 import run.endive.wasm.types.OpCode
 import run.endive.wasm.types.SectionId
+import run.endive.wasm.types.TypeSection
 import java.io.ByteArrayInputStream
 
 /**
@@ -55,7 +56,8 @@ internal object ModulePrescan {
         for (i in 0 until 4) if (bytes[i] != HEADER[i]) fail("WASM のヘッダーがない")
         for (i in 4 until 8) if (bytes[i] != HEADER[i]) fail("WASM のコアモジュール（version 1）ではない")
         val r = Reader(bytes, HEADER.size, bytes.size)
-        var structFields: IntArray? = null
+        var hasGcTypes = false
+        var seenTypes = false
         while (r.pos < r.end) {
             val id = r.u8()
             val size = r.u32()
@@ -64,7 +66,12 @@ internal object ModulePrescan {
             r.pos = s.end
             when (id) {
                 SEC_CUSTOM, SEC_START, SEC_DATA_COUNT -> Unit
-                SEC_TYPE -> structFields = checkTypes(s, limits)
+                SEC_TYPE -> {
+                    // Endive も型のセクションが 2 つあれば断る。ここで見る型の表と Endive が読む表を、1 つに決めておく
+                    if (seenTypes) fail("型のセクションが 2 つある")
+                    seenTypes = true
+                    hasGcTypes = checkTypes(s, limits)
+                }
                 SEC_IMPORT -> s.count("import", limits.maxImports)
                 SEC_FUNCTION -> s.count("関数", limits.maxFunctions)
                 SEC_TABLE -> checkTables(s, limits)
@@ -79,66 +86,83 @@ internal object ModulePrescan {
             }
         }
         deadline?.check("構造の確認")
-        if (structFields != null) {
-            checkGcWork(bytes, structFields, limits, deadline)
+        if (hasGcTypes) {
+            checkGcWork(bytes, limits, deadline)
             deadline?.check("構造の確認")
         }
     }
 
     /**
-     * 型のセクションを読み、型の数とフィールドの数を確かめる。GC の型（struct か array）があれば、平らな型の番号（rec グループの中の型を
-     * 1 つずつ数えた番号）ごとの struct のフィールドの数（struct でない型は 0）を返す。GC の型がなければ `null`
+     * 型のセクションを読み、型の数とフィールドの数を確かめる。GC の型（struct か array）があれば `true`
      *
-     * 読み方は Endive 1.2.0 の `Parser.parseRecType` と同じ: `0x4E` は subtype のベクター、`0x50`・`0x4F` は親の型の番号のベクターと comptype、
-     * ほかは comptype だけ。comptype は `0x5E`（array）・`0x5F`（struct）・`0x60`（関数）で、ほかは断る（Endive も断る）
+     * 読み方は Endive 1.2.0 の `Parser.parseTypeSection` と合わせる（ずれると、ここで見た型の並びと Endive が検証する並びが違い、上限が効かなくなる）。
+     * 値の型のコードと型の形の識別子は、`readVarUInt32`（最短でない符号化も受け付ける）で読む。
+     * `0x4E` は subtype のベクター、`0x50`・`0x4F` は親の型の番号のベクターと comptype、ほかは comptype だけ。comptype は
+     * `0x5E`（array）・`0x5F`（struct）・`0x60`（関数）で、ほかは断る（Endive も断る）。読み終わったあとにセクションの読み残しがあれば断る
+     * （Endive は section size mismatch で断る）
      */
-    private fun checkTypes(s: Reader, limits: ModuleLimits): IntArray? {
+    private fun checkTypes(s: Reader, limits: ModuleLimits): Boolean {
         val groups = s.count("型", limits.maxTypes)
-        var fields = IntArray(minOf(groups, 16))
         var types = 0
         var totalFields = 0L
         var gc = false
-        fun subType() {
-            var form = s.u8()
-            if (form == 0x50 || form == 0x4F) {
+        fun subType(head: Long) {
+            var form = head
+            if (form == 0x50L || form == 0x4FL) {
                 repeat(s.count("親の型", limits.maxTypes)) { s.u32() }
-                form = s.u8()
+                form = s.u32()
             }
-            var n = 0
             when (form) {
-                0x5E -> {
+                0x5EL -> {
                     s.fieldType()
                     gc = true
                 }
-                0x5F -> {
+                0x5FL -> {
                     val count = s.u32()
                     if (count > limits.maxStructFields) fail("struct の型 $types のフィールドの数 $count が上限 ${limits.maxStructFields} を超える")
                     if (count > s.end - s.pos) fail("struct の型 $types のフィールドの数 $count が型のセクションの大きさに合わない")
                     totalFields += count
                     if (totalFields > limits.maxTotalStructFields) fail("struct の型のフィールドの数の合計が上限 ${limits.maxTotalStructFields} を超える")
                     repeat(count.toInt()) { s.fieldType() }
-                    n = count.toInt()
                     gc = true
                 }
-                0x60 -> {
+                0x60L -> {
                     repeat(s.count("関数の型の引数", Int.MAX_VALUE)) { s.valType() }
                     repeat(s.count("関数の型の戻り値", Int.MAX_VALUE)) { s.valType() }
                 }
                 else -> fail("知らない型の形 0x${form.toString(16)}")
             }
-            if (types >= limits.maxTypes) fail("型の数（rec グループの中の型も数える）が上限 ${limits.maxTypes} を超える")
-            if (types == fields.size) fields = fields.copyOf(maxOf(16, fields.size * 2))
-            fields[types++] = n
+            if (++types > limits.maxTypes) fail("型の数（rec グループの中の型も数える）が上限 ${limits.maxTypes} を超える")
         }
         repeat(groups) {
-            if (s.peek() == 0x4E) {
-                s.u8()
-                repeat(s.count("rec グループの型", limits.maxTypes)) { subType() }
+            val head = s.u32()
+            if (head == 0x4EL) {
+                repeat(s.count("rec グループの型", limits.maxTypes)) { subType(s.u32()) }
             } else {
-                subType()
+                subType(head)
             }
         }
-        return if (gc) fields.copyOf(types) else null
+        if (s.pos != s.end) fail("型のセクションの大きさに合わない（${s.end - s.pos} バイトが読み残される）")
+        return gc
+    }
+
+    /**
+     * Endive の型の表から、平らな型の番号（rec グループの中の型を 1 つずつ数えた番号）ごとの struct のフィールドの数（struct でない型は 0）を作る。
+     * [checkTypes] と同じ上限を、Endive が読んだ表にも当てる（2 つの読み方が食い違っても、上限が効くように）
+     */
+    private fun structFieldCounts(types: TypeSection, limits: ModuleLimits): IntArray {
+        val n = types.subTypeCount()
+        if (n > limits.maxTypes) fail("型の数（rec グループの中の型も数える）が上限 ${limits.maxTypes} を超える")
+        val counts = IntArray(n)
+        var total = 0L
+        for (i in 0 until n) {
+            val fields = types.getSubType(i).compType().structType()?.fieldTypes()?.size ?: continue
+            if (fields > limits.maxStructFields) fail("struct の型 $i のフィールドの数 $fields が上限 ${limits.maxStructFields} を超える")
+            total += fields
+            if (total > limits.maxTotalStructFields) fail("struct の型のフィールドの数の合計が上限 ${limits.maxTotalStructFields} を超える")
+            counts[i] = fields
+        }
+        return counts
     }
 
     /**
@@ -150,11 +174,14 @@ internal object ModulePrescan {
      * `struct.new`・`struct.new_default` は型のフィールドの数、`array.new_fixed` は要素の数を足し上げる。届かない場所（`unreachable` の後）も数える
      * （検証はそこも確かめる）。`array.new_fixed` は 1 つで重くできるので、1 つの要素の数にも上限（[ModuleLimits.maxArrayNewFixed]）を置く。
      *
-     * 命令は Endive の検証なしの parse（型・グローバル・要素・コードのセクションだけ）で読む（後の検証が見るものと同じ並び）。
-     * parse が失敗するモジュールは、ここでは断らずに通す（後のランタイムの parse が同じところで失敗して、いつもの理由で断る。
-     * 重い検証は parse の後なので、そこには届かない）。struct でない型の番号は 0 と数える（検証は最初の命令で断る）
+     * 型の表と命令は Endive の検証なしの parse（型・グローバル・要素・コードのセクションだけ）で読む（後の検証が見るものと同じ並び。
+     * 自前の読み手の表は使わない）。parse が失敗するモジュールは、ここでは断らずに通す（後のランタイムの parse が同じところで失敗して、
+     * いつもの理由で断る。重い検証は parse の後なので、そこには届かない）。struct でない型の番号は 0 と数える（検証は最初の命令で断る）。
+     *
+     * この parse 自体にも、型の大きさ × 具体的な型への参照の数の手間が残る（`ValType.resolve`。#1042）
      */
-    private fun checkGcWork(bytes: ByteArray, structFields: IntArray, limits: ModuleLimits, deadline: LoadDeadline?) {
+    private fun checkGcWork(bytes: ByteArray, limits: ModuleLimits, deadline: LoadDeadline?) {
+        var types: TypeSection? = null
         val code = ArrayList<CodeSection>(1)
         val globals = ArrayList<GlobalSection>(1)
         val elements = ArrayList<ElementSection>(1)
@@ -168,6 +195,7 @@ internal object ModulePrescan {
                 .build()
                 .parse(ByteArrayInputStream(bytes)) { section ->
                     when (section) {
+                        is TypeSection -> types = section
                         is CodeSection -> code += section
                         is GlobalSection -> globals += section
                         is ElementSection -> elements += section
@@ -180,6 +208,8 @@ internal object ModulePrescan {
             return
         }
         deadline?.check("構造の確認")
+        // フィールドの数は、Endive が読んだ型の表（後の検証が見るもの）から取る。自前の読み手の表には頼らない
+        val structFields = structFieldCounts(types ?: return, limits)
         var work = 0L
         var seen = 0
         fun add(ins: Instruction) {
@@ -289,16 +319,17 @@ internal object ModulePrescan {
 
         /** struct・array のフィールドの型（i8・i16 か値の型と、可変かの 1 バイト）を読み飛ばす */
         fun fieldType() {
-            if (peek() == 0x78 || peek() == 0x77) u8() else valType()
+            valType() // i8・i16（0x78・0x77）も、後ろに何も付かない 1 つの型のコードとして同じに読める
             u8()
         }
 
-        /** 値の型（参照の型を含む）を読み飛ばす */
+        /**
+         * 値の型（参照の型を含む）を読み飛ばす。型のコードは Endive と同じ `readVarUInt32`（最大 5 バイトで、最短でない符号化も受ける）で読み、
+         * 0x63・0x64 のときだけヒープの型が付く。ほかのコードは、どんなバイトでも 1 つの型として読む（検査は Endive に任せる）
+         */
         fun valType() {
-            when (u8()) {
-                0x63, 0x64 -> skipS33() // (ref null? ヒープの型)
-                else -> Unit // 数・ベクター・短い形の参照の型は 1 バイト
-            }
+            val code = u32()
+            if (code == 0x63L || code == 0x64L) skipS33() // (ref null? ヒープの型)
         }
 
         fun refType() = valType()
