@@ -138,7 +138,9 @@ class HostWaitTest {
     @Test
     fun `closeHostWaitで閉じたホスト呼び出しは実行しない`() = timeout(limit) {
         Harness().use { h ->
-            val m = h.machine()
+            // 燃料を先に入れ、閉じ終わるまで tick を回さない。tick が閉じる前に列から取り出した分は
+            // 走るのが仕様なので（closeHostWait の KDoc）、tick と競合させない（#1014）
+            val m = h.machine().also { it.fillFuel() }
             val ran = AtomicBoolean()
             val ranOther = AtomicBoolean()
             val pid = m.spawnTest(
@@ -152,6 +154,11 @@ class HostWaitTest {
                     StepResult.Wait(listOf(kept.key))
                 },
             )
+            // tick を回さずに待機点まで待つ。閉じた呼び出しは列からも待ちの表からも外れている
+            eventually { m.parkedAtWaitPoint(pid) && m.pendingHostCalls == 1 }
+            assertFalse(ran.get())
+            assertFalse(ranOther.get())
+            assertEquals(1, m.hostCompletions())
             h.tickUntil { m.stateOf(pid) == ProcessState.EXITED }
             assertFalse(ran.get())
             assertTrue(ranOther.get())
