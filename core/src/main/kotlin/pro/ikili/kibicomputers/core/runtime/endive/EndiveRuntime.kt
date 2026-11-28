@@ -59,6 +59,7 @@ import run.endive.wasm.Parser
 import run.endive.wasm.UninstantiableException
 import run.endive.wasm.UnlinkableException
 import run.endive.wasm.WasmEngineException
+import run.endive.wasm.types.ActiveDataSegment
 import run.endive.wasm.types.ActiveElement
 import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
@@ -169,9 +170,9 @@ public class EndiveRuntime internal constructor(
             throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
         return try {
-            // Endive の検証が確かめないパッシブ・宣言の要素の式を確かめる（#893）。正しくない WASM を「対応していない作り」と報告しないよう、
-            // #706 の判定より先に見る
-            invalidPassiveElementInitializer(module)?.let { throw WasmLoadException("WASM の検証に通らない: $it") }
+            // Endive の検証が確かめない定数式の型を確かめる（パッシブ・宣言の要素は #893、グローバル・アクティブの要素・表・データは #942）。
+            // 正しくない WASM を「対応していない作り」と報告しないよう、#706 の判定より先に見る
+            invalidConstExpr(module)?.let { throw WasmLoadException("WASM の検証に通らない: $it") }
             // Endive が違う関数を置いてしまう形は、動かす前に断る（#706。正しくない結果になるので、対応しない作りとして扱う）
             foreignFuncRefInitializer(module)?.let {
                 throw WasmLoadException("対応していない作り: $it（Endive が別の関数を置いてしまう。#706）")
@@ -630,23 +631,33 @@ public class EndiveRuntime internal constructor(
         }
 
         /**
-         * パッシブ・宣言の要素セグメントの項目の式のうち、正しい定数式でないものがあれば、その場所と理由。なければ `null`（#893）。
-         * 場所の番号は [gcObjectInitializer] と同じく、セクションの中の番号
+         * 定数式のうち、正しくないものがあれば、その場所と理由。なければ `null`（#893・#942）。
+         * 場所の番号は [gcObjectInitializer] と同じく、セクションの中の番号（グローバルは import を数えない）
          *
-         * Endive 1.2.0 の検証（`Validator.validateElements`）は、アクティブの要素の式しか定数式として確かめない。パッシブ（flag 1・5）・
-         * 宣言（flag 3・7）の要素の式は、定数式に使えない命令（`drop` など）・型の合わない値（funcref の要素の `v128.const` など）でも
-         * 通してしまい、`table.init`・`array.new_elem` で使うと、正しくない値が表・配列に入るか、JVM の例外で止まる。
+         * Endive 1.2.0 の検証（`Validator.validateConstantExpression`）は、式の結果の型しか確かめず、命令が取る値の型を確かめない
+         * （`(global i32 (i32.add (i64.const 1) (i64.const 2)))`、`struct.new` のフィールドの型が違う値など）。さらに、パッシブ（flag 1・5）・
+         * 宣言（flag 3・7）の要素の式は、定数式としても確かめない（`drop` なども通る）。どちらも、型の合わない値が `struct.get`・`table.init`・
+         * `call_indirect` などに届き、正しくない値が使われるか、JVM の例外（`ArrayIndexOutOfBoundsException` など）で止まる。
+         * ここでは、次の場所の式を同じ規則（[constExprProblem]）で確かめる:
+         * - グローバルの初期値: 期待する型はグローバルの型。`global.get` は、import したものと自分より前のグローバルだけ
+         * - 表の初期値: 期待する型は表の要素の型。`global.get` は import したグローバルだけ（表のセクションはグローバルのセクションより前にあり、
+         *   仕様でも定義したグローバルは見えない。Endive は全グローバルで通すが、インスタンスを作るとき、表の初期値をグローバルの初期化より前に
+         *   評価するので、定義したグローバルは読めない）
+         * - 要素セグメント・データセグメントのオフセット（アクティブ）: i32（Endive と同じ）。全グローバル
+         * - 要素セグメントの項目（アクティブ・パッシブ・宣言）: 期待する型は要素の型（アクティブで要素の型が表の型に合うことは、Endive が確かめる）。
+         *   全グローバル
+         *
          * 式の先頭の `ref.func` の範囲（flag 1・3 の番号の並びを含む）は、Endive の検証（`Validator` のコンストラクターの `declaredFunctions`）が
-         * もう断るので、ここに届くのは先頭でない `ref.func` だけ。Endive がアクティブの要素に使うのと同じ規則（`Validator.validateConstantExpression`）で確かめる:
-         * 定数式の命令だけで、スタックにちょうど 1 つの値が残り、その型が要素の型に合う（[ValType.matches]）。`global.get` は不変のグローバルだけ。
-         * Endive の `validateConstantExpression` は命令が取る値の型を確かめないが、ここでは確かめる。取る値の型が合わない式
-         * （`struct.new` のフィールドの型が違う値など）も、`table.init`・`struct.get` などを経て、正しくない値・JVM の例外に届くため。
-         * `any.convert_extern`・`extern.convert_any` の結果が null を持てるかは、取った値に従う。
+         * もう断るので、ここに届くのは先頭でない `ref.func` だけ。
+         * 型が合うかは [valTypeMatches]（Endive の `ValType.matches` の、`none` を eq・struct・array・i31 の部分型として扱わない穴をふさいだもの）で決める。
+         * 判定は読み込みのときに 1 回だけ（関数の型とグローバルの一覧は 1 回だけ作る）。コストは「命令が取る値の数（式の長さの和に比例）×
+         * 型の照合 1 回のコスト」で、式の長さだけには比例しない: 型の番号の違う型どうしの照合（Endive の `ValType.matches` →
+         * `heapTypeSubtype`）は、上位の型を 1 段ずつたどり、各段で rec グループの全部の型を構造で比べ（`TypeSection.canonicallyEquivalent`）、
+         * グループの外の型への参照は結果を覚えずに比べ直すので、型セクションの形しだいで大きくなる。同じ照合は Endive 自身の検証
+         * （関数の本体と、定数式の結果の型）も 1 命令・1 式ごとに呼ぶので、ここで新しい最悪の場合を足すわけではない（回数が定数式の取る値の分だけ増える）。
          * Endive が直ったら、この判定を外す
          */
-        internal fun invalidPassiveElementInitializer(module: EndiveModule): String? {
-            val elements = module.elementSection()
-            if (elements.elementCount() == 0) return null
+        internal fun invalidConstExpr(module: EndiveModule): String? {
             val imports = module.importSection()
             val funcTypes = ArrayList<Int>()
             val globals = ArrayList<Pair<ValType, Boolean>>() // 型と、可変か
@@ -657,19 +668,46 @@ public class EndiveRuntime internal constructor(
                     else -> {}
                 }
             }
+            val importedGlobals = globals.size
             val functions = module.functionSection()
             for (i in 0 until functions.functionCount()) funcTypes += functions.getFunctionType(i)
-            for (g in module.globalSection().globals()) globals += g.valueType() to (g.mutabilityType() != MutabilityType.Const)
+            val defined = module.globalSection().globals()
+            for (g in defined) globals += g.valueType() to (g.mutabilityType() != MutabilityType.Const)
             val types = module.typeSection()
+            // 一覧は 1 回だけ作り、場所ごとに読めるグローバルの数（上限）だけを変える
+            fun check(expr: List<Instruction>, expected: ValType, what: String, limit: Int, scope: String): String? =
+                constExprProblem(expr, expected, what, funcTypes, globals, limit, scope, types)
+            defined.forEachIndexed { i, g ->
+                check(g.initInstructions(), g.valueType(), "グローバルの型", importedGlobals + i, "import したものか前のグローバルだけ")
+                    ?.let { return "グローバル $i の初期値: $it" }
+            }
+            val tables = module.tableSection()
+            for (i in 0 until tables.tableCount()) {
+                val t = tables.getTable(i)
+                val init: List<Instruction> = t.initialize() ?: continue
+                check(init, t.elementType(), "表の要素の型", importedGlobals, "import したものだけ")?.let { return "表 $i の初期値: $it" }
+            }
+            val elements = module.elementSection()
             for (i in 0 until elements.elementCount()) {
                 val el = elements.getElement(i)
-                if (el is ActiveElement) continue
-                val kind = if (el is PassiveElement) "パッシブ" else "宣言"
-                el.initializers().forEachIndexed { j, init ->
-                    constExprProblem(init, el.type(), funcTypes, globals, types)?.let {
-                        return "要素セグメント $i（$kind）の項目 $j: $it"
-                    }
+                val kind = when (el) {
+                    is ActiveElement -> "アクティブ"
+                    is PassiveElement -> "パッシブ"
+                    else -> "宣言"
                 }
+                if (el is ActiveElement) {
+                    check(el.offset(), ValType.I32, "オフセットの型", globals.size, "")
+                        ?.let { return "要素セグメント $i（$kind）のオフセット: $it" }
+                }
+                el.initializers().forEachIndexed { j, init ->
+                    check(init, el.type(), "要素の型", globals.size, "")?.let { return "要素セグメント $i（$kind）の項目 $j: $it" }
+                }
+            }
+            val data = module.dataSection()
+            for (i in 0 until data.dataSegmentCount()) {
+                val ds = data.getDataSegment(i) as? ActiveDataSegment ?: continue
+                check(ds.offsetInstructions(), ValType.I32, "オフセットの型", globals.size, "")
+                    ?.let { return "データセグメント $i のオフセット: $it" }
             }
             return null
         }
@@ -677,12 +715,18 @@ public class EndiveRuntime internal constructor(
         /** [constExprProblem] の途中で、正しくない理由が分かったときの中断 */
         private class ConstExprProblem(message: String) : RuntimeException(message)
 
-        /** [expr] が [expected] の型の正しい定数式でなければ、その理由（[invalidPassiveElementInitializer]） */
+        /**
+         * [expr] が [expected] の型の正しい定数式でなければ、その理由（[invalidConstExpr]）。[what] は [expected] の呼び名（文面に使う）。
+         * `global.get` で読めるのは、[globals] の先頭の [globalLimit] 個だけ（[scope] はその範囲の説明。全部読めるときは使わない）
+         */
         private fun constExprProblem(
             expr: List<Instruction>,
             expected: ValType,
+            what: String,
             funcTypes: List<Int>,
             globals: List<Pair<ValType, Boolean>>,
+            globalLimit: Int,
+            scope: String,
             types: TypeSection,
         ): String? {
             val stack = ArrayList<ValType>()
@@ -693,7 +737,7 @@ public class EndiveRuntime internal constructor(
             fun pop(op: OpCode, want: ValType): ValType {
                 if (stack.isEmpty()) fail("スタックの値が足りない")
                 val actual = stack.removeAt(stack.size - 1)
-                if (!ValType.matches(actual, want, types)) fail("命令 $op が取る値の型（$actual）が期待する型（$want）に合わない")
+                if (!valTypeMatches(actual, want, types)) fail("命令 $op が取る値の型（$actual）が期待する型（$want）に合わない")
                 return actual
             }
             // struct のフィールド・array の要素の型を、スタックの値の型にしたもの（i8・i16 は i32）
@@ -742,6 +786,8 @@ public class EndiveRuntime internal constructor(
                         OpCode.GLOBAL_GET -> {
                             val idx = ins.operand(0)
                             if (idx < 0 || idx >= globals.size) fail("グローバルがない")
+                            // 番号は global.get の番号（import を数える）。場所の番号（セクションの中の番号。import を数えない）と区別して書く
+                            if (idx >= globalLimit) fail("global.get が読むグローバル $idx（import を数えた番号）はここでは読めない（$scope）")
                             val (type, mutable) = globals[idx.toInt()]
                             if (mutable) fail("可変のグローバルは定数式で読めない")
                             type
@@ -794,11 +840,36 @@ public class EndiveRuntime internal constructor(
                 }
                 if (stack.size != 1) fail("定数式の値が ${stack.size} 個（1 個でない）")
                 val actual = stack[0]
-                if (!ValType.matches(actual, expected, types)) fail("値の型（$actual）が要素の型（$expected）に合わない")
+                if (!valTypeMatches(actual, expected, types)) fail("値の型（$actual）が$what（$expected）に合わない")
             } catch (e: ConstExprProblem) {
                 return e.message
             }
             return null
+        }
+
+        /**
+         * [actual] が [want] の部分型か（[constExprProblem] が使う）。Endive 1.2.0 の `ValType.matches` の、null の底の型 `none` の穴（eq・struct・array・i31 の部分型として扱わない）をふさいだもの。
+         *
+         * Endive の `heapTypeSubtype` は、`none` を any と番号の struct・array の型の部分型としか扱わず、eq・struct・array・i31 の部分型として扱わない
+         * （仕様では `none` は any の階層の全部の型の部分型）。そのままでは、`(struct.new $X (ref.null none))`（`$X` のフィールドが eqref など）のような
+         * 正しい WASM を断ってしまう（`ref.null none` は Binaryen が any の階層の null に出す標準の形）。`nofunc`・`noextern`・`noexn` は Endive が
+         * 正しく扱うので、そのまま任せる。null を持てるかは、`ValType.matches` と同じく、[actual] が null を持てるなら [want] も持てるときだけ通す。
+         * Endive が直ったら、`ValType.matches` に戻す（#1013）
+         */
+        internal fun valTypeMatches(actual: ValType, want: ValType, types: TypeSection): Boolean {
+            if (actual.isReference && want.isReference && actual.typeIdx() == ValType.TypeIdxCode.NONE.code()) {
+                if (actual.isNullable && !want.isNullable) return false
+                val heap = want.typeIdx()
+                return when (heap) {
+                    ValType.TypeIdxCode.NONE.code(), ValType.TypeIdxCode.ANY.code(), ValType.TypeIdxCode.EQ.code(),
+                    ValType.TypeIdxCode.I31.code(), ValType.TypeIdxCode.STRUCT.code(), ValType.TypeIdxCode.ARRAY.code(),
+                    -> true
+                    else -> heap >= 0 && heap < types.subTypeCount() && types.getSubType(heap).compType().let {
+                        it.structType() != null || it.arrayType() != null
+                    }
+                }
+            }
+            return ValType.matches(actual, want, types)
         }
 
         /** 値をスタックから取って、GC のオブジェクト（struct・array）の中に入れる命令（`*.new_default`・`array.new_elem`・`array.new_data` は値を取らない） */

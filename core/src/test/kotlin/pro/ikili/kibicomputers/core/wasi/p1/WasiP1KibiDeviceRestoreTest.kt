@@ -40,6 +40,7 @@ import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.MachineSnapshot
+import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
 import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
@@ -132,14 +133,22 @@ class WasiP1KibiDeviceRestoreTest {
                 h.scheduler.tick()
                 pendingCall(m, pid)?.state is PendingDeviceCall.State.Done && m.isAtWaitPoint
             }
-            assertEquals(ProcessState.RUNNABLE, m.stateOf(pid))
         }
+        // 待機点なら保存できる。ただし DONE の段では、止めた後に起こされたプロセスに、ワーカーが step を1回だけ始めて
+        // 燃料待ちへ戻る間がある（その間はスレッドを持つので TRANSIENT。ADR 0043、isAtWaitPointLocked。#1020）。
+        // 上の isAtWaitPoint はその前に真になりうるので、写しが取れるまで待つ。取れた最初の写しをそのまま使う
+        // （写しを取ると captureToken と差分の基準が進むので、取り直さない）
+        var taken: MachineSnapshotSource? = null
+        eventually(60_000, "待っている間は保存できる") {
+            taken = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)
+            taken != null
+        }
+        val snapshot = taken!!
+        if (stage == Stage.DONE) assertEquals(ProcessState.RUNNABLE, m.stateOf(pid))
         val call = pendingCall(m, pid)
         assertNotNull(call)
         val identity = store.assignNewId(owner)!!
-        val snapshot = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)
-        assertNotNull(snapshot, "待っている間は保存できる")
-        assertSectionLayout(snapshot!!.build(identity.id, identity.generation, "test"))
+        assertSectionLayout(snapshot.build(identity.id, identity.generation, "test"))
         val written = store.write(identity, owner, snapshot).identity
         hold?.close()
         m.close()

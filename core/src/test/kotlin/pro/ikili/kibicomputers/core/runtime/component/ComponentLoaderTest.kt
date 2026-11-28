@@ -1136,7 +1136,7 @@ class ComponentLoaderTest {
         val e = estimateOf(small)
         assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.checkCount} × ${e.maxTypeWeight} = ${e.cost}" }
         assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
-        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 175 万。うち型のたどり（#955）は約 2.5 万。実際の検証は CPU 0.5 秒ほど）
+        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 183 万。うち型のたどり（#955）は約 3.2 万。#963 で型を付けた export の確認に付けた型の大きさを足した後。実際の検証は CPU 0.5 秒ほど）
         val large = composedComponent(k = 20, n = 20)
         val l = estimateOf(large)
         assertTrue(l.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${l.checkCount} × ${l.maxTypeWeight} = ${l.cost}（写し直し ${l.remapCost}）" }
@@ -1584,6 +1584,135 @@ class ComponentLoaderTest {
         val e = estimateOf(bytes)
         assertTrue(e.remapCost >= 60L * 900 * 900 / 2) { "${e.remapCost}" }
         rejectedBeforeValidation(bytes)
+    }
+
+    /**
+     * `(func)` の import を [imports] 個持つコンポーネント型 `$ct` と、`$ct` を export に持つインスタンス型 `$it` を定義し、
+     * 入れ子のコンポーネント 1 つにつき [body] で作る型を付けた export を [perNested] 個並べたものを [nested] 個置く（#963）
+     */
+    private fun ascribedExports(imports: Int, nested: Int, perNested: Int, body: (Int) -> String): ByteArray {
+        val funcs = (0 until imports).joinToString(" ") { """(import "i$it" (func))""" }
+        val components = (0 until nested).joinToString("\n") { n ->
+            val exports = (0 until perNested).joinToString(" ") { body(n * perNested + it) }
+            """
+            (component
+              (alias outer 1 ${'$'}ct (type ${'$'}ct))
+              (alias outer 1 ${'$'}it (type ${'$'}it))
+              (component ${'$'}empty)
+              (type ${'$'}x (component))
+              (instance ${'$'}i (export "c" (component ${'$'}empty)))
+              $exports
+            )
+            """
+        }
+        return wat(
+            """
+            (component
+              (type ${'$'}ct (component $funcs))
+              (type ${'$'}it (instance (alias outer 1 ${'$'}ct (type ${'$'}c)) (export "c" (component (type ${'$'}c)))))
+              $components
+            )
+            """,
+        )
+    }
+
+    @Test
+    fun `型を付けたexportの確認は、付けた型の大きさも数える`() {
+        // #935 のレビューの形: import 4,000 個のコンポーネント型を付けた、空のコンポーネントの export が 1,000 個（約 73 KB）。
+        // 渡す側（空のコンポーネント）の大きさだけで数えると見積もりは約 1,000 で通り、検証は CPU 2.6 秒ほどかかっていた
+        val component = ascribedExports(imports = 4000, nested = 10, perNested = 100) {
+            """(export "e$it" (component ${'$'}empty) (component (type ${'$'}ct)))"""
+        }
+        assertTrue(component.size < 100_000) { "${component.size}" }
+        val c = estimateOf(component)
+        assertEquals(1_000L, c.checkCount)
+        // 1 回の確認で、付けた型の import 4,000 個（それぞれ (func) の大きさ）を数える
+        assertTrue(c.cost - c.remapCost >= 1_000L * 4_000) { "${c.cost} - ${c.remapCost}" }
+        rejectedBeforeValidation(component)
+
+        // インスタンス型の export に入れたコンポーネント型も、wasmparser は同じく受ける側の import を写してたどる
+        val wrapped = ascribedExports(imports = 4000, nested = 10, perNested = 100) {
+            """(export "x$it" (instance ${'$'}i) (instance (type ${'$'}it)))"""
+        }
+        val w = estimateOf(wrapped)
+        assertEquals(1_000L, w.checkCount)
+        assertTrue(w.cost - w.remapCost >= 1_000L * 4_000) { "${w.cost} - ${w.remapCost}" }
+        rejectedBeforeValidation(wrapped)
+
+        // `(type (eq ..))` で付けた型（空のコンポーネント型 `$x` を、import の多い `$ct` と等しいものとして export する）も、同じく数える
+        val eq = ascribedExports(imports = 4000, nested = 10, perNested = 100) {
+            """(export "t$it" (type ${'$'}x) (type (eq ${'$'}ct)))"""
+        }
+        assertTrue(eq.size < 100_000) { "${eq.size}" }
+        val q = estimateOf(eq)
+        assertEquals(1_000L, q.checkCount)
+        assertTrue(q.cost - q.remapCost >= 1_000L * 4_000) { "${q.cost} - ${q.remapCost}" }
+        rejectedBeforeValidation(eq)
+
+        // 付けた型が小さければ通る（確認ごとに、渡す側と付けた型の大きさを足す）
+        val small = ascribedExports(imports = 3, nested = 2, perNested = 5) {
+            """(export "e$it" (component ${'$'}empty) (component (type ${'$'}ct)))"""
+        }
+        val s = estimateOf(small)
+        assertEquals(10L, s.checkCount)
+        assertTrue(s.cost - s.remapCost >= 10L * 4) { "${s.cost} - ${s.remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(small) }
+
+        // インスタンス型で包んだ形・`(type (eq ..))` の形も、付けた型が小さければ実際の検証を通る（正しいコンポーネントである）
+        val smallWrapped = ascribedExports(imports = 3, nested = 2, perNested = 5) {
+            """(export "x$it" (instance ${'$'}i) (instance (type ${'$'}it)))"""
+        }
+        assertEquals(10L, estimateOf(smallWrapped).checkCount)
+        assertDoesNotThrow { ComponentLoader.load(smallWrapped) }
+        val smallEq = ascribedExports(imports = 3, nested = 2, perNested = 5) {
+            """(export "t$it" (type ${'$'}x) (type (eq ${'$'}ct)))"""
+        }
+        val se = estimateOf(smallEq)
+        assertEquals(10L, se.checkCount)
+        assertTrue(se.cost - se.remapCost >= 10L * 3) { "${se.cost} - ${se.remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(smallEq) }
+    }
+
+    /**
+     * `(func)` の import を [funcs] 個持つコンポーネント型 `$ct` を、[imports] 個の import で受けるコンポーネント `$r` を、
+     * 引数 [imports] 個（どれも空のコンポーネント）で [instances] 回インスタンス化する（#963）
+     */
+    private fun instantiateWithComponentArgs(funcs: Int, imports: Int, instances: Int): ByteArray {
+        val funcDecls = (0 until funcs).joinToString(" ") { """(import "i$it" (func))""" }
+        val importDecls = (0 until imports).joinToString(" ") { """(import "c$it" (component (type ${'$'}ct)))""" }
+        val args = (0 until imports).joinToString(" ") { """(with "c$it" (component ${'$'}empty))""" }
+        val instanceDecls = (0 until instances).joinToString(" ") { "(instance (instantiate ${'$'}r $args))" }
+        return wat(
+            """
+            (component
+              (type ${'$'}ct (component $funcDecls))
+              (component ${'$'}empty)
+              (component ${'$'}r (alias outer 1 ${'$'}ct (type ${'$'}ct)) $importDecls)
+              $instanceDecls
+            )
+            """,
+        )
+    }
+
+    @Test
+    fun `インスタンス化の引数で受けるコンポーネント型の import は写し直しで数える`() {
+        // #963: 同じ型をインスタンス化の引数で受ける形は、受ける側の import をインスタンス化ごとの写し直しが覆う
+        // （wasmparser が引数ごとにたどる受ける側の import は、写し直しの数える import の宣言の大きさを超えない）ので、型の確認には足さない
+        val bytes = instantiateWithComponentArgs(funcs = 100, imports = 100, instances = 10)
+        val e = estimateOf(bytes)
+        assertEquals(1_000L, e.checkCount)
+        // インスタンス化ごとに、受ける側の import 100 個それぞれのコンポーネント型（import 100 個）を写し直す分
+        assertTrue(e.remapCost >= 10L * 100 * 100) { "${e.remapCost}" }
+        // 型の確認は、渡す側（空のコンポーネント）の大きさだけ（受ける側を足すと、写し直しと二重に数える）。型のたどり（#955）は別に数える
+        assertTrue(e.cost - e.remapCost - e.scanCost <= 1_000L * 2) { "${e.cost} - ${e.remapCost} - ${e.scanCost}" }
+        // この形の見積もり（約 20 万）は既定の上限に収まり、実際の検証も通る（検証に通らない形を測っているのではない）
+        assertTrue(e.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${e.cost}" }
+        assertDoesNotThrow { ComponentLoader.load(bytes) }
+
+        // 小さい版も、正しいコンポーネントとして実際の検証を通る
+        val small = instantiateWithComponentArgs(funcs = 3, imports = 4, instances = 2)
+        assertEquals(8L, estimateOf(small).checkCount)
+        assertDoesNotThrow { ComponentLoader.load(small) }
     }
 
     /**
