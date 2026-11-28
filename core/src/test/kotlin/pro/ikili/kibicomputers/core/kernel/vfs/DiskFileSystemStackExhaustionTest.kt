@@ -332,9 +332,11 @@ class DiskFileSystemStackExhaustionTest {
             val tally = SoePositions()
             var completed = 0
             val options = OpenOptions(read = true, write = true, create = true)
-            // 1 段ずつの掃引（境目から [VFS_WIDTH] 段）の分だけ。境目を探す途中の大きな詰め物（倍々の 4096 段など）は、いつも詰め物の中で尽きて
-            // [SoePositions.Position.OTHER] に入るので、全部の回で数えると下の検査が空振りする。区間の途中の分は [pendingSwept] に置き、
-            // [walkStackEdge] が区間を採るか（`commitSwept(true)`）、やり直しで捨てるか（`false`）を決める
+            // 1 段ずつの掃引（境目から [VFS_WIDTH] 段）の分だけ。境目を探す回（倍々の大きな詰め物）も [SoePositions.Position.OTHER] に入りうる
+            // （境目が低い冷えた道・`-Xint` では、境目から離れた詰め物の中で尽きる。JIT で境目が 8000 段前後のときは、倍々の 8192 段が境目に近く、
+            // 確かめの中 [SoePositions.Position.PROBE] で尽きて入らない）ので、全部の回で数えると、1 段ずつの掃引が確かめの外まで届かなくても
+            // 下の検査が通ってしまう。区間の途中の分は [pendingSwept] に置き、[walkStackEdge] が区間を採るか（`commitSwept(true)`）、
+            // やり直しで捨てるか（`false`）を決める
             val swept = SoePositions()
             val pendingSwept = ArrayList<StackOverflowError>()
 
