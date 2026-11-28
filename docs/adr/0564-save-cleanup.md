@@ -67,6 +67,11 @@
     対象のチャンクは別の名前・別の形式で生きている、という混ざった状態がある。そこで、「`r.X.Z.mca` がない ⇒ チャンクはない」が成り立つ（既定の作り）と確かめたときだけ、ファイル名で判定する。
     既定の作りなら、外部のチャンクファイル（`.mcc`）もリージョンのヘッダーからしか指されないので成り立つ
   - 既定の作りの確かめ: クラスの書き換え、インスタンスの差し替え、変換の記録（#959）の3つを見る。どれか1つにでも当たれば、または調べるのに失敗したら、既定の作りと見なさない（「判定できない」）。
+    対象のクラスは `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` と、その入れ子のクラス（#969。1.21.1 の実物では `IOWorker$PendingStore`・`IOWorker$Priority`・`RegionFile$ChunkBuffer`・`RegionFile$CommitOp`。
+    匿名のクラスはなく、ラムダの本体は外側のクラスの synthetic なメソッドなので外側で見えている）。入れ子は、クラスの書き換え（印）と、変換の記録・Mixin の記録の対象にする（インスタンスの差し替えは、入れ子のインスタンスを外から引けないので対象外）。
+    入れ子は名前の固定の一覧にし、確かめのときに読み込む（初期化はしない。まだ読み込まれていなければ、そこで変換が走って記録が残る）。読み込めなければ数える。一覧が実物の入れ子と一致することは GameTest が見る（版の違いに気づく）。
+    対象を増やす分は数クラスで、掃除1回につき定数のコスト。入れ子だけに当たる Mixin・coremod はまれで、数えて失う回収は小さい。見ないと、`RegionFile$ChunkBuffer.close`（書き込み先を決める）の書き換えで、使っているセーブを消しうる。
+    `ChunkMap` の入れ子（`DistanceManager`・`TrackedEntity` など）は保存先と関係がなく、性能のための Mixin で回収が止まるだけなので対象にしない
     - クラスの書き換え: `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` に、処理を書き換える Mixin が当たっていないことを、合わせたメンバーの印（実行時に見える注釈 `@MixinMerged`）で見る。
       アクセサー・インボーカーだけの Mixin（インターフェースの Mixin。処理を書き換えない。NeoForge 自身が `BlockEntityType`・`MappedRegistry` に当てている）は数えない。
       印の `mixin`（合わせた Mixin のクラス名）のクラスファイルを、クラスローダーのリソースとして読み、インターフェースかどうかで分ける
@@ -85,28 +90,47 @@
       - TRANSFORMER は1つでもあれば数える（`fml` だからといって許さない。NeoForge 自身の coremod も `fml` で、区別できない）。
       - PLUGIN は、名前がそのまま一致する許可の一覧（`accesstransformer`・`mixin`・`runtimedistcleaner`）にないものを数える（前方一致は使わない。知らない名前・名前のないものは数える）。
         `accesstransformer` はアクセス修飾子だけを変える（製品の環境では、このプロジェクト自身の AT もこれで当たる。数えると製品でいつも回収が止まる）。
-        `mixin` は上のクラスの書き換えが印で細かく見ている（`ChunkMap` の性能のための Mixin を数えない方針も、そちらで保つ）。`runtimedistcleaner` は反対側だけのメンバーを消すだけ。
+        `mixin` は上のクラスの書き換えが印で細かく見ていて、`ChunkMap` 以外の対象のクラスでは下の Mixin の記録でも見る（`ChunkMap` の性能のための Mixin を数えない方針は、`ChunkMap` で Mixin の記録を見ないことで保つ）。`runtimedistcleaner` は反対側だけのメンバーを消すだけ。
         REASON（`classloading`・`computing_frames`）は数えない。知らない種類は数える
       - 記録が空であることは、変換されていないことの証拠にならない（変換も plugin もないクラスは、記録を残さずに読み込まれる）。そこで、クラスが ModLauncher の
         `TransformingClassLoader` で読み込まれていることも確かめる（そうでなければ、記録の外で読み込まれた）
       - 記録が引けない（ModLauncher で起動していない・`Launcher.INSTANCE` がない・クラスが見えない）、読むのに失敗した（記録の一覧は同期されない `ArrayList` の生のビューで、
         ほかのクラスのフレーム計算が同じキーに追記しうるので、すぐに写し、写すのに失敗したら）、は数える（「判定できない」）
+      - Mixin の記録（#969。`unexplainedMixins`）: 合わせたメンバーを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、
+        `<clinit>` だけの Mixin）は `@MixinMerged` が付かず、上のクラスの書き換えでは見えない。Mixin がクラスを書き換えると、変換の記録には PLUGIN `mixin`（相の印 `A`・`B`）が必ず残るので、
+        `ChunkMap` 以外の対象のクラスにそれがあれば、Mixin の記録で、当たった Mixin がアクセサーだけ（plugin のない config のもの）と説明できるかを見る。説明できなければ数える。
+        - Mixin の記録は、Mixin の `ClassInfo` のキャッシュ（`ClassInfo.fromCache`。キャッシュにない名前のクラスを読み込む `forName` は使わない）の、そのクラスを狙う Mixin の集合
+          （private のフィールド `mixins`。Mixin の config を準備するときに、対象のクラスごとに入る。それを返す package-private の `getMixins()` は、配られている jar では削られていて引けない）を反射で読み、すぐに写す（ほかのスレッドのクラスの読み込みと同時に書き換わりうる。写すのに失敗したら数える）。
+          Mixin のロック（`MixinProcessor` の `synchronized`）は取らない（ほかのスレッドのクラスの読み込みを待たせ、止まる元になる）。Mixin がアクセサーかは、上と同じくクラスファイルのアクセスフラグで見る（`getClassNode` などの重い読み直しはしない）。
+          config に plugin があるかは `IMixinConfig.getPlugin()` で見る
+        - 数えないのは、そのクラスを狙う Mixin が1つ以上あり、すべてアクセサー・インボーカーだけの Mixin で、その config に plugin がないときだけ。
+          plugin の `preApply`・`postApply` は、その config の Mixin が当たるたびに対象の ClassNode を受け取って書き換えられるので、plugin のある config のアクセサーは数える
+          （plugin の処理の中身を読んで分ける形は、Kotlin の plugin が引数の null の確かめを入れて空にならず、継承・委譲の読みも要るので採らない。
+          失うのは、plugin のある config から対象のクラスにアクセサーを当てる環境での、リージョンのない位置の残骸の回収だけ）。
+          処理を書き換える Mixin は、合わせたメンバーの有無を問わず数える。記録が引けない・ない・空（PLUGIN `mixin` があるのに説明できない）・読めないも数える
+        - Mixin 自身が足す記録（`mixin:APP:<config>:<Mixin> from mod <MOD>`・`DEC`・`GEN`）は判定に使わない。Mixin の監査の口（`ModLauncherAuditTrail`）は1つだけで、
+          今のクラスと受け手を同期せずに持つので、ほかのスレッドが同時にクラスを読み込むと抜けうる。当てになるのは相の印の有無だけ
+        - PLUGIN `mixin` のないクラスでは Mixin の記録を引かない。Mixin の内部（`ClassInfo` の package-private のメソッド）の読みは版上げで壊れうるが、
+          壊れても止まるのは Mixin が対象のクラスに当たった環境だけで、バニラ（#968 の記録では、4クラスに PLUGIN `mixin` がない）の回収は止まらない。
+          いつも内部を読み、読めなければ数える形にすると、Mixin の版上げ1つで全環境の回収が黙って止まるので採らない
+        - Issue の「性能のための Mixin と、読み書きを書き換えうる Mixin を分ける」は、分けられない（Mixin の名前・config・plugin・MOD からは、形式を変えるかが分からない。
+          性能の MOD も `read`・`write` の経路に注入する）。そこで分けずに、今の方針（対象のクラスに当たるアクセサー以外の Mixin は、性能のためでも数える）を、印の付かない Mixin にも広げた。
+          分けられないことは下の「限界」に書く。新しく失う回収は、印の付かない Mixin と plugin のある config のアクセサーが対象のクラスに当たる環境の分だけ
       - `ChunkMap` も対象にする。coremod は `@MixinMerged` を付けずに `read` などの上書きを足せる。性能のための書き換えはふつう Mixin（PLUGIN `mixin`。数えない）なので、
         `ChunkMap` に coremod が当たる環境はまれで、数えて失うものは小さい
       - Issue の「やること」の二択（リージョンがなければいつも「判定できない」にする / coremod の書き換えを見分ける）のうち、見分ける方を採る。いつも「判定できない」にすると、
         バニラの環境でも、リージョンを削ったワールドの残骸（この経路が回収するもの）を永久に回収できず、再起動のたびに件数分の `owner.bin` の読みと問いを繰り返す。
         記録は掃除1回につき5クラス分を読むだけで、台の数によらない。確かめられないときは「判定できない」に倒すので、いつも「判定できない」の形は、その失敗時の振る舞いとして入っている
   - 確かめは掃除1回につき1回、掃除を始めるとき（メインスレッド）にして、問いには真偽値で渡す（問いごと・IO のスレッドでは調べない）。既定の作りでないなら、その旨を掃除1回につき1行ログに出す
-  - 限界: 処理を書き換える Mixin が4クラスのどれかに1つでも当たっていると、それが形式を変えないもの（性能のための Mixin）でも「既定の作りでない」と見なす（形式を変えるかどうかは Mixin の中身からは判定できない）。
+  - 限界: 処理を書き換える Mixin（印の付かないものを含む。#969）か、plugin のある config のアクセサーが、対象のクラス（4クラスとその入れ子）のどれかに1つでも当たっていると、それが形式を変えないもの（性能のための Mixin）でも「既定の作りでない」と見なす（形式を変えるかどうかは Mixin の中身からは判定できず、Mixin の名前・config・plugin・MOD からも分けられない。#969 で調べた）。
     その環境では、リージョンファイルのない位置の残骸（ADR のこの経路が回収する、リージョンを削ったワールドの残骸）は回収されず、掃除のたびに「判定できない」に数えられる（INFO が1行）。
     チャンクの I/O を作り替える性能 MOD（どのクラスに当てているかは未確認）が入った環境で起こりうる。残す側に倒れるだけで、安全性の問題ではない。
     ほかの回収の経路（リージョンファイルがあるチャンクの NBT での判定）は、この影響を受けない。
   - 限界: 記録の外の書き換えは見えない。JVM エージェント（`java.lang.instrument`）と、ModLauncher の記録を通らない書き換えがこれに当たる。
     バニラのクラスのインスタンスのまま、その処理をこれらで書き換えた環境では、既定の作りと見なしてしまう（リージョンファイルのない位置を「ない」にする）。
     coremod（#959 で見えるようにした）と違い、そうした MOD は確認していない。`-javaagent` があることを数える形は、開発環境・認証用のエージェントで回収が止まるので採らない。
-    合わせたメンバーを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、`<clinit>` だけの Mixin）は印が付かないが、
-    当てたクラスの変換の記録に PLUGIN `mixin` として残り、許可の一覧で数えないので、やはり見えない（Mixin の記録から Mixin の名前を取って分けるのは #969）。
-    入れ子のクラス（`IOWorker$PendingStore`・`RegionFile` の内部クラスなど）は、Mixin の印も変換の記録も見ない（#969）
+    Mixin の拡張（`IExtension` の `preApply`・`postApply`。MixinExtras など。どの Mixin が当たったクラスにも走る）と Mixin の coprocessor は、許して見ない（Mixin の当たった対象のクラスは、上の Mixin の記録で見ている）。
+    `ChunkMap` に、plugin の `postApply` が印なしで `ChunkStorage` の上書きを足す形も見えない（`ChunkMap` では Mixin の記録を見ないため。元のクラスファイルと実行時の宣言を比べる形は、必要になったら別の Issue にする）
   - 限界: `ChunkMap` への Mixin による書き換え（`@MixinMerged` の印と、変換の記録の PLUGIN `mixin`）は数えない。coremod の TRANSFORMER と、許可の一覧にない PLUGIN は、上の変換の記録で数える（多くの MOD パックで性能のための Mixin が当たり、数えるとほとんどの環境でリージョンのない位置の残骸を回収できなくなる。
     保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。ただし、`ChunkStorage` のメソッド（`read`・`write` など）を
     `ChunkMap` で上書きする Mixin（Mixin のクラスが `ChunkStorage` を継承して override を足す形。合わせたメソッドに `@MixinMerged` が付く）は、チャンクの読み書きをすべて
@@ -205,7 +229,12 @@
   holder があって FULL でないチャンク（keeper で INACCESSIBLE に降りた `LevelChunk`、続くアンロード待ち）はケースがなくても「判定できない」、
   リージョンファイルのない位置は、リージョンファイルを作らずに「ない」、リージョンファイルのある所の IOWorker の書き込み待ちのケースは「ある」（ID が違う・種類が違うものは「ない」）、
   保存先に別の座標のリージョンファイルだけがあり、読み書きする側が既定の作りと確かめられないとき、台のディレクトリは残り「判定できない」に数えられ、リージョンファイルも作らない（書き込み待ちのケースも「ない」にならない。#899）、
-  GameTest のサーバーのチャンクの読み書きの経路に Mixin が当たっておらず、数える変換の記録もなく、既定の問いがファイル名で判定する（製品の jar の GameTest でも同じ）、
+  GameTest のサーバーのチャンクの読み書きの経路に Mixin が当たっておらず、数える変換の記録もなく、既定の問いがファイル名で判定する（製品の jar の GameTest でも同じ）。入れ子のクラスの固定の一覧が実物の `declaredClasses` と一致して読み込め、確かめの対象に入る（#969）、
+  Mixin の記録の判定（`mixinRecordsExplainMixinTransforms`。#969）: PLUGIN `mixin` のあるクラスで、アクセサーだけ（plugin のない config）なら数えず、合わせたメンバーのない Mixin を含む処理を書き換える Mixin・plugin のある config のアクセサー・
+  記録が引けない・ない・空・読めない・説明できない `APP`・`DEC` は数える。PLUGIN `mixin` のないクラスでは記録を引かず（記録が例外を投げても数えない）、`ChunkMap` の PLUGIN `mixin` は数えない。入れ子のクラス・`ChunkStorage` も同じに見て、
+  入れ子の `RegionFile$ChunkBuffer` の印のない Mixin で既定の作りでなくなる。陽性の対照として、NeoForge 自身のアクセサーが当たる `BlockEntityType` の本物の記録に PLUGIN `mixin` があり、本物の Mixin の記録が
+  `BlockEntityTypeAccessor` をアクセサー・plugin なしとして返して数えない、
+  実行時のクラス・インスタンス・印は本物のまま、記録の口に `RegionFileStorage` の PLUGIN `mixin:A` を、Mixin の記録の口に合わせたメンバーのない Mixin を足して本番の掃除を回すと、上の coremod と同じ2台が残る（`regionlessPositionIsKeptWhenEmptyMixinTransformsStorage`。#969）、
   変換の記録の判定（`transformAuditCountsCoremods`。#959）: 記録なし・許可した PLUGIN・REASON は数えず、TRANSFORMER・知らない PLUGIN（前方一致では許さない）・知らない種類・記録が引けない・読めない・
   `TransformingClassLoader` で読み込まれていないクラスは数える。陽性の対照として、NeoForge 自身の coremod が当たる `EntityType` の本物の記録の TRANSFORMER `fml` を数える、
   実行時のクラス・インスタンス・Mixin の印は本物のまま、記録の口にだけ `RegionFileStorage` の coremod の TRANSFORMER を足して `SaveCleanups.start` で本番の掃除を回すと、

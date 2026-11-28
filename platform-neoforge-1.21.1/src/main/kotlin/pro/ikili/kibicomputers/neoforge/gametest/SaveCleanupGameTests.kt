@@ -11,6 +11,7 @@ import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
+import net.minecraft.server.MinecraftServer
 import net.minecraft.server.level.ChunkMap
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.server.level.ServerLevel
@@ -46,6 +47,8 @@ import pro.ikili.kibicomputers.core.persist.SaveWriter
 import pro.ikili.kibicomputers.neoforge.computer.CaseAccess
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ChunkReferenceProbe
+import pro.ikili.kibicomputers.neoforge.machine.MixinRecord
+import pro.ikili.kibicomputers.neoforge.machine.MixinRegistry
 import pro.ikili.kibicomputers.neoforge.machine.SaveCleanups
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.TransformActivity
@@ -593,6 +596,12 @@ object SaveCleanupGameTests {
     @GameTest(template = SmokeGameTests.EMPTY)
     fun vanillaRegionStorageIsTrusted(helper: GameTestHelper) {
         val server = helper.level.server
+        // 入れ子のクラス（#969）: 固定の一覧が実物の入れ子と一致し（版の違いに気づく）、どれも読み込める
+        val declared = STORAGE.flatMap { it.declaredClasses.toList() }.map { it.name }.sorted()
+        helper.assertTrue(declared == ChunkReferenceProbe.NESTED_REGION_STORAGE_CLASSES.sorted(), "the nested chunk storage classes should match the list: $declared")
+        val (nested, missing) = ChunkReferenceProbe.nestedRegionStorage()
+        helper.assertTrue(missing.isEmpty() && nested.map { it.name } == ChunkReferenceProbe.NESTED_REGION_STORAGE_CLASSES, "the nested classes should load: $missing")
+        helper.assertTrue(ChunkReferenceProbe.regionStorageClasses() == STORAGE + nested, "the storage classes should be the four classes and the nested ones")
         val modified = ChunkReferenceProbe.modifiedRegionStorage()
         helper.assertTrue(modified.isEmpty(), "the chunk storage classes should have no mixins: $modified")
         val substituted = ChunkReferenceProbe.substitutedRegionStorage(server)
@@ -603,6 +612,7 @@ object SaveCleanupGameTests {
         AUDIT_LOGGER.log(System.Logger.Level.INFO) {
             "Transformer audit of the chunk storage: " + AUDITED.joinToString("; ") { type -> "${type.name}=${audit?.activities(type.name)?.map { it.describe() }}" }
         }
+        helper.assertTrue(ChunkReferenceProbe.auditedClasses() == AUDITED, "the audited classes should be the storage classes and ChunkMap: ${ChunkReferenceProbe.auditedClasses()}")
         val transformed = ChunkReferenceProbe.transformedRegionStorage(audit)
         helper.assertTrue(transformed.isEmpty(), "the chunk storage classes should have no transformers: $transformed")
         helper.assertTrue(ChunkReferenceProbe.untrustedRegionStorage(server).isEmpty(), "the chunk storage should be trusted")
@@ -620,8 +630,17 @@ object SaveCleanupGameTests {
 
     private val AUDIT_LOGGER = System.getLogger("kibicomputers.gametest")
 
-    /** 変換の記録を見るクラス（[ChunkReferenceProbe.transformedRegionStorage] の既定と同じ5つ。ログに出し、既定の一覧の中身を [transformAuditCountsCoremods] で固定する） */
-    private val AUDITED = listOf(RegionFileStorage::class.java, RegionFile::class.java, IOWorker::class.java, ChunkStorage::class.java, ChunkMap::class.java)
+    /** リージョンファイルの名前と中身を決める4クラス */
+    private val STORAGE = listOf(RegionFileStorage::class.java, RegionFile::class.java, IOWorker::class.java, ChunkStorage::class.java)
+
+    /** 4クラスの入れ子のクラス（#969。[ChunkReferenceProbe.NESTED_REGION_STORAGE_CLASSES] を読み込んだもの） */
+    private val NESTED: List<Class<*>> = ChunkReferenceProbe.NESTED_REGION_STORAGE_CLASSES.map { Class.forName(it, false, RegionFile::class.java.classLoader) }
+
+    /**
+     * 変換の記録を見るクラス（[ChunkReferenceProbe.transformedRegionStorage] の既定と同じ。4クラス、その入れ子、`ChunkMap`）。
+     * ログに出し、既定の一覧の中身を [transformAuditCountsCoremods] で固定する
+     */
+    private val AUDITED: List<Class<*>> = STORAGE + NESTED + ChunkMap::class.java
 
     /** テスト用の coremod の変換の記録（FML の coremod は、サービス名 `fml` の TRANSFORMER として残る） */
     private val COREMOD = TransformActivity(TransformActivity.TRANSFORMER, listOf("fml", "kibicomputers_test_coremod"))
@@ -636,8 +655,9 @@ object SaveCleanupGameTests {
     @GameTest(template = SmokeGameTests.EMPTY)
     fun transformAuditCountsCoremods(helper: GameTestHelper) {
         val classes = listOf(RegionFileStorage::class.java)
+        // PLUGIN mixin は、アクセサーだけ（plugin のない config）と説明できる Mixin の記録の下で数えない（#969 の判定は [mixinRecordsExplainMixinTransforms]）
         fun reasons(activities: List<TransformActivity>?, transforming: Boolean = true): List<String> =
-            ChunkReferenceProbe.transformedRegionStorage(TransformAudit { activities }, classes) { transforming }
+            ChunkReferenceProbe.transformedRegionStorage(TransformAudit { activities }, classes, { transforming }, mixins = ACCESSOR_ONLY)
         fun plugin(name: String) = TransformActivity(TransformActivity.PLUGIN, listOf(name, "A"))
         fun reason(name: String) = TransformActivity(TransformActivity.REASON, listOf(name))
         helper.assertTrue(reasons(emptyList()).isEmpty(), "no activity should not count")
@@ -652,9 +672,9 @@ object SaveCleanupGameTests {
         helper.assertTrue(reasons(listOf(TransformActivity("OTHER", listOf("x")))).size == 1, "an unknown activity type should count")
         helper.assertTrue(reasons(null).size == 1, "a missing trail for the class should count")
         helper.assertTrue(reasons(emptyList(), transforming = false).size == 1, "a class outside the transforming class loader should count")
-        val none = ChunkReferenceProbe.transformedRegionStorage(null, classes) { true }
+        val none = ChunkReferenceProbe.transformedRegionStorage(null, classes, transforming = { true })
         helper.assertTrue(none.size == 1, "an unavailable trail should count: $none")
-        val failing = ChunkReferenceProbe.transformedRegionStorage(TransformAudit { throw ConcurrentModificationException() }, classes) { true }
+        val failing = ChunkReferenceProbe.transformedRegionStorage(TransformAudit { throw ConcurrentModificationException() }, classes, transforming = { true })
         helper.assertTrue(failing.size == 1, "an unreadable trail should count: $failing")
         // 本物の記録: 読み書きの経路のクラスは TransformingClassLoader で読み込まれ、NeoForge の coremod の当たるクラスは数えられる
         val audit = ChunkReferenceProbe.modLauncherAudit()
@@ -675,7 +695,7 @@ object SaveCleanupGameTests {
         }
         val everywhere = TransformAudit { name -> audit!!.activities(name).orEmpty() + COREMOD }
         val all = ChunkReferenceProbe.transformedRegionStorage(everywhere).map { it.substringBefore(": ") }
-        helper.assertTrue(all == AUDITED.map { it.name }, "the default classes should be the five chunk storage classes: $all")
+        helper.assertTrue(all == AUDITED.map { it.name }, "the default classes should be the chunk storage classes, the nested ones and ChunkMap: $all")
         // ChunkMap の coremod は、Mixin を数えない方針の外で、既定の作りでない理由に数えられる
         val chunkMap = ChunkReferenceProbe.untrustedRegionStorage(helper.level.server, withCoremodOn(ChunkMap::class.java))
         helper.assertTrue(
@@ -687,6 +707,91 @@ object SaveCleanupGameTests {
             entityType.size == 1 && "TRANSFORMER fml" in entityType[0],
             "the NeoForge coremod on EntityType should count: $entityType (${audit?.activities(EntityType::class.java.name)?.map { it.describe() }})",
         )
+        helper.succeed()
+    }
+
+    /** アクセサーだけ（plugin のない config）の Mixin の記録を返す、偽の Mixin の記録 */
+    private val ACCESSOR_ONLY = MixinRegistry { listOf(MixinRecord("test.AccessorMixin", accessor = true, hasPlugin = false)) }
+
+    /** Mixin の launch plugin の、相の印の変換の記録 */
+    private val MIXIN_PHASE = TransformActivity(TransformActivity.PLUGIN, listOf("mixin", "A"))
+
+    /**
+     * Mixin の記録での判定（[ChunkReferenceProbe.unexplainedMixins]。#969）。読み書きの経路のクラスに PLUGIN `mixin` があれば、Mixin の記録で、
+     * 当たった Mixin がアクセサーだけ（plugin のない config のもの）と説明できるときだけ数えない。偽の記録で確かめる:
+     * - 数える: 合わせたメンバーのないものを含む、処理を書き換える Mixin（印に頼らない）、plugin のある config のアクセサー、記録が引けない・ない・空・例外、
+     *   Mixin 自身の `APP`・`DEC` の記録（説明できなければ）、入れ子のクラス・`ChunkStorage` の PLUGIN `mixin`、入れ子のクラスの coremod の TRANSFORMER
+     * - 数えない: PLUGIN `mixin` のないクラス（Mixin の記録を引かない。記録が例外を投げても数えない。バニラの環境が Mixin の内部の読みに巻き込まれない）、
+     *   `ChunkMap` の PLUGIN `mixin`（性能のための Mixin を数えない方針）
+     * 陽性の対照（本物）: NeoForge 自身のアクセサーの Mixin が当たる `BlockEntityType` の本物の記録に PLUGIN `mixin` があり、本物の Mixin の記録
+     * （[ChunkReferenceProbe.mixinRegistry]）が `BlockEntityTypeAccessor` をアクセサー・plugin なしとして返し、数えない（反射の経路が開発の run と jar の run で働く）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun mixinRecordsExplainMixinTransforms(helper: GameTestHelper) {
+        val storage = RegionFileStorage::class.java
+        fun reasons(activities: List<TransformActivity>, mixins: MixinRegistry?, type: Class<*> = storage): List<String> =
+            ChunkReferenceProbe.transformedRegionStorage(TransformAudit { activities }, listOf(type), { true }, mixins = mixins)
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), ACCESSOR_ONLY).isEmpty(), "an accessor-only mixin should not count")
+        // 処理を書き換える Mixin は、合わせたメンバーの有無を問わず数える（空の Mixin・<clinit> だけの Mixin は印がなく、記録でしか見えない）
+        val empty = MixinRegistry { listOf(MixinRecord("test.EmptyPluginMixin", accessor = false, hasPlugin = true)) }
+        val counted = reasons(listOf(MIXIN_PHASE), empty)
+        helper.assertTrue(counted.size == 1 && counted[0].startsWith("${storage.name}: ") && "test.EmptyPluginMixin" in counted[0], "a mixin without merged members should count: $counted")
+        val plain = MixinRegistry { listOf(MixinRecord("test.ClinitMixin", accessor = false, hasPlugin = false)) }
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), plain).size == 1, "a non-accessor mixin without a plugin should count")
+        val pluginAccessor = MixinRegistry { listOf(MixinRecord("test.PluginAccessor", accessor = true, hasPlugin = true)) }
+        val viaPlugin = reasons(listOf(MIXIN_PHASE), pluginAccessor)
+        helper.assertTrue(viaPlugin.size == 1 && "test.PluginAccessor (accessor in a config with a plugin)" in viaPlugin[0], "an accessor in a config with a plugin should count: $viaPlugin")
+        val mixed = MixinRegistry { ACCESSOR_ONLY.mixins(it).orEmpty() + MixinRecord("test.ClassMixin", accessor = false, hasPlugin = false) }
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), mixed).size == 1, "a class mixin beside an accessor should count")
+        // 説明できない: 記録の口がない・クラスの記録がない・空・読めない
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), null).size == 1, "unavailable mixin records should count")
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), MixinRegistry { null }).size == 1, "a class without mixin records should count")
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), MixinRegistry { emptyList() }).size == 1, "empty mixin records should count")
+        val throwing = MixinRegistry { throw ConcurrentModificationException() }
+        val unreadable = reasons(listOf(MIXIN_PHASE), throwing)
+        helper.assertTrue(unreadable.size == 1 && "unreadable" in unreadable[0], "unreadable mixin records should count: $unreadable")
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), MixinRegistry { throw LinkageError("x") }).size == 1, "a linkage error should count")
+        // Mixin 自身の APP・DEC の記録（相の印がなくても）は、Mixin の記録で説明できなければ数える
+        val app = TransformActivity(TransformActivity.PLUGIN, listOf("mixin", "APP", "test.mixins.json:Empty from mod test"))
+        val dec = TransformActivity(TransformActivity.PLUGIN, listOf("mixin", "DEC"))
+        helper.assertTrue(reasons(listOf(app), MixinRegistry { emptyList() }).size == 1, "an APP record without a mixin record should count")
+        helper.assertTrue(reasons(listOf(dec), MixinRegistry { emptyList() }).size == 1, "a DEC record without a mixin record should count")
+        // PLUGIN mixin のないクラスでは、Mixin の記録を引かない（引けば例外で数えられる）
+        helper.assertTrue(reasons(emptyList(), throwing).isEmpty(), "a class without a mixin plugin record should not read the mixin records")
+        val harmless = listOf(TransformActivity(TransformActivity.REASON, listOf("classloading")), TransformActivity(TransformActivity.PLUGIN, listOf("accesstransformer", "A")))
+        helper.assertTrue(reasons(harmless, throwing).isEmpty(), "harmless plugins should not read the mixin records")
+        // ChunkMap の PLUGIN mixin は数えない（性能のための Mixin の方針。Mixin の記録も引かない）
+        helper.assertTrue(reasons(listOf(MIXIN_PHASE), throwing, ChunkMap::class.java).isEmpty(), "a mixin on ChunkMap should not count")
+        // 入れ子のクラスと ChunkStorage も同じに見る
+        for (type in NESTED + ChunkStorage::class.java) {
+            helper.assertTrue(reasons(listOf(MIXIN_PHASE), empty, type).size == 1, "a mixin without merged members on ${type.name} should count")
+            helper.assertTrue(reasons(listOf(COREMOD), ACCESSOR_ONLY, type).size == 1, "a coremod on ${type.name} should count")
+        }
+        // 既定の untrustedRegionStorage の経路: 本物の記録に、入れ子のクラスの PLUGIN mixin を足すと、Mixin の記録で説明できず数える
+        val audit = ChunkReferenceProbe.modLauncherAudit()
+        helper.assertTrue(audit != null, "the transformer audit trail should be available")
+        val chunkBuffer = NESTED.first { it.name.endsWith("\$ChunkBuffer") }
+        val withMixin = TransformAudit { name -> audit!!.activities(name).let { if (name == chunkBuffer.name) it.orEmpty() + MIXIN_PHASE else it } }
+        val nestedReasons = ChunkReferenceProbe.untrustedRegionStorage(helper.level.server, withMixin, empty)
+        helper.assertTrue(
+            nestedReasons.size == 1 && nestedReasons[0].startsWith("${chunkBuffer.name}: ") && "test.EmptyPluginMixin" in nestedReasons[0],
+            "a mixin without merged members on the nested ChunkBuffer should make the chunk storage untrusted: $nestedReasons",
+        )
+        // 陽性の対照: NeoForge 自身のアクセサーの Mixin
+        val registry = ChunkReferenceProbe.mixinRegistry()
+        val blockEntityType = BlockEntityType::class.java.name
+        val activities = audit!!.activities(blockEntityType).orEmpty()
+        helper.assertTrue(activities.any { it.type == TransformActivity.PLUGIN && it.context.firstOrNull() == "mixin" }, "the real BlockEntityType should have a mixin record: ${activities.map { it.describe() }}")
+        val real = registry.mixins(blockEntityType)
+        AUDIT_LOGGER.log(System.Logger.Level.INFO) { "Mixin records of $blockEntityType: $real" }
+        helper.assertTrue(
+            real != null && real.any { it.name == "net.neoforged.neoforge.mixins.BlockEntityTypeAccessor" && it.accessor && !it.hasPlugin },
+            "the real mixin records should list the NeoForge accessor: $real",
+        )
+        helper.assertTrue(ChunkReferenceProbe.unexplainedMixins(blockEntityType, registry) == null, "the NeoForge accessor should explain the mixin record: $real")
+        val explained = ChunkReferenceProbe.transformedRegionStorage(audit, listOf(BlockEntityType::class.java), mixinChecked = setOf(BlockEntityType::class.java))
+        helper.assertTrue(explained.isEmpty(), "the real BlockEntityType should not count with the real mixin records: $explained")
         helper.succeed()
     }
 
@@ -702,6 +807,42 @@ object SaveCleanupGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200, batch = "kibicomputers_save_cleanup_coremod")
     fun regionlessPositionIsKeptWhenCoremodTransformsStorage(helper: GameTestHelper) {
+        val real = ChunkReferenceProbe.modLauncherAudit()
+        helper.assertTrue(real != null, "the transformer audit trail should be available")
+        val fake = TransformAudit { name ->
+            val activities = real!!.activities(name)
+            if (name == RegionFileStorage::class.java.name) activities.orEmpty() + COREMOD else activities
+        }
+        regionlessPositionIsKeptWhenUntrusted(helper, "TRANSFORMER fml:kibicomputers_test_coremod") { server -> ChunkReferenceProbe.untrustedRegionStorage(server, fake) }
+    }
+
+    /**
+     * Issue #969 の端から端まで: [regionlessPositionIsKeptWhenCoremodTransformsStorage] と同じ形で、変換の記録の口に「`RegionFileStorage` に Mixin の相の印
+     * （PLUGIN `mixin:A`）がある」偽の記録を、Mixin の記録の口に合わせたメンバーのない Mixin（plugin の `postApply` で書き換えるための空の Mixin。印が付かない）を渡す。
+     * 実行時のクラス・インスタンス・`@MixinMerged` の印は本物のまま（印では見えない）で、2台のディレクトリは「判定できない」になって残る。対照は本物の記録で「ない」
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200, batch = "kibicomputers_save_cleanup_mixin")
+    fun regionlessPositionIsKeptWhenEmptyMixinTransformsStorage(helper: GameTestHelper) {
+        val real = ChunkReferenceProbe.modLauncherAudit()
+        helper.assertTrue(real != null, "the transformer audit trail should be available")
+        val fake = TransformAudit { name ->
+            val activities = real!!.activities(name)
+            if (name == RegionFileStorage::class.java.name) activities.orEmpty() + MIXIN_PHASE else activities
+        }
+        val realMixins = ChunkReferenceProbe.mixinRegistry()
+        val mixins = MixinRegistry { name ->
+            if (name == RegionFileStorage::class.java.name) listOf(MixinRecord("test.EmptyPluginMixin", accessor = false, hasPlugin = true)) else realMixins.mixins(name)
+        }
+        helper.assertTrue(ChunkReferenceProbe.modifiedRegionStorage().isEmpty(), "the empty mixin should not leave a merged mark")
+        regionlessPositionIsKeptWhenUntrusted(helper, "mixin test.EmptyPluginMixin") { server -> ChunkReferenceProbe.untrustedRegionStorage(server, fake, mixins) }
+    }
+
+    /**
+     * [regionlessPositionIsKeptWhenCoremodTransformsStorage]・[regionlessPositionIsKeptWhenEmptyMixinTransformsStorage] の本体。[untrusted] は既定の作りでない理由を返し、
+     * その理由がちょうど1つで、`RegionFileStorage` の [expected] を含むことを確かめてから、2台が残ることと、対照（本物の記録）で「ない」になることを見る
+     */
+    private fun regionlessPositionIsKeptWhenUntrusted(helper: GameTestHelper, expected: String, untrusted: (MinecraftServer) -> List<String>) {
         val level = helper.level
         val dimension = level.dimension().location().toString()
         ensureVanillaRegion(helper)
@@ -736,20 +877,17 @@ object SaveCleanupGameTests {
         previousDirectory(root, aliasedId, MachineOwner(dimension, aliasedPos.x, aliasedPos.y, aliasedPos.z))
         previousDirectory(controlRoot, aliasedId, MachineOwner(dimension, aliasedPos.x, aliasedPos.y, aliasedPos.z))
         previousDirectory(controlRoot, controlId, MachineOwner(dimension, controlChunk.minBlockX, 64, controlChunk.minBlockZ))
-        val real = ChunkReferenceProbe.modLauncherAudit()
-        helper.assertTrue(real != null, "the transformer audit trail should be available")
-        val fake = TransformAudit { name ->
-            val activities = real!!.activities(name)
-            if (name == RegionFileStorage::class.java.name) activities.orEmpty() + COREMOD else activities
-        }
         var reasons: List<String> = emptyList()
         val cleanup = SaveCleanups.start(
             dryRun = false, force = false, store = MachineSaveStore(root, MachineIdIndex(), "test"), modules = null,
-            untrustedReasons = { server -> ChunkReferenceProbe.untrustedRegionStorage(server, fake).also { reasons = it } },
+            untrustedReasons = { server -> untrusted(server).also { reasons = it } },
             regionOf = regionOf,
         )
         helper.assertTrue(cleanup != null, "the cleanup should start")
-        helper.assertTrue(reasons.size == 1 && reasons[0].startsWith(RegionFileStorage::class.java.name), "only the fake coremod should be a reason: $reasons")
+        helper.assertTrue(
+            reasons.size == 1 && reasons[0].startsWith("${RegionFileStorage::class.java.name}: ") && expected in reasons[0],
+            "only the fake transformation should be a reason: $reasons",
+        )
         var control: SaveCleanup? = null
         helper.startSequence().thenWaitUntil {
             helper.assertTrue(cleanup!!.finished && !cleanup.settling && readable.isDone, "the cleanup should finish (${cleanup.phase})")
